@@ -9,6 +9,7 @@
 #import "KPAuditCoWIntegrityModule.h"
 #import "KPAuditAVE112705Module.h"
 #import "KPAuditAVESpriteModule.h"
+#import "KPAuditAVEPANModule.h"
 #import "KPAuditUAF84495Module.h"
 #import "KPLog.h"
 #import "KPLogTerminalView.h"
@@ -127,6 +128,8 @@
         [[KPAuditAVE112705Module alloc] initWithTemporalLayers:16463],
         [[KPAuditAVESpriteModule alloc] initWithSprayCount:24 marker:0x42424242],
         [[KPAuditAVESpriteModule alloc] initWithSprayCount:64 marker:0x43434343],
+        [[KPAuditAVEPANModule alloc] initWithTemporalLayers:16464],
+        [[KPAuditAVEPANModule alloc] initWithTemporalLayers:16465],
         [[KPAuditUAF84495Module alloc] initWithArmed:NO],
         [[KPAuditUAF84495Module alloc] initWithArmed:YES],
     ];
