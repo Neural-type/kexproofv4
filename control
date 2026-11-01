@@ -1,0 +1,9 @@
+Package: com.stealth.kexproofv4
+Name: KexProofV4
+Version: 4.0.0
+Architecture: iphoneos-arm64
+Description: Independent iOS 27.0.1 vulnerability re-audit rig with legacy terminal log
+Maintainer: LO
+Author: ENI
+Section: Utilities
+Depends: firmware (>= 15.0)

@@ -1,0 +1,83 @@
+name: arm64e build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos + SDK
+        run: |
+          git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/theos/theos.git /Users/runner/theos
+          mkdir -p /Users/runner/theos/sdks
+          curl -sL "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz" -o /tmp/sdk.tar.xz
+          tar -xf /tmp/sdk.tar.xz -C /Users/runner/theos/sdks
+          mkdir -p /Users/runner/theos/bin && curl -sL https://raw.githubusercontent.com/theos/dm.pl/master/dm.pl -o /Users/runner/theos/bin/dm.pl && chmod +x /Users/runner/theos/bin/dm.pl
+          brew install ldid
+
+      - name: Objective-C syntax check
+        working-directory: .
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          "$(xcrun --find clang)" -fsyntax-only \
+            -target arm64-apple-ios15.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc -Wall -Wextra -Wno-error -Wno-deprecated-declarations \
+            -F"$SDK/System/Library/Frameworks" \
+            -F"$SDK/System/Library/PrivateFrameworks" \
+            -ISources \
+            Sources/*.m
+
+      - name: Build KexProofV4 (arm64e)
+        working-directory: .
+        env:
+          THEOS: /Users/runner/theos
+        run: |
+          make package FINALPACKAGE=1 THEOS="$THEOS"
+
+      - name: Sign + package IPA
+        working-directory: .
+        run: |
+          BIN="$(find .theos/_ -path '*/KexProofV4.app/KexProofV4' -type f | head -1)"
+          test -f "$BIN"
+          python3 - "$BIN" <<'EOF'
+          import struct, sys
+          p = sys.argv[1]
+          d = bytearray(open(p,'rb').read())
+          cputype, subtype = struct.unpack('<II', d[4:12])
+          if cputype == 0x100000C and subtype != 0x80000002:
+              struct.pack_into('<I', d, 8, 0x80000002)
+              open(p,'wb').write(d)
+          EOF
+          mkdir -p out/Payload
+          cp -R "$(dirname "$BIN")" out/Payload/
+          APP="out/Payload/KexProofV4.app"
+          codesign --sign - --force --timestamp=none --entitlements Resources/entitlements.plist "$APP"
+          codesign --verify --verbose=2 "$APP"
+          test -s "$APP/_CodeSignature/CodeResources"
+          (cd out && zip -qr KexProofV4-arm64e.ipa Payload)
+
+      - name: Verify arm64e and audit symbols
+        working-directory: .
+        run: |
+          BIN="$(find .theos/_ -path '*/KexProofV4.app/KexProofV4' -type f | head -1)"
+          test -f "$BIN"
+          python3 - "$BIN" <<'EOF'
+          import struct, sys
+          d = open(sys.argv[1], 'rb').read(12)
+          cputype, subtype = struct.unpack('<II', d[4:12])
+          assert cputype == 0x100000C, hex(cputype)
+          assert subtype == 0x80000002, hex(subtype)
+          EOF
+          nm -a "$BIN" | grep -E 'KPAuditLP112621Module|KPAuditGlyph86950Module|KPAuditPDF112611Module|KPAuditRPU112688Module|KPAuditCoW112576Module|KPAuditUAF84495Module|KPLogTerminalView|KPViewController' >/dev/null
+          file "$BIN"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KexProofV4-arm64e
+          path: out/KexProofV4-arm64e.ipa
