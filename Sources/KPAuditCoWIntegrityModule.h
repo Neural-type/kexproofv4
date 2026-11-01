@@ -13,7 +13,10 @@ NS_ASSUME_NONNULL_BEGIN
 ///   O6  shared mach_memory_entry mapped twice with copy=TRUE — named-object CoW.
 ///   O7  vm_remap(FIXED|OVERWRITE, copy=TRUE) overlay — the vm_map_remap fix lane.
 ///   O8  MAP_SHARED cache + MAP_PRIVATE CoW write — the shared-cache family.
-/// Only leaks in O1/O2/O5/O6/O7/O8 are CVE evidence; O3 leaking is EXPECTED.
+///   O9  threaded race (writer + madvise + compressor-pressure) on a private
+///       copy; the MAP_SHARED cache page must never see the writes.
+///   O10 same threaded race on a vm_remap(copy=TRUE) copy; source must be clean.
+/// Only leaks in O1/O2/O5..O10 are CVE evidence; O3 leaking is EXPECTED.
 @interface KPAuditCoWIntegrityModule : NSObject <KPTestModule>
 - (instancetype)initWithArmed:(BOOL)armed;
 @end
