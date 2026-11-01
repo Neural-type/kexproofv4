@@ -54,6 +54,26 @@ typedef bool (*KPOsFeatureEnabledFn)(const char *domain, const char *feature);
         [out appendString:@"GlyphNormalization: UNREADABLE without os_feature_enabled\n"];
     }
 
+    // Process-local override SPI (libsystem_featureflags). If it exists it is
+    // the only channel that can flip the evaluated flag for THIS process.
+    typedef bool (*KPFeatureOverrideFn)(const char *domain, const char *feature, bool value);
+    const char *overrideNames[] = {
+        "os_feature_set_override", "os_feature_override_set",
+        "os_feature_set_overrides", "_os_feature_set_override"
+    };
+    KPFeatureOverrideFn overrideFn = NULL;
+    const char *overrideName = NULL;
+    for (size_t i = 0; i < sizeof(overrideNames) / sizeof(overrideNames[0]); i++) {
+        overrideFn = (KPFeatureOverrideFn)dlsym(handle ? handle : RTLD_DEFAULT, overrideNames[i]);
+        if (overrideFn) { overrideName = overrideNames[i]; break; }
+    }
+    [out appendFormat:@"override_sym=%@\n", overrideName ? @(overrideName) : @"(nil)"];
+    BOOL overrideApplied = NO;
+    if (overrideFn) {
+        overrideApplied = overrideFn("CoreGraphics", "GlyphNormalization", false);
+        [out appendFormat:@"override call returned=%d\n", overrideApplied];
+    }
+
     // Attempt a user-preference override. Apple's libsystem_featureflags honors
     // the com.apple.featureflags preferences domain; if the write takes effect,
     // the edgepool branch (the vulnerable one) becomes reachable.
@@ -69,7 +89,8 @@ typedef bool (*KPOsFeatureEnabledFn)(const char *domain, const char *feature);
         [out appendFormat:@"GlyphNormalization after-override=%d\n", after];
         [out appendString:(after != before)
             ? @"FLAG STATE CHANGED — edgepool backend selection is attacker-reachable.\n"
-            : @"override did not change the evaluated flag (stock default sticky).\n"];
+            : @"neither the override SPI nor the prefs write flipped the evaluated flag "
+              @"(stock default sticky for this process).\n"];
     }
     if (handle) dlclose(handle);
     [out appendFormat:@"flag_readout_complete=%d\n", known];

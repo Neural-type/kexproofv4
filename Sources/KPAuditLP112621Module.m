@@ -3,6 +3,7 @@
 #import "KPLog.h"
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
@@ -235,6 +236,11 @@
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     NSData *data = [NSData dataWithContentsOfFile:path];
     result[@"heic_bytes"] = @(data.length);
+
+    // The hard class import was removed (it was a launch-time dyld risk), so
+    // the framework is not in the process until we load it explicitly.
+    void *lpHandle = dlopen("/System/Library/Frameworks/LinkPresentation.framework/LinkPresentation", RTLD_LAZY);
+    result[@"lp_framework"] = lpHandle ? @"loaded" : @"dlopen_failed";
 
     Class imageClass = NSClassFromString(@"LPImage");
     Class transcoderClass = NSClassFromString(@"LPAnimatedImageTranscoder");
