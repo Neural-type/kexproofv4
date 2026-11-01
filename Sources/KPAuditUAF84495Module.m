@@ -2,10 +2,25 @@
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <sys/stat.h>
+#import <dlfcn.h>
 
-// sandbox_check lives in libsystem but its prototype is not public SDK API.
+// Soft reference — never let dyld bind _sandbox_check: iOS export is not
+// guaranteed and a hard bind kills the app before main() (dyld "Symbol not
+// found"). V3 launched precisely because it had no hard imports like this.
 enum { KPSandboxFilterPath = 1 };
-extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+typedef int (*KPSandboxCheckFn)(pid_t pid, const char *operation, int type, ...);
+
+static int KPSandboxCheckSoft(const char *operation, const char *path) {
+    static void *handle;
+    static KPSandboxCheckFn fn;
+    if (!fn) {
+        handle = dlopen("/usr/lib/system/libsystem_sandbox.dylib", RTLD_LAZY);
+        if (!handle) handle = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_LAZY);
+        if (handle) fn = (KPSandboxCheckFn)dlsym(handle, "sandbox_check");
+    }
+    if (!fn) return -2; // marker: symbol unavailable
+    return fn(getpid(), operation, KPSandboxFilterPath, path);
+}
 
 @interface KPAuditUAF84495Module ()
 @property (nonatomic, assign) BOOL armed;
@@ -115,14 +130,11 @@ extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
 
     [report appendString:@"--- sandbox probes ---\n"];
     if (getuid() == 501) {
-        int check = sandbox_check(getpid(), "file-write-data",
-                                  KPSandboxFilterPath, "/dev/bpf0");
+        int writeCheck = KPSandboxCheckSoft("file-write-data", "/dev/bpf0");
         [report appendFormat:@"sandbox_check(file-write-data,/dev/bpf0)=%d "
-                             @"(0=allowed, -1=denied errno=%@)\n",
-            check, [self describeErrno:errno]];
-        check = sandbox_check(getpid(), "file-read-data",
-                              KPSandboxFilterPath, "/dev/bpf0");
-        [report appendFormat:@"sandbox_check(file-read-data,/dev/bpf0)=%d\n", check];
+                             @"(0=allowed, -1=denied, -2=symbol unavailable)\n", writeCheck];
+        int readCheck = KPSandboxCheckSoft("file-read-data", "/dev/bpf0");
+        [report appendFormat:@"sandbox_check(file-read-data,/dev/bpf0)=%d\n", readCheck];
     }
 
     if (self.armed) {

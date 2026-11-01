@@ -2,8 +2,27 @@
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <CoreMedia/CoreMedia.h>
+#import <dlfcn.h>
 
-extern int CMGetDMVersionLevelFromRPU(CFDataRef data);
+// Soft reference: the symbol is not in the public header and its on-device
+// export is not guaranteed; dyld must never see a hard bind (that kills the
+// process before main() when the symbol is absent).
+typedef int (*KPCMGetDMVersionLevelFromRPUFn)(CFDataRef);
+
+static int KPCallRPUVersionLevel(CFDataRef data, BOOL *available) {
+    static void *handle;
+    static KPCMGetDMVersionLevelFromRPUFn function;
+    if (!function) {
+        handle = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
+        if (handle) function = (KPCMGetDMVersionLevelFromRPUFn)dlsym(handle, "CMGetDMVersionLevelFromRPU");
+    }
+    if (!function) {
+        if (available) *available = NO;
+        return 0;
+    }
+    if (available) *available = YES;
+    return function(data);
+}
 
 // Known-good empty-dmv1 RBSP prefix (dovi_tool reference corpus, 112-byte
 // rpu-reference-empty-rbsp.bin payload before extension blocks).
@@ -140,12 +159,14 @@ static uint32_t KPCRC32MPEG2(const uint8_t *data, size_t len) {
     CFDataRef cfData = CFDataCreate(kCFAllocatorDefault, data.bytes, (CFIndex)data.length);
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     int status = -1;
+    BOOL available = NO;
     @try {
-        status = CMGetDMVersionLevelFromRPU(cfData);
+        status = KPCallRPUVersionLevel(cfData, &available);
     } @catch (NSException *exception) {
         result[@"exception"] = exception.reason ?: exception.name;
     }
     result[@"seconds"] = @(CFAbsoluteTimeGetCurrent() - t0);
+    result[@"parser_exported"] = @(available);
     result[@"cm_status"] = @(status);
     if (cfData) CFRelease(cfData);
     return result;

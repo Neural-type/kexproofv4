@@ -2,9 +2,24 @@
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <objc/message.h>
-#import <LinkPresentation/LinkPresentation.h>
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+
+// Soft shims: never hard-bind LinkPresentation class refs. A dyld import that
+// is missing on the target OS kills the app before main() — the same reason
+// V3 resolved CoreMedia's parser through dlsym. Instances are messaged by
+// selector, so the shim types only describe the surface we use.
+@interface KPLinkMetadataShim : NSObject
+@property (nonatomic, readonly, nullable) NSString *title;
+@property (nonatomic, readonly, nullable) id imageProvider;
+@end
+
+@interface KPMetadataProviderShim : NSObject
+@property (nonatomic) double timeout;
+- (void)startFetchingMetadataForURL:(NSURL *)url
+                  completionHandler:(void (^)(KPLinkMetadataShim * _Nullable metadata,
+                                              NSError * _Nullable error))handler;
+@end
 
 @interface KPAuditLP112621Module ()
 @property (nonatomic, assign) BOOL armed;
@@ -111,6 +126,14 @@
 
 #pragma mark - Trigger via public LPMetadataProvider
 
+- (nullable KPMetadataProviderShim *)makeProvider {
+    Class providerClass = NSClassFromString(@"LPMetadataProvider");
+    if (!providerClass) return nil;
+    KPMetadataProviderShim *provider = [[providerClass alloc] init];
+    provider.timeout = 30;
+    return provider;
+}
+
 - (NSDictionary *)runMetadataProviderForImage:(NSString *)path {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     NSURL *fileURL = [NSURL fileURLWithPath:path];
@@ -120,13 +143,14 @@
         // is accepted by -[LPImage _isAnimated] for image/heic, which spawns
         // LPAnimatedImageTranscoder — the vulnerable consumer.
         // Selector is not in every SDK header; dispatch dynamically.
-        LPMetadataProvider *provider = [[LPMetadataProvider alloc] init];
-        provider.timeout = 30;
+        KPMetadataProviderShim *provider = [self makeProvider];
         SEL imageSel = NSSelectorFromString(@"startFetchingMetadataForImageAtFileURL:completionHandler:");
-        if ([provider respondsToSelector:imageSel]) {
+        if (!provider) {
+            result[@"image_route"] = @"LPMetadataProvider_CLASS_NOT_FOUND";
+        } else if ([provider respondsToSelector:imageSel]) {
             dispatch_semaphore_t sema = dispatch_semaphore_create(0);
             __block NSDictionary *fetchInfo = nil;
-            void (^handler)(LPLinkMetadata *, NSError *) = ^(LPLinkMetadata *metadata, NSError *error) {
+            void (^handler)(KPLinkMetadataShim *, NSError *) = ^(KPLinkMetadataShim *metadata, NSError *error) {
                 NSMutableDictionary *info = [NSMutableDictionary dictionary];
                 info[@"route"] = @"startFetchingMetadataForImageAtFileURL";
                 if (error) {
@@ -176,10 +200,13 @@
 
     dispatch_semaphore_t sema = dispatch_semaphore_create(0);
     __block NSDictionary *fetchInfo = nil;
-    LPMetadataProvider *provider = [[LPMetadataProvider alloc] init];
-    provider.timeout = 30;
+    KPMetadataProviderShim *provider = [self makeProvider];
+    if (!provider) {
+        result[@"page_route"] = @"LPMetadataProvider_CLASS_NOT_FOUND";
+        return result;
+    }
     [provider startFetchingMetadataForURL:[NSURL fileURLWithPath:htmlPath]
-                        completionHandler:^(LPLinkMetadata *metadata, NSError *error) {
+                        completionHandler:^(KPLinkMetadataShim *metadata, NSError *error) {
         NSMutableDictionary *info = [NSMutableDictionary dictionary];
         info[@"route"] = @"startFetchingMetadataForURL(page->og:image)";
         if (error) {
