@@ -269,13 +269,28 @@
     result[@"lp_transcoder_inits"] = tcInits;
     result[@"lp_transcoder_methods"] = tcAll;
 
+    SEL fileInit = NSSelectorFromString(@"initByReferencingFileURL:MIMEType:");
     SEL dataInit = NSSelectorFromString(@"initWithData:MIMEType:");
+    NSURL *fileURL = [NSURL fileURLWithPath:path];
     id lpImage = nil;
-    if ([imageClass instancesRespondToSelector:dataInit]) {
+    if ([imageClass instancesRespondToSelector:fileInit]) {
+        // File-backed keeps the two-frame HEIC intact for CGImageSource inside
+        // the transcoder; the data-backed initializer may collapse to frame 0.
+        lpImage = ((id (*)(id, SEL, id, id))objc_msgSend)([imageClass alloc], fileInit, fileURL, @"image/heic");
+        result[@"lp_image_via"] = @"initByReferencingFileURL:MIMEType:";
+    }
+    if (!lpImage && [imageClass instancesRespondToSelector:dataInit]) {
         lpImage = ((id (*)(id, SEL, id, id))objc_msgSend)([imageClass alloc], dataInit, data, @"image/heic");
+        result[@"lp_image_via"] = @"initWithData:MIMEType:";
     }
     result[@"lp_image_created"] = @(lpImage != nil);
     if (!lpImage) return result;
+
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)fileURL, NULL);
+    if (source) {
+        result[@"heic_frame_count"] = @(CGImageSourceGetCount(source));
+        CFRelease(source);
+    }
 
     // LPAnimatedImageTranscoder's only initializer takes an "animated image".
     // Try LPAnimatedImage first; fall back to passing LPImage directly.
@@ -325,22 +340,41 @@
         result[@"transcoder_created"] = @(transcoder != nil);
         if (!transcoder) continue;
 
-        SEL transcodeSel = NSSelectorFromString(@"transcodeWithCompletionHandler:");
+        SEL transcodeSel = NSSelectorFromString(@"_transcodeWithCompletionHandler:");
         if (![transcoder respondsToSelector:transcodeSel]) {
-            transcodeSel = NSSelectorFromString(@"_transcodeWithCompletionHandler:");
+            transcodeSel = NSSelectorFromString(@"transcodeWithCompletionHandler:");
         }
         if ([transcoder respondsToSelector:transcodeSel]) {
             dispatch_semaphore_t sema = dispatch_semaphore_create(0);
-            __block NSError *completionError = nil;
-            void (^completion)(NSError *) = ^(NSError *error) {
-                completionError = error;
+            __block NSString *resultClass = nil;
+            __block NSString *errorText = nil;
+            // Slot 0 of the callback has proven to carry the result (LPVideo on
+            // success). One-param block is signature-safe for either (result)
+            // or (result, error) callbacks.
+            void (^completion)(id) = ^(id slot0) {
+                if (!slot0) {
+                    resultClass = @"(nil)";
+                    errorText = @"none";
+                } else if ([slot0 isKindOfClass:NSError.class]) {
+                    resultClass = NSStringFromClass([slot0 class]);
+                    NSError *error = (NSError *)slot0;
+                    errorText = error.localizedDescription ?: error.domain;
+                } else {
+                    resultClass = NSStringFromClass([slot0 class]);
+                    errorText = @"none";
+                }
                 dispatch_semaphore_signal(sema);
             };
-            [KPLog.shared append:@"[lp112621] BEFORE_DIRECT_TRANSCODE (crash forensics armed)"];
-            ((void (*)(id, SEL, id))objc_msgSend)(transcoder, transcodeSel, completion);
-            long waited = dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
-            result[@"transcode_waited_out"] = @(waited != 0);
-            result[@"completion_error"] = completionError.localizedDescription ?: @"none";
+            [KPLog.shared appendFormat:@"[lp112621] BEFORE_DIRECT_TRANSCODE via %@ (crash forensics armed)", NSStringFromSelector(transcodeSel)];
+            @try {
+                ((void (*)(id, SEL, id))objc_msgSend)(transcoder, transcodeSel, completion);
+                long waited = dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
+                result[@"transcode_waited_out"] = @(waited != 0);
+                result[@"completion_result_class"] = resultClass ?: @"(no callback)";
+                result[@"completion_error"] = errorText ?: @"(no callback)";
+            } @catch (NSException *exception) {
+                result[@"completion_exception"] = exception.reason ?: exception.name;
+            }
             [KPLog.shared append:@"[lp112621] AFTER_DIRECT_TRANSCODE survived"];
         } else {
             SEL encodeSel = NSSelectorFromString(@"encodeNextFrame");
