@@ -10,7 +10,10 @@ NS_ASSUME_NONNULL_BEGIN
 ///   O3  sanity: vm_remap(copy=FALSE) MUST propagate (proves the oracle sees it).
 ///   O4  O1/O2 under compressor pressure (the fix touched vm_pageout_compress_page).
 ///   O5  madvise(MADV_FREE) race on the private-copy path.
-/// Only leaks in O1/O2/O5 are CVE evidence; O3 leaking is EXPECTED.
+///   O6  shared mach_memory_entry mapped twice with copy=TRUE — named-object CoW.
+///   O7  vm_remap(FIXED|OVERWRITE, copy=TRUE) overlay — the vm_map_remap fix lane.
+///   O8  MAP_SHARED cache + MAP_PRIVATE CoW write — the shared-cache family.
+/// Only leaks in O1/O2/O5/O6/O7/O8 are CVE evidence; O3 leaking is EXPECTED.
 @interface KPAuditCoWIntegrityModule : NSObject <KPTestModule>
 - (instancetype)initWithArmed:(BOOL)armed;
 @end
