@@ -2,7 +2,6 @@
 #import "KPLog.h"
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <pthread.h>
 #import <sys/mman.h>
 #import <sys/wait.h>
@@ -96,18 +95,18 @@ static void *KPCoWWriteLoop(void *arg) {
     }
     uint32_t changed = 0;
     for (uint32_t i = 0; i < iters; i++) {
-        mach_vm_address_t dst = 0;
-        kern_return_t kr = mach_vm_allocate(mach_task_self(), &dst, kKPPageSize, VM_FLAGS_ANYWHERE);
+        vm_address_t dst = 0;
+        kern_return_t kr = vm_allocate(mach_task_self(), &dst, kKPPageSize, VM_FLAGS_ANYWHERE);
         if (kr != KERN_SUCCESS) break;
-        mach_vm_copy(mach_task_self(), (mach_vm_address_t)src, kKPPageSize, dst);
+        vm_copy(mach_task_self(), (vm_address_t)src, kKPPageSize, dst);
         madvise((void *)dst, kKPPageSize, MADV_FREE_REUSABLE);
         memset((void *)dst, 0x42, 64);
-        mach_vm_deallocate(mach_task_self(), dst, kKPPageSize);
+        vm_deallocate(mach_task_self(), dst, kKPPageSize);
         if (![self fileStillOriginalAtPath:path]) { changed++; break; }
     }
     munmap(src, kKPPageSize);
     close(fd);
-    return @{@"shape": @"mach_vm_copy+MADV_FREE_REUSABLE", @"iterations": @(iters),
+    return @{@"shape": @"vm_copy+MADV_FREE_REUSABLE", @"iterations": @(iters),
              @"file_changed": @(changed > 0)};
 }
 
