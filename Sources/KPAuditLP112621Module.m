@@ -269,31 +269,66 @@
     result[@"lp_transcoder_inits"] = tcInits;
     result[@"lp_transcoder_methods"] = tcAll;
 
-    SEL providerInit = NSSelectorFromString(@"initWithItemProvider:");
+    SEL dataInit = NSSelectorFromString(@"initWithData:MIMEType:");
     id lpImage = nil;
-    if ([imageClass instancesRespondToSelector:providerInit]) {
-        NSItemProvider *provider = [[NSItemProvider alloc] initWithItem:(id)data typeIdentifier:@"public.heic"];
-        lpImage = ((id (*)(id, SEL, id))objc_msgSend)([imageClass alloc], providerInit, provider);
+    if ([imageClass instancesRespondToSelector:dataInit]) {
+        lpImage = ((id (*)(id, SEL, id, id))objc_msgSend)([imageClass alloc], dataInit, data, @"image/heic");
     }
     result[@"lp_image_created"] = @(lpImage != nil);
     if (!lpImage) return result;
 
-    for (NSString *initName in @[@"initWithAnimatedImage:", @"initWithImage:", @"initWithData:"]) {
+    // LPAnimatedImageTranscoder's only initializer takes an "animated image".
+    // Try LPAnimatedImage first; fall back to passing LPImage directly.
+    id animated = nil;
+    Class animatedClass = NSClassFromString(@"LPAnimatedImage");
+    result[@"lp_animated_class"] = animatedClass ? NSStringFromClass(animatedClass) : @"NOT_FOUND";
+    if (animatedClass) {
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(animatedClass, &count);
+        NSMutableArray *inits = [NSMutableArray array];
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *name = NSStringFromSelector(method_getName(methods[i]));
+            if ([name hasPrefix:@"init"]) [inits addObject:name];
+        }
+        free(methods);
+        result[@"lp_animated_inits"] = inits;
+        for (NSString *name in inits) {
+            NSRange colon = [name rangeOfString:@":"];
+            if (colon.location == NSNotFound) continue;
+            SEL sel = NSSelectorFromString(name);
+            id candidate = nil;
+            if ([name isEqualToString:@"initWithImage:"] || [name hasPrefix:@"initWithImage:"]) {
+                candidate = ((id (*)(id, SEL, id))objc_msgSend)([animatedClass alloc], sel, lpImage);
+            } else if ([name isEqualToString:@"initWithData:MIMEType:"]) {
+                candidate = ((id (*)(id, SEL, id, id))objc_msgSend)([animatedClass alloc], sel, data, @"image/heic");
+            }
+            if (candidate) {
+                animated = candidate;
+                result[@"animated_created_via"] = name;
+                break;
+            }
+        }
+    }
+    id transcoderArgument = animated ?: lpImage;
+
+    for (NSString *initName in @[@"initWithAnimatedImage:"]) {
         SEL sel = NSSelectorFromString(initName);
         if (![transcoderClass instancesRespondToSelector:sel]) continue;
         [KPLog.shared appendFormat:@"[lp112621] direct transcoder attempt via %@", initName];
         result[@"attempted_init"] = initName;
         id transcoder = nil;
         @try {
-            id argument = [initName isEqualToString:@"initWithData:"] ? (id)data : lpImage;
-            transcoder = ((id (*)(id, SEL, id))objc_msgSend)([transcoderClass alloc], sel, argument);
+            transcoder = ((id (*)(id, SEL, id))objc_msgSend)([transcoderClass alloc], sel, transcoderArgument);
         } @catch (NSException *exception) {
             result[@"init_exception"] = exception.reason ?: exception.name;
         }
         result[@"transcoder_created"] = @(transcoder != nil);
         if (!transcoder) continue;
 
-        SEL transcodeSel = NSSelectorFromString(@"_transcodeWithCompletionHandler:");
+        SEL transcodeSel = NSSelectorFromString(@"transcodeWithCompletionHandler:");
+        if (![transcoder respondsToSelector:transcodeSel]) {
+            transcodeSel = NSSelectorFromString(@"_transcodeWithCompletionHandler:");
+        }
         if ([transcoder respondsToSelector:transcodeSel]) {
             dispatch_semaphore_t sema = dispatch_semaphore_create(0);
             __block NSError *completionError = nil;
