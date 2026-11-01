@@ -18,10 +18,8 @@ extern kern_return_t mach_make_memory_entry(vm_map_t target_task, vm_size_t *siz
                                             vm_offset_t offset, vm_prot_t permission,
                                             mach_port_t *object_handle,
                                             mach_port_t parent_entry);
-extern kern_return_t vm_map(vm_map_t target_task, vm_address_t *address, vm_size_t size,
-                            vm_address_t mask, int flags, mach_port_t object,
-                            vm_offset_t offset, boolean_t copy, vm_prot_t *cur_protection,
-                            vm_prot_t *max_protection, vm_inherit_t inheritance);
+// vm_map: the SDK's declaration already exists (prot parameters are values in
+// this SDK); no re-declaration here.
 
 static const size_t kKPCoWPage = 0x4000; // 16 KB — the lsl #14 page stride in the fix
 
@@ -253,12 +251,11 @@ static void KPCoWFreeSlabs(NSArray<NSValue *> *slabs) {
     uint32_t leaks = 0, mapFailures = 0, firstLeak = 0;
     for (uint32_t i = 1; i <= iters; i++) {
         vm_address_t dst1 = 0, dst2 = 0;
-        vm_prot_t cur = 0, max = 0;
         kr = vm_map(mach_task_self(), &dst1, entrySize, 0, VM_FLAGS_ANYWHERE,
-                    entry, 0, TRUE, &cur, &max, VM_INHERIT_COPY);
+                    entry, 0, TRUE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_COPY);
         if (kr != KERN_SUCCESS) { mapFailures++; continue; }
         kr = vm_map(mach_task_self(), &dst2, entrySize, 0, VM_FLAGS_ANYWHERE,
-                    entry, 0, TRUE, &cur, &max, VM_INHERIT_COPY);
+                    entry, 0, TRUE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_COPY);
         if (kr != KERN_SUCCESS) {
             vm_deallocate(mach_task_self(), dst1, entrySize);
             mapFailures++;
