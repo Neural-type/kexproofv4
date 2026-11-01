@@ -10,6 +10,7 @@
 #import "KPAuditAVE112705Module.h"
 #import "KPAuditAVESpriteModule.h"
 #import "KPAuditAVEPANModule.h"
+#import "KPAuditIPCModule.h"
 #import "KPAuditUAF84495Module.h"
 #import "KPLog.h"
 #import "KPLogTerminalView.h"
@@ -130,6 +131,7 @@
         [[KPAuditAVESpriteModule alloc] initWithSprayCount:64 marker:0x43434343],
         [[KPAuditAVEPANModule alloc] initWithTemporalLayers:16467],
         [[KPAuditAVEPANModule alloc] initWithTemporalLayers:16471],
+        [[KPAuditIPCModule alloc] initWithNameSweep],
         [[KPAuditUAF84495Module alloc] initWithArmed:NO],
         [[KPAuditUAF84495Module alloc] initWithArmed:YES],
     ];
