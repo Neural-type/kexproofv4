@@ -57,13 +57,14 @@
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     const int32_t width = 1280, height = 720;
 
-    CFMutableDictionaryRef sourceAttrs = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
-    CFDictionarySetValue(sourceAttrs, kCVPixelBufferIOSurfacePropertiesKey, CFDictionaryCreate(NULL, NULL, NULL, 0, NULL, NULL));
+    [self journal:[NSString stringWithFormat:@"BEFORE_PIXELBUFFER %dx%d", width, height]];
+    // No source attributes: an unretained CFDictionary here made IOSurface
+    // retain raw pointers during creation (objc_retain crash). The buffer
+    // works fine with NULL attrs — the PoC path never needed them.
     CVPixelBufferRef pixelBuffer = NULL;
     CVReturn cvr = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
                                        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                                       sourceAttrs, &pixelBuffer);
-    CFRelease(sourceAttrs);
+                                       NULL, &pixelBuffer);
     if (cvr != kCVReturnSuccess || !pixelBuffer) {
         result[@"status"] = @"PIXELBUFFER_FAILED";
         result[@"cv_return"] = @(cvr);
