@@ -1,4 +1,5 @@
 #import "KPAuditCoWIntegrityModule.h"
+#import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <mach/mach.h>
 #import <sys/mman.h>
