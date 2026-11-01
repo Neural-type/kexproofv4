@@ -1,5 +1,6 @@
 #import "KPViewController.h"
 #import "KPDeviceInfoModule.h"
+#import "KPResourceLoaderModule.h"
 #import "KPAuditLP112621Module.h"
 #import "KPAuditGlyph86950Module.h"
 #import "KPAuditPDF112611Module.h"
@@ -42,7 +43,7 @@
         action:@selector(shareTapped:)];
 
     self.workQueue = dispatch_queue_create("com.stealth.kexproofv4.audit", DISPATCH_QUEUE_SERIAL);
-    self.sectionTitles = @[@"Device", @"Independent Audit"];
+    self.sectionTitles = @[@"Device", @"Resources", @"Independent Audit"];
     [self configureModules];
     [self configureHeader];
     [self configureTable];
@@ -58,6 +59,7 @@
 - (void)configureModules {
     self.modules = @[
         [[KPDeviceInfoModule alloc] init],
+        [[KPResourceLoaderModule alloc] init],
         [[KPAuditLP112621Module alloc] initWithArmed:NO],
         [[KPAuditLP112621Module alloc] initWithArmed:YES],
         [[KPAuditGlyph86950Module alloc] initWithArmed:NO],
