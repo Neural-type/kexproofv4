@@ -3,11 +3,15 @@
 #import "KPLog.h"
 #import <CoreMedia/CoreMedia.h>
 #import <dlfcn.h>
+#import <setjmp.h>
+#import <signal.h>
 
 // Soft reference: the symbol is not in the public header and its on-device
 // export is not guaranteed; dyld must never see a hard bind (that kills the
 // process before main() when the symbol is absent).
 typedef int (*KPCMGetDMVersionLevelFromRPUFn)(CFDataRef);
+
+static void *gKPRPUFunctionPtr;
 
 static int KPCallRPUVersionLevel(CFDataRef data, BOOL *available) {
     static void *handle;
@@ -15,6 +19,7 @@ static int KPCallRPUVersionLevel(CFDataRef data, BOOL *available) {
     if (!function) {
         handle = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
         if (handle) function = (KPCMGetDMVersionLevelFromRPUFn)dlsym(handle, "CMGetDMVersionLevelFromRPU");
+        gKPRPUFunctionPtr = (void *)function;
     }
     if (!function) {
         if (available) *available = NO;
@@ -22,6 +27,31 @@ static int KPCallRPUVersionLevel(CFDataRef data, BOOL *available) {
     }
     if (available) *available = YES;
     return function(data);
+}
+
+// Same-thread fault guard: a bad parse may SIGSEGV inside CoreMedia on the
+// calling thread; we trap it and report instead of dying (V3 pattern).
+static sigjmp_buf gKPRPUJmp;
+static volatile sig_atomic_t gKPRPUActive;
+static struct sigaction gKPRPUOldSEGV, gKPRPUOldBUS;
+static void KPRPUFault(int signal) {
+    (void)signal;
+    if (gKPRPUActive) {
+        gKPRPUActive = 0;
+        siglongjmp(gKPRPUJmp, 1);
+    }
+}
+static void KPRPUInstallGuard(void) {
+    struct sigaction action = {0};
+    action.sa_handler = KPRPUFault;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    sigaction(SIGSEGV, &action, &gKPRPUOldSEGV);
+    sigaction(SIGBUS, &action, &gKPRPUOldBUS);
+}
+static void KPRPURemoveGuard(void) {
+    sigaction(SIGSEGV, &gKPRPUOldSEGV, NULL);
+    sigaction(SIGBUS, &gKPRPUOldBUS, NULL);
 }
 
 // Known-good empty-dmv1 RBSP prefix (dovi_tool reference corpus, 112-byte
@@ -160,13 +190,26 @@ static uint32_t KPCRC32MPEG2(const uint8_t *data, size_t len) {
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     int status = -1;
     BOOL available = NO;
-    @try {
-        status = KPCallRPUVersionLevel(cfData, &available);
-    } @catch (NSException *exception) {
-        result[@"exception"] = exception.reason ?: exception.name;
+    BOOL faulted = NO;
+
+    KPRPUInstallGuard();
+    if (sigsetjmp(gKPRPUJmp, 1) == 0) {
+        gKPRPUActive = 1;
+        @try {
+            status = KPCallRPUVersionLevel(cfData, &available);
+        } @catch (NSException *exception) {
+            result[@"exception"] = exception.reason ?: exception.name;
+        }
+        gKPRPUActive = 0;
+    } else {
+        faulted = YES;
+        gKPRPUActive = 0;
     }
+    KPRPURemoveGuard();
+
     result[@"seconds"] = @(CFAbsoluteTimeGetCurrent() - t0);
     result[@"parser_exported"] = @(available);
+    result[@"faulted"] = @(faulted);
     result[@"cm_status"] = @(status);
     if (cfData) CFRelease(cfData);
     return result;
@@ -186,12 +229,21 @@ static uint32_t KPCRC32MPEG2(const uint8_t *data, size_t len) {
     NSData *baseline = [self buildRPUWithBlockID:0 count:0];
     [report appendFormat:@"baseline(empty): %@\n", [self callParserWithData:baseline label:@"empty"]];
 
+    // Slide oracle for the PC-side watchpoint session.
+    if (gKPRPUFunctionPtr) {
+        Dl_info info = {0};
+        if (dladdr(gKPRPUFunctionPtr, &info) && info.dli_fbase) {
+            [report appendFormat:@"CoreMedia fbase=%p fn=%p (watchpoint slide oracle)\n",
+                info.dli_fbase, gKPRPUFunctionPtr];
+        }
+    }
+
     if (self.armed) {
         struct { uint8_t id; uint32_t capacity; const char *name; } cases[] = {
             {10, 4, "A10"}, {2, 8, "B2"}, {6, 5, "C6"}
         };
         for (size_t c = 0; c < 3; c++) {
-            for (uint32_t over = 1; over <= 4; over++) {
+            for (uint32_t over = 1; over <= 8; over++) {
                 uint32_t count = cases[c].capacity + over;
                 NSData *rpu = [self buildRPUWithBlockID:cases[c].id count:count];
                 NSString *label = [NSString stringWithFormat:@"%s-o%u(id=%u,count=%u)",

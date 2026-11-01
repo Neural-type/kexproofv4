@@ -54,6 +54,53 @@
     [KPLog.shared append:@"Independent CVE re-audit rig. Sources: Apple advisories 149226/149230,"];
     [KPLog.shared append:@"Xplo8E PoC, Appknox write-up — not the local hunter reports."];
     [KPLog.shared append:@"Terminal log: legacy v1 panel. Target: iPhone 15 Pro / iOS 27.0.1."];
+    [self scheduleAutoRunFromArguments];
+}
+
+// PC-driven sessions: launch-application ... --run=<module-id> [--run-all-armed]
+- (void)scheduleAutoRunFromArguments {
+    NSMutableArray<NSString *> *wanted = [NSMutableArray array];
+    BOOL allArmed = NO;
+    for (NSString *arg in NSProcessInfo.processInfo.arguments) {
+        if ([arg hasPrefix:@"--run="]) {
+            [wanted addObject:[arg substringFromIndex:6]];
+        } else if ([arg isEqualToString:@"--run-all-armed"]) {
+            allArmed = YES;
+        }
+    }
+    if (!wanted.count && !allArmed) return;
+    [KPLog.shared appendFormat:@"[auto-run] scheduled: %@%@",
+        wanted.count ? [wanted componentsJoinedByString:@","] : @"(none)",
+        allArmed ? @" + all-armed" : @""];
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        NSMutableArray<id<KPTestModule>> *queue = [NSMutableArray array];
+        if (allArmed) {
+            for (id<KPTestModule> module in self.modules) {
+                if ([module.identifier containsString:@"armed"] ||
+                    [module.identifier containsString:@"survey"]) {
+                    [queue addObject:module];
+                }
+            }
+        }
+        for (NSString *identifier in wanted) {
+            for (id<KPTestModule> module in self.modules) {
+                if ([module.identifier isEqualToString:identifier] && ![queue containsObject:module]) {
+                    [queue addObject:module];
+                }
+            }
+        }
+        if (queue.count) {
+            [KPLog.shared appendFormat:@"[auto-run] firing %lu module(s)", (unsigned long)queue.count];
+            [self startModules:queue];
+        } else {
+            [KPLog.shared append:@"[auto-run] no matching modules"];
+        }
+    });
 }
 
 - (void)configureModules {

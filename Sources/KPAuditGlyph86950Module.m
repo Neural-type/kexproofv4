@@ -38,8 +38,12 @@ typedef bool (*KPOsFeatureEnabledFn)(const char *domain, const char *feature);
     NSMutableString *out = [NSMutableString string];
     void *handle = dlopen("/usr/lib/system/libsystem_featureflags.dylib", RTLD_LAZY);
     KPOsFeatureEnabledFn isEnabled = (KPOsFeatureEnabledFn)dlsym(handle, "os_feature_enabled");
+    if (!isEnabled) isEnabled = (KPOsFeatureEnabledFn)dlsym(handle, "os_feature_enabled_impl");
+    if (!isEnabled) isEnabled = (KPOsFeatureEnabledFn)dlsym(handle, "_os_feature_enabled_impl");
+    if (!isEnabled) isEnabled = (KPOsFeatureEnabledFn)dlsym(RTLD_DEFAULT, "os_feature_enabled");
+    if (!isEnabled) isEnabled = (KPOsFeatureEnabledFn)dlsym(RTLD_DEFAULT, "os_feature_enabled_impl");
     [out appendFormat:@"featureflags_dylib=%@ sym=%@\n",
-        handle ? @"loaded" : @"missing", isEnabled ? @"os_feature_enabled" : @"(nil)"];
+        handle ? @"loaded" : @"missing", isEnabled ? @"resolved" : @"(nil)"];
 
     BOOL before = NO, known = NO;
     if (isEnabled) {

