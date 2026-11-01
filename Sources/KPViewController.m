@@ -6,6 +6,7 @@
 #import "KPAuditPDF112611Module.h"
 #import "KPAuditRPU112688Module.h"
 #import "KPAuditCoW112576Module.h"
+#import "KPAuditCoWIntegrityModule.h"
 #import "KPAuditUAF84495Module.h"
 #import "KPLog.h"
 #import "KPLogTerminalView.h"
@@ -117,6 +118,8 @@
         [[KPAuditRPU112688Module alloc] initWithArmed:YES],
         [[KPAuditCoW112576Module alloc] initWithArmed:NO],
         [[KPAuditCoW112576Module alloc] initWithArmed:YES],
+        [[KPAuditCoWIntegrityModule alloc] initWithArmed:NO],
+        [[KPAuditCoWIntegrityModule alloc] initWithArmed:YES],
         [[KPAuditUAF84495Module alloc] initWithArmed:NO],
         [[KPAuditUAF84495Module alloc] initWithArmed:YES],
     ];
