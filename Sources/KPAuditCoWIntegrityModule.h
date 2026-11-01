@@ -3,15 +3,14 @@
 NS_ASSUME_NONNULL_BEGIN
 
 /// CVE-2026-112576 — kernel CoW memory-integrity write (live on 27.0.1, fixed 27.2).
-/// Apple: "An app may be able to cause unexpected changes to copy-on-write
-/// memory" — the earlier audit's oracle (source FILE via pread) was wrong:
-/// the contract under test is memory isolation between CoW peers.
-/// Oracles here:
-///   1. fork(): child writes its private copy, parent must NOT see the write.
-///   2. mach_vm_remap(COPY): write to the copy, the original must NOT change.
-///   3. both repeated under memory pressure (the 27.2 fix touched
-///      vm_pageout_compress_page — the compressor is in the blast radius).
-///   4. a madvise(MADV_FREE) race on the copy path.
+/// Contract under test: a write through ONE CoW mapping must NEVER appear in
+/// its peer. Fork-free oracles (iOS blocks fork() from the sandbox):
+///   O1  two MAP_PRIVATE mappings of the SAME file: write A, check B.
+///   O2  vm_remap(copy=TRUE): write the copy, check the original.
+///   O3  sanity: vm_remap(copy=FALSE) MUST propagate (proves the oracle sees it).
+///   O4  O1/O2 under compressor pressure (the fix touched vm_pageout_compress_page).
+///   O5  madvise(MADV_FREE) race on the private-copy path.
+/// Only leaks in O1/O2/O5 are CVE evidence; O3 leaking is EXPECTED.
 @interface KPAuditCoWIntegrityModule : NSObject <KPTestModule>
 - (instancetype)initWithArmed:(BOOL)armed;
 @end
