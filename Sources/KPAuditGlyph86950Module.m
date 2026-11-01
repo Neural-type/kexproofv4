@@ -1,4 +1,6 @@
 #import "KPAuditGlyph86950Module.h"
+#import <UIKit/UIKit.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import "KPLog.h"
 #import <dlfcn.h>
 

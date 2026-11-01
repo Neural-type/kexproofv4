@@ -1,6 +1,8 @@
 #import "KPAuditCoW112576Module.h"
 #import "KPLog.h"
+#import <UIKit/UIKit.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
 #import <pthread.h>
 #import <sys/mman.h>
 #import <sys/wait.h>

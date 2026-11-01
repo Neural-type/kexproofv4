@@ -1,7 +1,11 @@
 #import "KPAuditUAF84495Module.h"
+#import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <sys/stat.h>
-#import <sandbox.h>
+
+// sandbox_check lives in libsystem but its prototype is not public SDK API.
+enum { KPSandboxFilterPath = 1 };
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
 
 @interface KPAuditUAF84495Module ()
 @property (nonatomic, assign) BOOL armed;
@@ -112,12 +116,12 @@
     [report appendString:@"--- sandbox probes ---\n"];
     if (getuid() == 501) {
         int check = sandbox_check(getpid(), "file-write-data",
-                                  SANDBOX_FILTER_PATH, "/dev/bpf0");
+                                  KPSandboxFilterPath, "/dev/bpf0");
         [report appendFormat:@"sandbox_check(file-write-data,/dev/bpf0)=%d "
                              @"(0=allowed, -1=denied errno=%@)\n",
             check, [self describeErrno:errno]];
         check = sandbox_check(getpid(), "file-read-data",
-                              SANDBOX_FILTER_PATH, "/dev/bpf0");
+                              KPSandboxFilterPath, "/dev/bpf0");
         [report appendFormat:@"sandbox_check(file-read-data,/dev/bpf0)=%d\n", check];
     }
 

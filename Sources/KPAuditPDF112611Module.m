@@ -1,4 +1,5 @@
 #import "KPAuditPDF112611Module.h"
+#import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <CoreGraphics/CoreGraphics.h>
 
@@ -32,7 +33,11 @@
 
 - (NSData *)buildPDFWithFunctionCount:(uint32_t)R rows:(uint32_t)rows {
     NSMutableString *pdf = [NSMutableString string];
-    [pdf appendString:@"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n"];
+    [pdf appendString:@"%PDF-1.4\n%"];
+    // Binary comment line: four high-bit bytes, appended as raw Latin-1.
+    unsigned char marker[4] = {0xE2, 0xE3, 0xCF, 0xD3};
+    [pdf appendString:[[NSString alloc] initWithBytes:marker length:4 encoding:NSISOLatin1StringEncoding]];
+    [pdf appendString:@"\n"];
 
     NSMutableArray<NSNumber *> *offsets = [NSMutableArray array]; // 1-based object offsets
     void (^mark)(void) = ^{

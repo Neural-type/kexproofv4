@@ -1,4 +1,5 @@
 #import "KPAuditRPU112688Module.h"
+#import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <CoreMedia/CoreMedia.h>
 

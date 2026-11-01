@@ -1,5 +1,7 @@
 #import "KPAuditLP112621Module.h"
+#import <UIKit/UIKit.h>
 #import "KPLog.h"
+#import <objc/message.h>
 #import <LinkPresentation/LinkPresentation.h>
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -117,29 +119,38 @@
         // Direct image route: LPMetadataProvider feeds LPImage; multi-frame HEIC
         // is accepted by -[LPImage _isAnimated] for image/heic, which spawns
         // LPAnimatedImageTranscoder — the vulnerable consumer.
-        dispatch_semaphore_t sema = dispatch_semaphore_create(0);
-        __block NSDictionary *fetchInfo = nil;
+        // Selector is not in every SDK header; dispatch dynamically.
         LPMetadataProvider *provider = [[LPMetadataProvider alloc] init];
         provider.timeout = 30;
-        [provider startFetchingMetadataForImageAtFileURL:fileURL
-                                      completionHandler:^(LPLinkMetadata *metadata, NSError *error) {
-            NSMutableDictionary *info = [NSMutableDictionary dictionary];
-            info[@"route"] = @"startFetchingMetadataForImageAtFileURL";
-            if (error) {
-                info[@"error"] = error.localizedDescription ?: error.domain;
-                info[@"error_code"] = @(error.code);
+        SEL imageSel = NSSelectorFromString(@"startFetchingMetadataForImageAtFileURL:completionHandler:");
+        if ([provider respondsToSelector:imageSel]) {
+            dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+            __block NSDictionary *fetchInfo = nil;
+            void (^handler)(LPLinkMetadata *, NSError *) = ^(LPLinkMetadata *metadata, NSError *error) {
+                NSMutableDictionary *info = [NSMutableDictionary dictionary];
+                info[@"route"] = @"startFetchingMetadataForImageAtFileURL";
+                if (error) {
+                    info[@"error"] = error.localizedDescription ?: error.domain;
+                    info[@"error_code"] = @(error.code);
+                } else {
+                    info[@"status"] = @"COMPLETED";
+                    info[@"title"] = metadata.title ?: @"(nil)";
+                }
+                fetchInfo = info;
+                dispatch_semaphore_signal(sema);
+            };
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            ((void (*)(id, SEL, id, id))objc_msgSend)(provider, imageSel, fileURL, handler);
+#pragma clang diagnostic pop
+            long waited = dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(40 * NSEC_PER_SEC)));
+            if (waited != 0) {
+                result[@"timeout"] = @YES;
             } else {
-                info[@"status"] = @"COMPLETED";
-                info[@"title"] = metadata.title ?: @"(nil)";
+                result[@"image_route"] = fetchInfo ?: @{};
             }
-            fetchInfo = info;
-            dispatch_semaphore_signal(sema);
-        }];
-        long waited = dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(40 * NSEC_PER_SEC)));
-        if (waited != 0) {
-            result[@"timeout"] = @YES;
         } else {
-            result[@"image_route"] = fetchInfo ?: @{};
+            result[@"image_route"] = @"SELECTOR_NOT_AVAILABLE";
         }
     } else {
         result[@"image_route"] = @"NOT_AVAILABLE_BEFORE_IOS16";
