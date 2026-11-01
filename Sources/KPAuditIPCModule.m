@@ -2,7 +2,7 @@
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <mach/mach.h>
-#import <mach/mach_message.h>
+#import <mach/message.h>
 
 @interface KPAuditIPCModule ()
 @property (nonatomic, copy) NSString *identifier;
