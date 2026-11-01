@@ -7,6 +7,7 @@
 #import "KPAuditRPU112688Module.h"
 #import "KPAuditCoW112576Module.h"
 #import "KPAuditCoWIntegrityModule.h"
+#import "KPAuditAVE112705Module.h"
 #import "KPAuditUAF84495Module.h"
 #import "KPLog.h"
 #import "KPLogTerminalView.h"
@@ -120,6 +121,9 @@
         [[KPAuditCoW112576Module alloc] initWithArmed:YES],
         [[KPAuditCoWIntegrityModule alloc] initWithArmed:NO],
         [[KPAuditCoWIntegrityModule alloc] initWithArmed:YES],
+        [[KPAuditAVE112705Module alloc] initWithTemporalLayers:1],
+        [[KPAuditAVE112705Module alloc] initWithTemporalLayers:16462],
+        [[KPAuditAVE112705Module alloc] initWithTemporalLayers:16463],
         [[KPAuditUAF84495Module alloc] initWithArmed:NO],
         [[KPAuditUAF84495Module alloc] initWithArmed:YES],
     ];
