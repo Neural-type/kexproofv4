@@ -78,8 +78,8 @@
     }
 
     kern_return_t kr = mach_msg((mach_msg_header_t *)buf, MACH_SEND_MSG,
-                                0, (mach_msg_size_t)total,
-                                port, 1, MACH_PORT_NULL);
+                                (mach_msg_size_t)total, 0,
+                                MACH_PORT_NULL, 2, MACH_PORT_NULL);
     result[@"send_kr"] = @(kr);
     if (kr != KERN_SUCCESS) {
         free(buf);
@@ -157,7 +157,8 @@
         }
     }
     kern_return_t kr = mach_msg((mach_msg_header_t *)buf, MACH_SEND_MSG,
-                                0, (mach_msg_size_t)total, port, 1, MACH_PORT_NULL);
+                                (mach_msg_size_t)total, 0,
+                                MACH_PORT_NULL, 2, MACH_PORT_NULL);
     result[@"shape"] = shape;
     result[@"size"] = @(total);
     result[@"desc_size"] = @(descSize);
