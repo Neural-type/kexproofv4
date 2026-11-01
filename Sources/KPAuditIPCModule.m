@@ -67,7 +67,7 @@
     uint8_t *descBase = buf + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t);
     for (uint32_t i = 0; i < count; i++) {
         mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)(descBase + i * 16);
-        pd->name = (void *)(uintptr_t)sendRight;
+        pd->name = sendRight;
         pd->disposition = MACH_MSG_TYPE_COPY_SEND;
         pd->type = MACH_MSG_PORT_DESCRIPTOR;
     }
