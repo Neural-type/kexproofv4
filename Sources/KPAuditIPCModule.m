@@ -77,9 +77,10 @@
         pd->type = MACH_MSG_PORT_DESCRIPTOR;
     }
 
-    kern_return_t kr = mach_msg((mach_msg_header_t *)buf, MACH_SEND_MSG,
+    kern_return_t kr = mach_msg((mach_msg_header_t *)buf,
+                                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
                                 (mach_msg_size_t)total, 0,
-                                MACH_PORT_NULL, 2, MACH_PORT_NULL);
+                                MACH_PORT_NULL, 2000, MACH_PORT_NULL);
     result[@"send_kr"] = @(kr);
     if (kr != KERN_SUCCESS) {
         free(buf);
@@ -87,13 +88,15 @@
     }
 
     // RECEIVE — this is where ipc_port_translate_receive runs (the OOB site).
+    // Without MACH_RCV_TIMEOUT the receive blocks forever on an empty queue
+    // (that's what hung the last run).
     size_t rcvTotal = total + 64;
     uint8_t *rcv = calloc(1, rcvTotal);
     mach_msg_header_t *rh = (mach_msg_header_t *)rcv;
     rh->msgh_size = (mach_msg_size_t)rcvTotal;
     rh->msgh_local_port = port;
-    kr = mach_msg(rh, MACH_RCV_MSG, 0, (mach_msg_size_t)rcvTotal,
-                  port, 1, MACH_PORT_NULL);
+    kr = mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, (mach_msg_size_t)rcvTotal,
+                  port, 2000, MACH_PORT_NULL);
     result[@"recv_kr"] = @(kr);
     if (kr == KERN_SUCCESS) {
         mach_msg_body_t *rb = (mach_msg_body_t *)(rcv + sizeof(mach_msg_header_t));
@@ -156,9 +159,10 @@
             pd->type = MACH_MSG_PORT_DESCRIPTOR;
         }
     }
-    kern_return_t kr = mach_msg((mach_msg_header_t *)buf, MACH_SEND_MSG,
+    kern_return_t kr = mach_msg((mach_msg_header_t *)buf,
+                                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
                                 (mach_msg_size_t)total, 0,
-                                MACH_PORT_NULL, 2, MACH_PORT_NULL);
+                                MACH_PORT_NULL, 2000, MACH_PORT_NULL);
     result[@"shape"] = shape;
     result[@"size"] = @(total);
     result[@"desc_size"] = @(descSize);
