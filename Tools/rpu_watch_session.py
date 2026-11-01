@@ -26,41 +26,49 @@ from rsp_client import RSPClient  # noqa: E402
 BUNDLE_ID = "com.stealth.kexproofv4.ZK3K3TZ6JR"
 STATIC_TEXT = 0x18EE1B000
 STATIC_BREAK = 0x18EFBF974
-MODULE_ARG = "--run=rpu112688.armed"
-RSP_PORT = 12345
+MODULE_ARGS = ["--run=cow112576.armed", "--run=rpu112688.armed"]
+RSP_PORT = 12349
 
 
 def sh(args, timeout=60):
     print("EXEC", " ".join(args), flush=True)
-    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    return result.stdout + result.stderr
+    result = subprocess.run(args, capture_output=True, timeout=timeout)
+    return (result.stdout or b"").decode("utf-8", "replace") + (result.stderr or b"").decode("utf-8", "replace")
 
 
-def launch_suspended():
+def launch_with_lead():
+    # cow112576.armed runs first and takes seconds (256 forks) — that is the
+    # attach window for the debugger before rpu112688.armed starts.
     out = sh([sys.executable, "-m", "pymobiledevice3", "developer", "core-device",
-              "launch-application", BUNDLE_ID, MODULE_ARG,
-              "--kill-existing", "--suspended"], timeout=90)
-    print(out, flush=True)
-    match = re.search(r'"?pid"?[:=]\s*(\d+)', out)
+              "launch-application", BUNDLE_ID,
+              "--kill-existing", "--"] + MODULE_ARGS, timeout=90)
+    print(out[:1500], flush=True)
+    match = re.search(r'"processIdentifier"\s*:\s*(\d+)', out)
     if match:
         return int(match.group(1))
-    time.sleep(2)
+    time.sleep(1)
     out = sh([sys.executable, "-m", "pymobiledevice3", "developer", "core-device",
               "list-processes"], timeout=60)
-    for line in out.splitlines():
-        if BUNDLE_ID in line or "KexProofV4" in line:
-            digits = re.findall(r'\b(\d{2,7})\b', line)
-            if digits:
-                return int(digits[-1])
-    raise RuntimeError("could not determine pid:\n" + out)
+    try:
+        processes = json.loads(out)
+    except ValueError:
+        raise RuntimeError("list-processes not JSON:\n" + out[:1500])
+    for process in processes:
+        url = process.get("executableURL", {}).get("relative", "")
+        if "KexProofV4.app" in url:
+            pid = int(process["processIdentifier"])
+            print(f"FOUND pid={pid} {url}", flush=True)
+            return pid
+    raise RuntimeError("KexProofV4 not in process list")
 
 
 def coremedia_text_base(pid):
     out = sh([sys.executable, "-m", "pymobiledevice3", "developer", "dvt",
               "vm-regions", str(pid)], timeout=120)
-    regions = json.loads(out)
+    regions, _ = json.JSONDecoder().raw_decode(out.lstrip())
     for region in regions:
-        if region.get("path", "").endswith("CoreMedia.framework/CoreMedia") and region.get("type") == "__TEXT__":
+        path = region.get("path") or ""
+        if path.endswith("CoreMedia.framework/CoreMedia") and region.get("type") == "__TEXT":
             return int(region["start"])
     raise RuntimeError("CoreMedia __TEXT not found in vm-regions")
 
@@ -79,24 +87,24 @@ def main():
     block_id = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     over = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 
+    server_log = open(str(Path(__file__).parent / "debugserver.log"), "wb")
     server = subprocess.Popen(
         [sys.executable, "-m", "pymobiledevice3", "developer", "debugserver",
          "start-server", "--userspace", "--local-port", str(RSP_PORT)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(3)
+        stdout=server_log, stderr=subprocess.STDOUT)
+    time.sleep(7)
     try:
-        pid = launch_suspended()
+        pid = launch_with_lead()
         print(f"PID {pid}", flush=True)
-        text_base = coremedia_text_base(pid)
-        slide = text_base - STATIC_TEXT
-        breakpoint = STATIC_BREAK + slide
-        print(f"SLIDE 0x{slide:x} CoreMedia__TEXT=0x{text_base:x} break=0x{breakpoint:x}", flush=True)
-
-        rsp = RSPClient(pid, port=RSP_PORT)
+        rsp = RSPClient(pid, port=RSP_PORT)  # vAttach stops the process
         entry_bp = False
         watch = None
         outcome = "NOT_OBSERVED"
         try:
+            text_base = coremedia_text_base(pid)
+            slide = text_base - STATIC_TEXT
+            breakpoint = STATIC_BREAK + slide
+            print(f"SLIDE 0x{slide:x} CoreMedia__TEXT=0x{text_base:x} break=0x{breakpoint:x}", flush=True)
             rsp.set_breakpoint(breakpoint, 0, 4)
             entry_bp = True
             print("CONTINUE_FOR_PARSE", flush=True)

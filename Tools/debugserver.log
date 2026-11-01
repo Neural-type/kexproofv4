@@ -1,0 +1,11 @@
+
+Follow the following connections steps from LLDB:
+
+(lldb) platform select remote-ios
+(lldb) target create /path/to/local/application.app
+(lldb) script lldb.target.module[0].SetPlatformFileSpec(lldb.SBFileSpec('/private/var/containers/Bundle/Application/<APP-UUID>/application.app'))
+(lldb) process connect connect://[127.0.0.1]:12349   <-- ACTUAL CONNECTION DETAILS!
+(lldb) process launch
+
+Started port forwarding. Press Ctrl-C to close this shell when done
+2026-11-01 23:25:23 Desktop pymobiledevice3.tcp_forwarder[45928] INFO connection established from ('127.0.0.1', 57984)
