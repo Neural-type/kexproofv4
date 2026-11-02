@@ -135,7 +135,7 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
         void *msg = figXPCCreateBasicMessage(opcode, NULL);
         if (!msg) { [self journal:[NSString stringWithFormat:@"create %@ failed", opStr]]; continue; }
         __block xpc_object_t reply = NULL;
-        my_xpc_conn_send_reply(conn, (__bridge xpc_object_t)msg, NULL, ^(xpc_object_t r) { reply = r; });
+        my_xpc_conn_send_reply(conn, (__bridge xpc_object_t)msg, NULL, (__bridge void *)^(xpc_object_t r) { reply = r; });
         usleep(100000);
         [self journal:[NSString stringWithFormat:@"handshake %@: reply=%p", opStr, reply]];
     }
@@ -152,7 +152,7 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
     [self journal:[NSString stringWithFormat:@"Curl: %@", urlStr]];
 
     __block xpc_object_t curlReply = NULL;
-    my_xpc_conn_send_reply(conn, (__bridge xpc_object_t)curlMsg, NULL, ^(xpc_object_t r) { curlReply = r; });
+    my_xpc_conn_send_reply(conn, (__bridge xpc_object_t)curlMsg, NULL, (__bridge void *)^(xpc_object_t r) { curlReply = r; });
     usleep(200000);
 
     if (!curlReply) {
@@ -172,7 +172,6 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
     [self journal:[NSString stringWithFormat:@"GOT FD: %d", fd]];
     my_xpc_conn_cancel(conn);
     return fd;
-}
 }
 - (NSString *)runReport {
     NSMutableString *report = [NSMutableString string];
