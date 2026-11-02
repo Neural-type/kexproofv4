@@ -240,7 +240,7 @@
                 [report appendFormat:@"*** CG BUFFER ADJACENT SIZES: %lu corrupted ***\n",
                  (unsigned long)corrupted.count];
                 [corrupted enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
-                    [report appendFormat:@"  -> %u bytes\n", sizes[idx]];
+                    [report appendFormat:@"  -> %u bytes\n", (uint32_t)idx < 13 ? (uint32_t)(64 + idx * 64) : 0];
                 }];
             } else {
                 [report appendString:@"No canary corruption — CG buffer not adjacent to our objects.\n"];
