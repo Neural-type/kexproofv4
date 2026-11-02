@@ -1,6 +1,13 @@
 #import "KPLogTerminalView.h"
 #import "KPLog.h"
 
+@interface KPLogTerminalView () {
+    NSMutableString *_pendingBuffer;
+    NSTimer *_flushTimer;
+    BOOL _needsScroll;
+}
+@end
+
 @implementation KPLogTerminalView
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -19,13 +26,26 @@
         self.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
         self.accessibilityLabel = @"KexProof terminal log";
         self.text = @"";
+        _pendingBuffer = [NSMutableString string];
+        _needsScroll = NO;
 
         __weak typeof(self) weakSelf = self;
         KPLog.shared.onAppend = ^(NSString *text) {
             [weakSelf appendRaw:text];
         };
+
+        // Flush timer: batch UI updates every 300ms
+        _flushTimer = [NSTimer scheduledTimerWithTimeInterval:0.3
+                                                       target:self
+                                                     selector:@selector(flushBuffer)
+                                                     userInfo:nil
+                                                      repeats:YES];
     }
     return self;
+}
+
+- (void)dealloc {
+    [_flushTimer invalidate];
 }
 
 - (void)appendLine:(NSString *)text {
@@ -34,16 +54,35 @@
 
 - (void)appendRaw:(NSString *)text {
     if (!text.length) return;
+    @synchronized (_pendingBuffer) {
+        [_pendingBuffer appendString:text];
+        _needsScroll = YES;
+    }
+}
+
+- (void)flushBuffer {
+    NSString *pending;
+    BOOL scroll;
+    @synchronized (_pendingBuffer) {
+        if (_pendingBuffer.length == 0) return;
+        pending = [_pendingBuffer copy];
+        [_pendingBuffer setString:@""];
+        scroll = _needsScroll;
+        _needsScroll = NO;
+    }
+
     NSDictionary *attributes = @{
         NSFontAttributeName: self.font,
         NSForegroundColorAttributeName: self.textColor
     };
     NSTextStorage *storage = self.textStorage;
-    [storage appendAttributedString:[[NSAttributedString alloc] initWithString:text attributes:attributes]];
+    [storage appendAttributedString:[[NSAttributedString alloc] initWithString:pending attributes:attributes]];
     if (storage.length > 524288) {
         [storage deleteCharactersInRange:NSMakeRange(0, storage.length - 393216)];
     }
-    [self scrollToBottom];
+    if (scroll) {
+        [self scrollToBottom];
+    }
 }
 
 - (void)scrollToBottom {
