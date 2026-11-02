@@ -50,17 +50,21 @@ static BOOL isKernelPtr(uint64_t v) {
         || (v >> 32) == 0xffffffe0ULL || (v >> 32) == 0xffffffe1ULL;
 }
 
-// Known static segment bases for iOS 27.0.1 (from kernelcache analysis)
-// These are the UNSLID addresses. slide = runtime_addr - static_addr.
+// Known static segment bases for iOS 27.0.1 iPhone16,1 (from kernelcache Mach-O)
 static const uint64_t kStaticBases[] = {
-    0xfffffff007004000ULL,  // __TEXT (typical XNU base)
-    0xfffffff008000000ULL,  // __TEXT segment
-    0xfffffff009000000ULL,  // __DATA segment
-    0xfffffff00a000000ULL,  // __DATA_CONST
-    0xfffffff00b000000ULL,  // __LINKEDIT
+    0xfffffff007004000ULL,  // __TEXT
+    0xfffffff00700c000ULL,  // __PRELINK_TEXT
+    0xfffffff007ce0000ULL,  // __DATA_CONST
+    0xfffffff0082b0000ULL,  // __DATA_SPTM
+    0xfffffff0082fc000ULL,  // __TEXT_EXEC
+    0xfffffff00b02c000ULL,  // __TEXT_BOOT_EXEC
+    0xfffffff00b034000ULL,  // __PRELINK_INFO
+    0xfffffff00b284000ULL,  // __DATA
+    0xfffffff00b4e8000ULL,  // __LINKEDIT
 };
 static const char *kStaticNames[] = {
-    "__TEXT_base", "__TEXT", "__DATA", "__DATA_CONST", "__LINKEDIT"
+    "__TEXT", "__PRELINK_TEXT", "__DATA_CONST", "__DATA_SPTM",
+    "__TEXT_EXEC", "__TEXT_BOOT_EXEC", "__PRELINK_INFO", "__DATA", "__LINKEDIT"
 };
 static const int kStaticCount = sizeof(kStaticBases) / sizeof(kStaticBases[0]);
 
@@ -134,8 +138,8 @@ static const int kStaticCount = sizeof(kStaticBases) / sizeof(kStaticBases[0]);
             for (int b = 0; b < kStaticCount; b++) {
                 if (v > kStaticBases[b]) {
                     uint64_t slide = v - kStaticBases[b];
-                    // Valid slide: positive, page-aligned, < 256MB
-                    if ((slide & 0x3FFF) == 0 && slide < (256ULL << 20)) {
+                    // Valid slide: positive, page-aligned, < 1GB (iOS 27 SPTM)
+                    if ((slide & 0x3FFF) == 0 && slide < (1024ULL << 20)) {
                         // Check if this slide is already in candidates
                         BOOL found = NO;
                         for (int c = 0; c < candidateCount; c++) {
