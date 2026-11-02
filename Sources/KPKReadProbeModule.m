@@ -388,7 +388,7 @@ static BOOL isKernelPointer(uint64_t v) {
         memcpy(snap, (void *)scanAddr, scanSize);
 
         // For each kernel pointer, record its diffs
-        for (size_t i = 0; i < words && structuresFound < 10; i++) {
+        for (size_t i = 0; i < words && structuresFound < 50; i++) {
             uint64_t v = rp[i];
             if (!isKernelPointer(v) || v == 0xffffffffffffffffULL) continue;
             if ((v & 0xfff) == 0xfff) continue;
@@ -439,7 +439,9 @@ static BOOL isKernelPointer(uint64_t v) {
                 for (int d = 0; d < nd; d++) {
                     uint32_t lo = (uint32_t)(diffs[d] & 0xffffffff);
                     uint32_t hi = (uint32_t)(diffs[d] >> 32);
-                    if (lo == (uint32_t)myPID || hi == (uint32_t)myPID) {
+                    if (lo == (uint32_t)myPID || hi == (uint32_t)myPID ||
+                    (lo > 0 && lo < 65536 && lo == (uint32_t)myPID) ||
+                    (hi > 0 && hi < 65536 && hi == (uint32_t)myPID)) {
                         [report appendFormat:@"  *** PID found in diff at +0x%zx! ***\n", diffs_off[d]];
                     }
                 }
@@ -448,7 +450,7 @@ static BOOL isKernelPointer(uint64_t v) {
                 for (int d = 0; d < nd; d++) {
                     uint32_t lo = (uint32_t)(diffs[d] & 0xffffffff);
                     uint32_t hi = (uint32_t)(diffs[d] >> 32);
-                    if (lo == 501 || lo == 0 || hi == 501 || hi == 0) {
+                    if (lo == 501 || lo == 0 || hi == 501 || hi == 0 || lo == (uint32_t)myUID) {
                         if (diffs_was[d] != 0 || diffs[d] != 0) {
                             [report appendFormat:@"  possible uid field at +0x%zx: %u/%u -> %u/%u\n",
                              diffs_off[d], lo, hi, (uint32_t)(diffs[d] & 0xffffffff), (uint32_t)(diffs[d] >> 32)];
@@ -461,7 +463,7 @@ static BOOL isKernelPointer(uint64_t v) {
         }
 
         free(snap);
-        if (structuresFound >= 10) break;
+        if (structuresFound >= 50) break;
     }
 
     [report appendFormat:@"\nstructures analyzed: %d\n", structuresFound];
