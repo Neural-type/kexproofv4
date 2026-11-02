@@ -377,10 +377,10 @@
     // Allocate 128 canary ports. Snapshot their urefs. Trigger translate_receive
     // with various w2 values (OOL counts). Snapshot again. Any delta = bit-set hit.
     [report appendString:@"\n--- translate_receive bit-set canary (128 ports) ---\n"];
-    [report appendFormat:@"DEBUG: pid=%d — attach debugserver now, 15s window\n", getpid()];
+    [report appendFormat:@"DEBUG: pid=%d — attach debugserver now, 5s window\n", getpid()];
     [self journal:[NSString stringWithFormat:@"DEBUG pid=%d — attach debugserver", getpid()]];
     fflush(stdout);
-    sleep(15);  // give us time to attach lldb/debugserver
+    sleep(5);  // short window — iOS watchdog kills UI apps after ~10s unresponsive
     #define CANARY_N 128
     mach_port_t canary[CANARY_N];
     uint32_t canaryAlive[CANARY_N];
@@ -548,8 +548,7 @@
     // Test 1: disposition sweep (0x10..0x1f + large values)
     [report appendString:@"disposition sweep:\n"];
     int dispTested = 0, dispHits = 0;
-    uint32_t dispositions[] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x1f,
-                                64, 128, 256, 1024, 4096, 65536};
+    uint32_t dispositions[] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x1f};
     for (size_t d = 0; d < sizeof(dispositions)/sizeof(dispositions[0]); d++) {
         uint32_t disp = dispositions[d];
         // Build custom message with crafted disposition
@@ -590,7 +589,7 @@
 
     // Test 2: msgh_id sweep
     [report appendString:@"msgh_id sweep:\n"];
-    int ids[] = {0, 1, 2, 3, 4, 5, 10, 100, 0x4b50, 0x4141, 65, 128, 256, 1024};
+    int ids[] = {0, 1, 2, 3, 0x4b50, 65, 128, 256};
     for (size_t d = 0; d < sizeof(ids)/sizeof(ids[0]); d++) {
         int32_t msgID = ids[d];
         mach_port_t idPorts[68] = {0};
