@@ -188,7 +188,7 @@
             // Try sending a simple message
             xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
             __block xpc_object_t reply = NULL;
-            my_xpc_conn_send_reply(conn, msg, NULL, ^(xpc_object_t r) { reply = r; });
+            my_xpc_conn_send_reply(conn, msg, NULL, (__bridge void *)^(xpc_object_t r) { reply = r; });
             usleep(100000);
 
             if (reply) {
