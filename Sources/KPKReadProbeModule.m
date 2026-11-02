@@ -666,7 +666,7 @@ static BOOL isKernelPointer(uint64_t v) {
         int shown = 0;
         for (int i = 0; i < nkptrs && shown < 8; i++) {
             if ((kptrs10[i] & ~0x3ffffULL) == clusterBase[c]) {
-                [report appendFormat:@"  [user+0x%zx] -> kernel 0x%llx\n", kptrAddrs10[i], kptrs10[i]);
+                [report appendFormat:@"  (user+0x%zx) -> kernel 0x%llx\n", kptrAddrs10[i], kptrs10[i]];
                 shown++;
             }
         }
