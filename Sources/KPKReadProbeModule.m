@@ -128,7 +128,7 @@ static BOOL isKernelPointer(uint64_t v) {
                 kptrs[kptrCount] = v;
                 kptrOffsets[kptrCount] = i * 8;
                 kptrCount++;
-                [report appendFormat:@"kptr[%d] @ +0x%zx: 0x%llx\n", kptrCount - 1, i * 8, v];
+                [report appendFormat:@"kptr(%%d) @ +0x%%zx: 0x%%llx\n", (int)(kptrCount - 1), (size_t)(i * 8), (unsigned long long)v];
             }
         }
     }
@@ -140,7 +140,7 @@ static BOOL isKernelPointer(uint64_t v) {
         [report appendString:@"\n--- Phase 4: diff-test kptr fields ---\n"];
         for (int k = 0; k < kptrCount; k++) {
             uint64_t orig = out64[kptrOffsets[k] / 8];
-            [report appendFormat:@"kptr[%d] @ +0x%zx: 0x%llx -> +0x100\n", k, kptrOffsets[k], orig];
+            [report appendFormat:@"kptr(%%d) @ +0x%%zx: 0x%%llx -> +0x100\n", (int)k, (size_t)*(kptrOffsets + k), (unsigned long long)orig];
 
             // Modify by +0x100
             in64[kptrOffsets[k] / 8] = orig + 0x100;
@@ -428,10 +428,10 @@ static BOOL isKernelPointer(uint64_t v) {
                 }
                 if (nd >= 2) {
                 // Analyze diff pattern
-                [report appendFormat:@"\nkptr[+0x%zx] = 0x%llx -> %d diffs:\n", i * 8, v, nd];
+                [report appendFormat:@"\nkptr(+0x%%zx) = 0x%%llx -> %%d diffs:\n", (size_t)(i * 8), (unsigned long long)v, (int)nd];
                 for (int d = 0; d < nd; d++) {
                     uint64_t delta = (diffs[d] > diffs_was[d]) ? diffs[d] - diffs_was[d] : diffs_was[d] - diffs[d];
-                    [report appendFormat:@"  [+0x%zx] 0x%llx -> 0x%llx (delta=0x%llx)\n",
+                    [report appendFormat:@"  (+0x%%zx) 0x%%llx -> 0x%%llx (delta=0x%%llx)\n",
                      diffs_off[d], diffs_was[d], diffs[d], delta];
                 }
 
@@ -443,7 +443,7 @@ static BOOL isKernelPointer(uint64_t v) {
                     if (lo == (uint32_t)myPID || hi == (uint32_t)myPID ||
                     (lo > 0 && lo < 65536 && lo == (uint32_t)myPID) ||
                     (hi > 0 && hi < 65536 && hi == (uint32_t)myPID)) {
-                        [report appendFormat:@"  *** PID found in diff at +0x%zx! ***\n", diffs_off[d]];
+                        [report appendFormat:@"  *** PID found in diff at +0x%%zx! ***\n", (size_t)*(diffs_off + d)];
                     }
                 }
 
