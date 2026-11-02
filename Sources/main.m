@@ -38,11 +38,6 @@ int main(int argc, char *argv[]) {
     @autoreleasepool {
         NSLog(@"[KexProofV4] launch");
 
-        // Run fd leak BEFORE UIKit
-        NSLog(@"[fdleak] preflight starting...");
-        int fr = fdleak_preflight();
-        NSLog(@"[fdleak] preflight result: %d", fr);
-
         return UIApplicationMain(argc, argv, nil, NSStringFromClass(KPAppDelegate.class));
     }
 }
