@@ -12,6 +12,7 @@
 #import "KPAuditAVEPANModule.h"
 #import "KPAuditIPCModule.h"
 #import "KPKReadProbeModule.h"
+#import "KPKASLRBypassModule.h"
 #import "KPAuditUAF84495Module.h"
 #import "KPLog.h"
 #import "KPLogTerminalView.h"
@@ -134,6 +135,7 @@
         [[KPAuditAVEPANModule alloc] initWithTemporalLayers:16471],
         [[KPAuditIPCModule alloc] initWithNameSweep],
         [[KPKReadProbeModule alloc] initWithNameSweep],
+        [[KPKASLRBypassModule alloc] initWithNameSweep],
         [[KPAuditUAF84495Module alloc] initWithArmed:NO],
         [[KPAuditUAF84495Module alloc] initWithArmed:YES],
     ];
