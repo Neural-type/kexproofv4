@@ -14,6 +14,7 @@
 #import "KPKReadProbeModule.h"
 #import "KPKASLRBypassModule.h"
 #import "KPFDLeakModule.h"
+#import "KPINFileLeakModule.h"
 #import "KPAuditUAF84495Module.h"
 #import "KPLog.h"
 #import "KPLogTerminalView.h"
@@ -119,6 +120,7 @@
         [[KPKReadProbeModule alloc] initWithNameSweep],
         [[KPKASLRBypassModule alloc] initWithNameSweep],
         [[KPFDLeakModule alloc] initWithNameSweep],
+        [[KPINFileLeakModule alloc] initWithNameSweep],
         [[KPAuditLP112621Module alloc] initWithArmed:NO],
         [[KPAuditLP112621Module alloc] initWithArmed:YES],
         [[KPAuditGlyph86950Module alloc] initWithArmed:NO],
