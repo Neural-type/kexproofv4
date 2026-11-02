@@ -3,7 +3,6 @@
 #import "KPLog.h"
 #import <mach/mach.h>
 #import <mach/message.h>
-#import <mach/mach_vm.h>
 
 @interface KPAuditIPCModule ()
 @property (nonatomic, copy) NSString *identifier;
@@ -260,9 +259,9 @@
                 }
                 // deallocate the kernel-allocated port array
                 if (rod->address != NULL && rod->count > 0) {
-                    mach_vm_deallocate(mach_task_self(),
-                                       (mach_vm_address_t)rod->address,
-                                       (mach_vm_size_t)(rod->count * sizeof(mach_port_t)));
+                    vm_deallocate(mach_task_self(),
+                                  (vm_address_t)rod->address,
+                                  (vm_size_t)(rod->count * sizeof(mach_port_t)));
                 }
             }
         }
