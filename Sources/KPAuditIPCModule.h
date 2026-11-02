@@ -15,6 +15,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// name values) through a local port pair and journals each result.
 @interface KPAuditIPCModule : NSObject <KPTestModule>
 - (instancetype)initWithNameSweep;
+- (NSDictionary *)sendOOLPortsCount:(uint32_t)count realEntries:(uint32_t)real port:(mach_port_t)port sendRight:(mach_port_t)sendRight useSpray:(BOOL)useSpray;
 @end
 
 NS_ASSUME_NONNULL_END
