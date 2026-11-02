@@ -2,6 +2,8 @@
 #import <dlfcn.h>
 #import <unistd.h>
 #import <xpc/xpc.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 // Standalone KexProof — no UIKit, no scene management
 // All output goes to file, no UI
