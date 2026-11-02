@@ -140,19 +140,29 @@ static const int kStaticCount = sizeof(kStaticBases) / sizeof(kStaticBases[0]);
                     uint64_t slide = v - kStaticBases[b];
                     // Valid slide: positive, page-aligned, < 1GB (iOS 27 SPTM)
                     if ((slide & 0x3FFF) == 0 && slide < (1024ULL << 20)) {
-                        // Check if this slide is already in candidates
-                        BOOL found = NO;
-                        for (int c = 0; c < candidateCount; c++) {
-                            if (slideCandidates[c] == slide) {
-                                slideCounts[c]++;
-                                found = YES;
-                                break;
+                        // Verify pointer falls WITHIN segment bounds
+                        // Segment sizes from kernelcache Mach-O
+                        static const uint64_t kStaticSizes[] = {
+                            0x8000, 0xcd4000, 0x5d0000, 0x4c000,
+                            0x2d30000, 0x8000, 0x250000, 0x264000, 0xc0000
+                        };
+                        uint64_t segEnd = kStaticBases[b] + kStaticSizes[b];
+                        uint64_t runtimeSegEnd = segEnd + slide;
+                        if (v < runtimeSegEnd) {
+                            // Check if this slide is already in candidates
+                            BOOL found = NO;
+                            for (int c = 0; c < candidateCount; c++) {
+                                if (slideCandidates[c] == slide) {
+                                    slideCounts[c]++;
+                                    found = YES;
+                                    break;
+                                }
                             }
-                        }
-                        if (!found && candidateCount < MAX_CANDIDATES) {
-                            slideCandidates[candidateCount] = slide;
-                            slideCounts[candidateCount] = 1;
-                            candidateCount++;
+                            if (!found && candidateCount < MAX_CANDIDATES) {
+                                slideCandidates[candidateCount] = slide;
+                                slideCounts[candidateCount] = 1;
+                                candidateCount++;
+                            }
                         }
                     }
                 }
