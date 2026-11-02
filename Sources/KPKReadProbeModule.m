@@ -366,6 +366,7 @@ static BOOL isKernelPointer(uint64_t v) {
     // Read-only: modify kptr by +0x100, record ALL diffs, restore.
     // Build a map: kptr -> affected fields. Identify proc/ucred patterns.
     [report appendString:@"\n--- Phase 8: structure analysis (safe, read-only) ---\n"];
+    int myUID2 = getuid();
 
     scanAddr = 0; scanSize = 0;
     int structuresFound = 0;
@@ -450,7 +451,7 @@ static BOOL isKernelPointer(uint64_t v) {
                 for (int d = 0; d < nd; d++) {
                     uint32_t lo = (uint32_t)(diffs[d] & 0xffffffff);
                     uint32_t hi = (uint32_t)(diffs[d] >> 32);
-                    if (lo == 501 || lo == 0 || hi == 501 || hi == 0 || lo == (uint32_t)myUID) {
+                    if (lo == 501 || lo == 0 || hi == 501 || hi == 0 || lo == (uint32_t)myUID2) {
                         if (diffs_was[d] != 0 || diffs[d] != 0) {
                             [report appendFormat:@"  possible uid field at +0x%zx: %u/%u -> %u/%u\n",
                              diffs_off[d], lo, hi, (uint32_t)(diffs[d] & 0xffffffff), (uint32_t)(diffs[d] >> 32)];
