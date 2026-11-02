@@ -42,9 +42,7 @@
 }
 
 static BOOL isKernelPointer(uint64_t v) {
-    // arm64e kernel pointers: top bits 0xfffffff0..0xffffffff
-    // PAC-signed: 0xfffffff8..0xffffffff typically
-    return (v >> 40) >= 0xfffffff0ULL;
+    return (v >> 32) >= 0xffffffe0ULL;
 }
 
 - (NSString *)runReport {
