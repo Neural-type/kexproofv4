@@ -119,7 +119,8 @@
         [[KPAuditIPCModule alloc] initWithNameSweep],
         [[KPKReadProbeModule alloc] initWithNameSweep],
         [[KPKASLRBypassModule alloc] initWithNameSweep],
-        [[KPFDLeakModule alloc] initWithNameSweep],
+        // FD leak: enable manually when needed (XPC crashes UIKit)
+        // [[KPFDLeakModule alloc] initWithNameSweep],
         [[KPINFileLeakModule alloc] initWithNameSweep],
         [[KPAuditLP112621Module alloc] initWithArmed:NO],
         [[KPAuditLP112621Module alloc] initWithArmed:YES],
