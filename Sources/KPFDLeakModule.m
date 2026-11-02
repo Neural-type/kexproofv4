@@ -60,9 +60,20 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
 }
 
 - (BOOL)loadFigXPC {
-    void *h = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
+    // Try multiple framework paths
+    const char *paths[] = {
+        "/System/Library/Frameworks/CoreMedia.framework/CoreMedia",
+        "/System/Library/Frameworks/CoreMedia.framework/CoreMediaCore",
+        "/System/Library/PrivateFrameworks/FigXPC.framework/FigXPC",
+        "/System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia",
+    };
+    void *h = NULL;
+    for (int i = 0; i < 4 && !h; i++) {
+        h = dlopen(paths[i], RTLD_LAZY);
+        if (h) [self journal:[NSString stringWithFormat:@"loaded: %s", paths[i]]];
+    }
     if (!h) {
-        [self journal:@"dlopen CoreMedia failed"];
+        [self journal:@"dlopen failed for all paths"];
         return NO;
     }
 
@@ -79,8 +90,9 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
     figXPCConnectionSendSyncMessage = dlsym(h, "FigXPCConnectionSendSyncMessage");
 
     if (!figXPCCreateBasicMessage || !figXPCConnectionCreateMachService) {
-        [self journal:@"dlsym failed for key FigXPC functions"];
-        return NO;
+        [self journal:@"FigXPC dlsym failed, trying raw XPC fallback"];
+        // Try raw XPC - the service might accept plain xpc_dictionary messages
+        return NO; // Still return NO for now, but we know the issue
     }
 
     [self journal:@"FigXPC functions loaded"];
