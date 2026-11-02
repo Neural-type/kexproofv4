@@ -166,9 +166,9 @@ static BOOL isKernelPointer(uint64_t v) {
     for (size_t i = 0; i < regionSize / 8; i++) in64[i] = 0;
 
     size_t sysctlSize = regionSize;
-    int mib[] = { CTL_KERN, KERN_PROC_ALL };
-    int ret = sysctl(mib, 2, (void *)inputAddr, &sysctlSize, NULL, 0);
-    [report appendFormat:@"sysctl(KERN_PROC_ALL) ret=%d size=%zu\n", ret, sysctlSize];
+    int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    int ret = sysctl(mib, 4, (void *)inputAddr, &sysctlSize, NULL, 0);
+    [report appendFormat:@"sysctl(KERN_PROC_PID %d) ret=%d size=%zu\n", getpid(), ret, sysctlSize];
 
     if (ret == 0 && sysctlSize > 0) {
         int kptr2 = 0;
