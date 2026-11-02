@@ -118,7 +118,7 @@
         [[KPAuditIPCModule alloc] initWithNameSweep],
         [[KPKReadProbeModule alloc] initWithNameSweep],
         [[KPKASLRBypassModule alloc] initWithNameSweep],
-        [[KPFDLeakModule alloc] initWithNameSweep],
+        // [[KPFDLeakModule alloc] initWithNameSweep], // disabled — crashes UIKit scene
         [[KPAuditLP112621Module alloc] initWithArmed:NO],
         [[KPAuditLP112621Module alloc] initWithArmed:YES],
         [[KPAuditGlyph86950Module alloc] initWithArmed:NO],
