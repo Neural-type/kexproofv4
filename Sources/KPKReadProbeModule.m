@@ -2,7 +2,6 @@
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 
 @interface KPKReadProbeModule ()
 @property (nonatomic, copy) NSString *identifier;
