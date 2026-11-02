@@ -7,6 +7,7 @@
 #import <sys/stat.h>
 #import <fcntl.h>
 #import <unistd.h>
+#include <dirent.h>
 
 // FigXPC function pointers (loaded via dlsym)
 static void *(*figXPCCreateBasicMessage)(uint32_t, void *);
@@ -99,7 +100,9 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
     figXPCConnectionResume(conn);
 
     // Handshake: .rp1 -> .rp2 -> .org
-    for (const char *opcode in @[@".rp1", @".rp2", @".org"]) {
+    NSArray *opcodes = @[@".rp1", @".rp2", @".org"];
+    for (NSString *opStr in opcodes) {
+        const char *opcode = opStr.UTF8String;
         void *msg = figXPCCreateBasicMessage(*(uint32_t *)[opcode UTF8String], NULL);
         if (!msg) {
             [self journal:[NSString stringWithFormat:@"create %s message failed", opcode]];
