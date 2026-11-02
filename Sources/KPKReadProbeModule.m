@@ -415,7 +415,17 @@ static BOOL isKernelPointer(uint64_t v) {
             rp[i] = v; // restore
             usleep(100);
 
-            if (nd >= 2) {
+            // Filter: if all kptrs produce identical diffs, it's a timestamp (false positive)
+                // Only report if this kptr produces UNIQUE diffs (causal)
+                static int last_nd = 0;
+                static uint64_t last_delta = 0;
+                if (nd >= 2 && diffs[0] != 0) {
+                    uint64_t d0 = (diffs[0] > diffs_was[0]) ? diffs[0] - diffs_was[0] : diffs_was[0] - diffs[0];
+                    if (last_nd == nd && d0 == last_delta) continue; // timestamp, skip
+                    last_nd = nd;
+                    last_delta = d0;
+                }
+                if (nd >= 2) {
                 // Analyze diff pattern
                 [report appendFormat:@"\nkptr[+0x%zx] = 0x%llx -> %d diffs:\n", i * 8, v, nd];
                 for (int d = 0; d < nd; d++) {
