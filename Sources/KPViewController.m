@@ -129,6 +129,9 @@ static void KPSignalHandler(int sig) {
     self.modules = @[
         [[KPDeviceInfoModule alloc] init],
         [[KPResourceLoaderModule alloc] init],
+        [[KPAuditIPCModule alloc] initWithNameSweep],
+        [[KPKReadProbeModule alloc] initWithNameSweep],
+        [[KPKASLRBypassModule alloc] initWithNameSweep],
         [[KPAuditLP112621Module alloc] initWithArmed:NO],
         [[KPAuditLP112621Module alloc] initWithArmed:YES],
         [[KPAuditGlyph86950Module alloc] initWithArmed:NO],
@@ -148,9 +151,6 @@ static void KPSignalHandler(int sig) {
         [[KPAuditAVESpriteModule alloc] initWithSprayCount:64 marker:0x43434343],
         [[KPAuditAVEPANModule alloc] initWithTemporalLayers:16467],
         [[KPAuditAVEPANModule alloc] initWithTemporalLayers:16471],
-        [[KPAuditIPCModule alloc] initWithNameSweep],
-        [[KPKReadProbeModule alloc] initWithNameSweep],
-        [[KPKASLRBypassModule alloc] initWithNameSweep],
         [[KPAuditUAF84495Module alloc] initWithArmed:NO],
         [[KPAuditUAF84495Module alloc] initWithArmed:YES],
     ];
@@ -304,6 +304,8 @@ static void KPSignalHandler(int sig) {
                 signal(SIGSEGV, KPSignalHandler);
                 signal(SIGBUS, KPSignalHandler);
                 signal(SIGABRT, KPSignalHandler);
+                signal(SIGILL, KPSignalHandler);
+                signal(SIGFPE, KPSignalHandler);
                 if (sigsetjmp(gKPSigJmpBuf, 1) == 0) {
                     gKPInProtected = 1;
                     report = [module runReport];
