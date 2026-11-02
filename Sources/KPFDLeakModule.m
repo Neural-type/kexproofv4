@@ -103,7 +103,9 @@ static int (*figXPCConnectionSendSyncMessage)(void *, void *, void **);
     NSArray *opcodes = @[@".rp1", @".rp2", @".org"];
     for (NSString *opStr in opcodes) {
         const char *opcode = opStr.UTF8String;
-        void *msg = figXPCCreateBasicMessage(*(uint32_t *)[opcode UTF8String], NULL);
+        uint32_t opcodeVal = 0;
+        memcpy(&opcodeVal, opcode, 4);
+        void *msg = figXPCCreateBasicMessage(opcodeVal, NULL);
         if (!msg) {
             [self journal:[NSString stringWithFormat:@"create %s message failed", opcode]];
             return -1;
