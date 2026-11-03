@@ -3,6 +3,7 @@
 #import "KPLog.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
+#import <IOSurface/IOSurface.h>
 #import <mach/mach.h>
 
 @interface KPH9EncoderModule ()
@@ -294,7 +295,73 @@
         }
     }
 
-    // === stage9 PANIC RUNG — DISABLED (reboots device) ===
+    // === IOSurface kernel write detection ===
+    [report appendString:@"\n--- IOSurface kernel write detection ---\n"];
+    NSDictionary *surfProps = @{
+        (id)kIOSurfaceWidth: @(64),
+        (id)kIOSurfaceHeight: @(64),
+        (id)kIOSurfaceBytesPerElement: @(4),
+        (id)kIOSurfacePixelFormat: @(0x42475241), // BGRA
+    };
+    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)surfProps);
+    if (surf) {
+        IOSurfaceLock(surf, 0, NULL);
+        void *surfBase = IOSurfaceGetBaseAddress(surf);
+        size_t surfSize = IOSurfaceGetSize(surf);
+        // Fill with known pattern
+        memset(surfBase, 0x41, surfSize);
+        uint32_t *p32 = (uint32_t *)surfBase;
+        for (int i = 0; i < 16; i++) p32[i] = 0xDEAD0000 + i;
+        IOSurfaceUnlock(surf, 0, NULL);
+        [report appendFormat:@"  IOSurface created: %zu bytes at %p\n", surfSize, surfBase];
+
+        // Read back after a moment — if kernel wrote, we'll see it
+        IOSurfaceLock(surf, 0, NULL);
+        uint32_t *check = (uint32_t *)IOSurfaceGetBaseAddress(surf);
+        int kernelWrites = 0;
+        for (int i = 0; i < 16; i++) {
+            if (check[i] != 0xDEAD0000 + i) {
+                [report appendFormat:@"  CHANGED [%d]: 0x%08x (was 0x%08x)\n", i, check[i], 0xDEAD0000 + i];
+                kernelWrites++;
+            }
+        }
+        IOSurfaceUnlock(surf, 0, NULL);
+        [report appendFormat:@"  kernel writes detected: %d\n", kernelWrites];
+        CFRelease(surf);
+    } else {
+        [report appendString:@"  IOSurfaceCreate FAILED\n"];
+    }
+
+    // === UserDPB properties (AVE27 stage12) ===
+    [report appendString:@"\n--- UserDPB properties (AVE27 stage12) ---\n"];
+    VTCompressionSessionRef sdpb = NULL;
+    OSStatus stdpb = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
+        NULL, NULL, NULL, NULL, NULL, &sdpb);
+    if (stdpb == noErr && sdpb) {
+        // Test UserDPB-related properties
+        NSArray *dpbKeys = @[
+            @"UserDPBFramesForFaceTime",
+            @"EnableUserRefForFacetime",
+            @"AllocateRVRABuffers",
+            @"DPBRequirements",
+            @"UserDPB",
+        ];
+        for (NSString *key in dpbKeys) {
+            CFNumberRef testNum = CFNumberCreate(NULL, kCFNumberIntType, &(int){24});
+            OSStatus setSt = VTSessionSetProperty(sdpb, (__bridge CFStringRef)key, testNum);
+            CFRelease(testNum);
+            [report appendFormat:@"  set %@ = %d\n", key, (int)setSt];
+        }
+        // Try DPBRequirements as array
+        NSMutableArray *dpbArr = [NSMutableArray array];
+        for (int i = 0; i < 24; i++) [dpbArr addObject:@(i)];
+        OSStatus setSt2 = VTSessionSetProperty(sdpb, CFSTR("DPBRequirements"), (__bridge CFArrayRef)dpbArr);
+        [report appendFormat:@"  set DPBRequirements array(24) = %d\n", (int)setSt2];
+        CFRelease(sdpb);
+    }
+
+    // === stage9 PANIC RUNG — DISABLED ===
     // To enable: uncomment the block below
     // [report appendString:@"\n--- stage9: PANIC RUNG (NTL=16463) ---\n"];
     // VTCompressionSessionRef s9 = NULL;
