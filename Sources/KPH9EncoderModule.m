@@ -348,6 +348,68 @@
         [report appendString:@"  dlopen IOSurface failed\n"];
     }
 
+    // === AVE27 stage14: EncoderUsage/RCMode acceptance matrix ===
+    [report appendString:@"\n--- AVE27 stage14: EncoderUsage/RCMode matrix ---\n"];
+    int usages[] = { 0, 1, 2, 3, 4 };
+    int rcModes[] = { 0, 1, 2, 3, 4, 5, 10, 20 };
+    for (int u = 0; u < 5; u++) {
+        for (int r = 0; r < 8; r++) {
+            VTCompressionSessionRef sm = NULL;
+            OSStatus stm = VTCompressionSessionCreate(
+                kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
+                NULL, NULL, NULL, NULL, NULL, &sm);
+            if (stm != noErr || !sm) continue;
+            // Set EncoderUsage first
+            int usage = usages[u];
+            CFNumberRef nu = CFNumberCreate(NULL, kCFNumberIntType, &usage);
+            OSStatus stU = VTSessionSetProperty(sm, CFSTR("EncoderUsage"), nu);
+            CFRelease(nu);
+            // Then RCMode
+            int rcMode = rcModes[r];
+            CFNumberRef nr = CFNumberCreate(NULL, kCFNumberIntType, &rcMode);
+            OSStatus stR = VTSessionSetProperty(sm, CFSTR("RCMode"), nr);
+            CFRelease(nr);
+            // Try UserDPB
+            int val8 = 8;
+            CFNumberRef n8 = CFNumberCreate(NULL, kCFNumberIntType, &val8);
+            OSStatus stD = VTSessionSetProperty(sm, CFSTR("UserDPBFramesForFaceTime"), n8);
+            CFRelease(n8);
+            // Only log if something works
+            if (stU == 0 || stR == 0 || stD == 0) {
+                [report appendFormat:@"  usage=%d rc=%d: U=%d R=%d DPB=%d\n", usage, rcMode, (int)stU, (int)stR, (int)stD];
+            }
+            CFRelease(sm);
+        }
+    }
+    [report appendString:@"  matrix done (only logged accepted combos)\n"];
+
+    // === RCMode first, then EncoderUsage ===
+    [report appendString:@"\n--- RCMode first, then EncoderUsage ---\n"];
+    for (int r = 0; r < 8; r++) {
+        VTCompressionSessionRef sm = NULL;
+        OSStatus stm = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
+            NULL, NULL, NULL, NULL, NULL, &sm);
+        if (stm != noErr || !sm) continue;
+        int rcMode = rcModes[r];
+        CFNumberRef nr = CFNumberCreate(NULL, kCFNumberIntType, &rcMode);
+        OSStatus stR = VTSessionSetProperty(sm, CFSTR("RCMode"), nr);
+        CFRelease(nr);
+        int usage = 1;
+        CFNumberRef nu = CFNumberCreate(NULL, kCFNumberIntType, &usage);
+        OSStatus stU = VTSessionSetProperty(sm, CFSTR("EncoderUsage"), nu);
+        CFRelease(nu);
+        int val8 = 8;
+        CFNumberRef n8 = CFNumberCreate(NULL, kCFNumberIntType, &val8);
+        OSStatus stD = VTSessionSetProperty(sm, CFSTR("UserDPBFramesForFaceTime"), n8);
+        CFRelease(n8);
+        if (stR == 0 || stU == 0 || stD == 0) {
+            [report appendFormat:@"  rc=%d usage=1: R=%d U=%d DPB=%d\n", rcMode, (int)stR, (int)stU, (int)stD];
+        }
+        CFRelease(sm);
+    }
+    [report appendString:@"  reverse order done\n"];
+
     // === UserDPB properties (AVE27 stage12) — proper order ===
     [report appendString:@"\n--- UserDPB properties (AVE27 stage12) ---\n"];
     VTCompressionSessionRef sdpb = NULL;
