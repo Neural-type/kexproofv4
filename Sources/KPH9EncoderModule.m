@@ -364,33 +364,44 @@
         VTSessionSetProperty(sDPB, CFSTR("EncoderUsage"), nu);
         CFRelease(nu);
 
-        // EnableUserRefForFacetime=1
-        int userRef = 1;
-        CFNumberRef nr = CFNumberCreate(NULL, kCFNumberIntType, &userRef);
-        OSStatus stRef = VTSessionSetProperty(sDPB, CFSTR("EnableUserRefForFacetime"), nr);
-        CFRelease(nr);
-        [report appendFormat:@"  EnableUserRefForFacetime=1 -> %d\n", (int)stRef];
+        // EnableUserRefForFacetime=BOOLEAN true
+        OSStatus stRef = VTSessionSetProperty(sDPB, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        [report appendFormat:@"  EnableUserRefForFacetime=YES -> %d\n", (int)stRef];
 
-        // UserDPBFramesForFaceTime=24
-        int dpbFrames = 24;
-        CFNumberRef nf = CFNumberCreate(NULL, kCFNumberIntType, &dpbFrames);
-        OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), nf);
-        CFRelease(nf);
-        [report appendFormat:@"  UserDPBFramesForFaceTime=24 -> %d\n", (int)stFrames];
-
-        // DPBRequirements
-        NSMutableArray *dpbReq = [NSMutableArray array];
-        for (int i = 0; i < 24; i++) [dpbReq addObject:@(i)];
-        OSStatus stReq = VTSessionSetProperty(sDPB, CFSTR("DPBRequirements"), (__bridge CFArrayRef)dpbReq);
-        [report appendFormat:@"  DPBRequirements(24) -> %d\n", (int)stReq];
-
-        // Encode with B-frames
+        // Encode FIRST frame to initialize encoder (AVE27 stage12 order)
         VTSessionSetProperty(sDPB, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
         OSStatus stPrep = VTCompressionSessionPrepareToEncodeFrames(sDPB);
         [report appendFormat:@"  prepare -> %d\n", (int)stPrep];
 
         if (stPrep == noErr) {
-            for (int i = 0; i < 3; i++) {
+            // First encode (initialize)
+            CVPixelBufferRef pb0 = NULL;
+            CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, NULL, &pb0);
+            if (pb0) {
+                CVPixelBufferLockBaseAddress(pb0, 0);
+                memset(CVPixelBufferGetBaseAddress(pb0), 0x80, CVPixelBufferGetDataSize(pb0));
+                CVPixelBufferUnlockBaseAddress(pb0, 0);
+                VTEncodeInfoFlags f0 = 0;
+                OSStatus stE0 = VTCompressionSessionEncodeFrame(sDPB, pb0, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f0);
+                [report appendFormat:@"  encode[0] (init) -> %d\n", (int)stE0];
+                CVPixelBufferRelease(pb0);
+            }
+
+            // NOW set UserDPBFramesForFaceTime=24 (after init)
+            int dpbFrames = 24;
+            CFNumberRef nf = CFNumberCreate(NULL, kCFNumberIntType, &dpbFrames);
+            OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), nf);
+            CFRelease(nf);
+            [report appendFormat:@"  UserDPBFramesForFaceTime=24 (after init) -> %d\n", (int)stFrames];
+
+            // DPBRequirements
+            NSMutableArray *dpbReq = [NSMutableArray array];
+            for (int i = 0; i < 24; i++) [dpbReq addObject:@(i)];
+            OSStatus stReq = VTSessionSetProperty(sDPB, CFSTR("DPBRequirements"), (__bridge CFArrayRef)dpbReq);
+            [report appendFormat:@"  DPBRequirements(24) -> %d\n", (int)stReq];
+
+            // Encode more frames
+            for (int i = 1; i < 4; i++) {
                 CVPixelBufferRef pbD = NULL;
                 CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, NULL, &pbD);
                 if (!pbD) continue;
@@ -412,6 +423,14 @@
             CFNumberGetValue(rb, kCFNumberIntType, &v);
             [report appendFormat:@"  readback UserDPBFramesForFaceTime=%d\n", v];
             CFRelease(rb);
+        }
+        CFNumberRef rb2 = NULL;
+        VTSessionCopyProperty(sDPB, CFSTR("EnableUserRefForFacetime"), NULL, &rb2);
+        if (rb2) {
+            BOOL v2 = false;
+            CFNumberGetValue(rb2, kCFNumberIntType, &v2);
+            [report appendFormat:@"  readback EnableUserRefForFacetime=%d\n", (int)v2];
+            CFRelease(rb2);
         }
 
         VTCompressionSessionCompleteFrames(sDPB, kCMTimeInvalid);
