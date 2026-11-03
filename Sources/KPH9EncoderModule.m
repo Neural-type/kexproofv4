@@ -348,32 +348,79 @@
         [report appendString:@"  dlopen IOSurface failed\n"];
     }
 
-    // === UserDPB properties (AVE27 stage12) ===
+    // === UserDPB properties (AVE27 stage12) — proper order ===
     [report appendString:@"\n--- UserDPB properties (AVE27 stage12) ---\n"];
     VTCompressionSessionRef sdpb = NULL;
     OSStatus stdpb = VTCompressionSessionCreate(
         kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
         NULL, NULL, NULL, NULL, NULL, &sdpb);
     if (stdpb == noErr && sdpb) {
-        // Test UserDPB-related properties
-        NSArray *dpbKeys = @[
-            @"UserDPBFramesForFaceTime",
-            @"EnableUserRefForFacetime",
-            @"AllocateRVRABuffers",
-            @"DPBRequirements",
-            @"UserDPB",
-        ];
-        for (NSString *key in dpbKeys) {
-            CFNumberRef testNum = CFNumberCreate(NULL, kCFNumberIntType, &(int){24});
-            OSStatus setSt = VTSessionSetProperty(sdpb, (__bridge CFStringRef)key, testNum);
-            CFRelease(testNum);
-            [report appendFormat:@"  set %@ = %d\n", key, (int)setSt];
-        }
-        // Try DPBRequirements as array
+        // Step 1: EncoderUsage=1 (enables extended properties)
+        int usage = 1;
+        CFNumberRef nu = CFNumberCreate(NULL, kCFNumberIntType, &usage);
+        OSStatus stU = VTSessionSetProperty(sdpb, CFSTR("EncoderUsage"), nu);
+        CFRelease(nu);
+        [report appendFormat:@"  EncoderUsage=1 -> %d\n", (int)stU];
+
+        // Step 2: RCMode=20
+        int rcMode = 20;
+        CFNumberRef nr = CFNumberCreate(NULL, kCFNumberIntType, &rcMode);
+        OSStatus stR = VTSessionSetProperty(sdpb, CFSTR("RCMode"), nr);
+        CFRelease(nr);
+        [report appendFormat:@"  RCMode=20 -> %d\n", (int)stR];
+
+        // Step 3: Test UserDPB keys with correct order
+        int val24 = 24;
+        CFNumberRef n24 = CFNumberCreate(NULL, kCFNumberIntType, &val24);
+        OSStatus st1 = VTSessionSetProperty(sdpb, CFSTR("UserDPBFramesForFaceTime"), n24);
+        [report appendFormat:@"  UserDPBFramesForFaceTime=24 -> %d\n", (int)st1];
+        OSStatus st2 = VTSessionSetProperty(sdpb, CFSTR("EnableUserRefForFacetime"), n24);
+        [report appendFormat:@"  EnableUserRefForFacetime=24 -> %d\n", (int)st2];
+        OSStatus st3 = VTSessionSetProperty(sdpb, CFSTR("AllocateRVRABuffers"), n24);
+        [report appendFormat:@"  AllocateRVRABuffers=24 -> %d\n", (int)st3];
+        CFRelease(n24);
+
+        // Step 4: DPBRequirements as array
         NSMutableArray *dpbArr = [NSMutableArray array];
         for (int i = 0; i < 24; i++) [dpbArr addObject:@(i)];
-        OSStatus setSt2 = VTSessionSetProperty(sdpb, CFSTR("DPBRequirements"), (__bridge CFArrayRef)dpbArr);
-        [report appendFormat:@"  set DPBRequirements array(24) = %d\n", (int)setSt2];
+        OSStatus st4 = VTSessionSetProperty(sdpb, CFSTR("DPBRequirements"), (__bridge CFArrayRef)dpbArr);
+        [report appendFormat:@"  DPBRequirements array(24) -> %d\n", (int)st4];
+
+        // Step 5: UserDPB with IOSurface
+        if (isLib) {
+            typedef void *(*ISCreateFn)(CFDictionaryRef);
+            ISCreateFn isCreate2 = (ISCreateFn)dlsym(isLib, "IOSurfaceCreate");
+            if (isCreate2) {
+                NSDictionary *dpbSurfProps = @{
+                    @"IOSurfaceWidth": @24,
+                    @"IOSurfaceHeight": @1,
+                    @"IOSurfaceBytesPerElement": @8,
+                };
+                void *dpbSurf = isCreate2((__bridge CFDictionaryRef)dpbSurfProps);
+                if (dpbSurf) {
+                    OSStatus st5 = VTSessionSetProperty(sdpb, CFSTR("UserDPB"), dpbSurf);
+                    [report appendFormat:@"  UserDPB (IOSurface 24x1) -> %d\n", (int)st5];
+                    // Also try as array of surfaces
+                    NSArray *surfArr = @[(__bridge id)dpbSurf];
+                    OSStatus st6 = VTSessionSetProperty(sdpb, CFSTR("UserDPB"), (__bridge CFArrayRef)surfArr);
+                    [report appendFormat:@"  UserDPB (IOSurface array) -> %d\n", (int)st6];
+                } else {
+                    [report appendString:@"  UserDPB IOSurface create failed\n"];
+                }
+            }
+        }
+
+        // Step 6: Try with NTL set first
+        int ntlTest = 8;
+        CFNumberRef nt = CFNumberCreate(NULL, kCFNumberIntType, &ntlTest);
+        VTSessionSetProperty(sdpb, CFSTR("NumberOfTemporalLayers"), nt);
+        CFRelease(nt);
+        int val8 = 8;
+        CFNumberRef n8 = CFNumberCreate(NULL, kCFNumberIntType, &val8);
+        OSStatus st7 = VTSessionSetProperty(sdpb, CFSTR("UserDPBFramesForFaceTime"), n8);
+        [report appendFormat:@"  UserDPBFramesForFaceTime=8 (after NTL=8) -> %d\n", (int)st7];
+        CFRelease(n8);
+
         CFRelease(sdpb);
     }
 
