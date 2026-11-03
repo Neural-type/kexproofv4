@@ -379,10 +379,11 @@
                     // GPU render to force kernel to use the surface
                     [report appendString:@"rendering to IOSurface via CoreGraphics...\n"];
                     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                    CGContextRef ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs, kCGImageAlphaPremultipliedFirst);
+                    unsigned long rw = 256, rh = 256, rbpr = bpr;
+                    CGContextRef ctx = CGBitmapContextCreate(base, rw, rh, 8, rbpr, cs, kCGImageAlphaPremultipliedFirst);
                     if (ctx) {
                         CGContextSetRGBFillColor(ctx, 1.0, 0.0, 0.0, 1.0);
-                        CGContextFillRect(ctx, CGRectMake(0, 0, w, h));
+                        CGContextFillRect(ctx, CGRectMake(0, 0, rw, rh));
                         CGContextFlush(ctx);
                         CGContextRelease(ctx);
                         [report appendString:@"render complete\n"];
