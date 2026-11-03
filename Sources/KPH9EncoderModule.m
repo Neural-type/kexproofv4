@@ -1,4 +1,5 @@
 #import "KPH9EncoderModule.h"
+#import <UIKit/UIKit.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
