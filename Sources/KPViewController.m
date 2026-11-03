@@ -13,6 +13,7 @@
 #import "KPAuditIPCModule.h"
 #import "KPKReadProbeModule.h"
 #import "KPKASLRBypassModule.h"
+#import "KPMarkerProbeModule.h"
 #import "KPFDLeakModule.h"
 #import "KPINFileLeakModule.h"
 #import "KPAuditUAF84495Module.h"
