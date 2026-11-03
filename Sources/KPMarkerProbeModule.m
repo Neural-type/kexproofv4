@@ -3,6 +3,7 @@
 #import "KPLog.h"
 #import <mach/mach.h>
 #import <dlfcn.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 @interface KPMarkerProbeModule ()
 @property (nonatomic, copy) NSString *identifier;
@@ -373,7 +374,33 @@
                             nonMarkers++;
                         }
                     }
-                    [report appendFormat:@"kernel writes: %d\n", nonMarkers];
+                    [report appendFormat:@"kernel writes (pre-render): %d\n", nonMarkers];
+
+                    // GPU render to force kernel to use the surface
+                    [report appendString:@"rendering to IOSurface via CoreGraphics...\n"];
+                    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                    CGContextRef ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs, kCGImageAlphaPremultipliedFirst);
+                    if (ctx) {
+                        CGContextSetRGBFillColor(ctx, 1.0, 0.0, 0.0, 1.0);
+                        CGContextFillRect(ctx, CGRectMake(0, 0, w, h));
+                        CGContextFlush(ctx);
+                        CGContextRelease(ctx);
+                        [report appendString:@"render complete\n"];
+                    } else {
+                        [report appendString:@"CGBitmapContextCreate failed\n"];
+                    }
+                    CGColorSpaceRelease(cs);
+
+                    // Check for kernel writes AFTER render
+                    int nonMarkers2 = 0;
+                    for (unsigned long j = 0; j < (bpr * h) / 4 && nonMarkers2 < 5; j++) {
+                        unsigned int v = p[j];
+                        if (v != 0xDEAD0000 + (unsigned int)j) {
+                            [report appendFormat:@"AFTER RENDER at +%lu: 0x%08x\n", j * 4, v];
+                            nonMarkers2++;
+                        }
+                    }
+                    [report appendFormat:@"kernel writes (post-render): %d\n", nonMarkers2];
                 }
                 isUnlock(surface, 0, NULL);
                 CFRelease(surface);
