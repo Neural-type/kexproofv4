@@ -285,7 +285,7 @@
                             [report appendFormat:@"  *** PID MATCH! ***\n"];
                         }
                         if (a32 == (uint32_t)myUID || b32 == (uint32_t)myUID) {
-                            [report appendFormat:@"  *** UID MATCH! ***\n");
+                            [report appendFormat:@"  *** UID MATCH! ***\n"];
                         }
                     }
                 }
