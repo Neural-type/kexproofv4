@@ -126,12 +126,12 @@ static void H9BFrameEncode(int w, int h, int fc, int gop) {
     CFRelease(session);
 }
 
-@implementation KPH9EncoderModule
-
-@synthesize identifier = _identifier;
-@synthesize subtitle = _subtitle;
-@synthesize icon = _icon;
-@synthesize section = _section;
+@implementation KPH9EncoderModule {
+    NSString *_identifier;
+    NSString *_subtitle;
+    NSString *_icon;
+    KPTestSection _section;
+}
 
 - (instancetype)init {
     self = [super init];
@@ -147,6 +147,11 @@ static void H9BFrameEncode(int w, int h, int fc, int gop) {
 - (instancetype)initWithNameSweep {
     return [self init];
 }
+
+- (NSString *)identifier { return _identifier; }
+- (NSString *)subtitle { return _subtitle; }
+- (NSString *)icon { return _icon; }
+- (KPTestSection)section { return _section; }
 
 - (NSString *)title { return @"H9 encoder OOB write"; }
 - (NSString *)desc { return @"AVE2 NTL kernel write + B-frame DPB MBStats overflow"; }
