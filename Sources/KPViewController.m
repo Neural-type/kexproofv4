@@ -126,7 +126,8 @@
         [[KPAuditGlyph86950Module alloc] initWithArmed:NO],
         [[KPAuditGlyph86950Module alloc] initWithArmed:YES],
         [[KPAuditPDF112611Module alloc] initWithArmed:NO],
-        [[KPAuditPDF112611Module alloc] initWithArmed:YES],
+        // CG PDF armed: disabled — OOB write corrupts system memory, causes crashes
+        // [[KPAuditPDF112611Module alloc] initWithArmed:YES],
         [[KPAuditRPU112688Module alloc] initWithArmed:NO],
         [[KPAuditRPU112688Module alloc] initWithArmed:YES],
         [[KPAuditCoW112576Module alloc] initWithArmed:NO],
