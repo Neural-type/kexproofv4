@@ -167,7 +167,7 @@
         // Try to send a message to the port
         uint8_t buf[128] = {0};
         mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
-        hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
         hdr->msgh_size = sizeof(mach_msg_header_t);
         hdr->msgh_remote_port = ports[i];
         hdr->msgh_local_port = MACH_PORT_NULL;
@@ -189,7 +189,7 @@
     for (int i = 0; i < PORT_COUNT; i++) {
         uint8_t buf[128] = {0};
         mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
-        hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
         hdr->msgh_size = sizeof(mach_msg_header_t);
         hdr->msgh_remote_port = ports[i];
         hdr->msgh_local_port = MACH_PORT_NULL;
