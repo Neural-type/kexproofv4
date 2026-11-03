@@ -135,4 +135,76 @@
     return report;
 }
 
-@end
+@end    // Systematic property name scan (RE approach)
+    [report appendString:@"\n--- Phase 2: property name scan ---\n"];
+
+    NSMutableArray *deltaArr = [NSMutableArray array];
+    for (int i = 0; i < 32; i++) [deltaArr addObject:@(0x4100 + i)];
+    NSDictionary *rpsInner = @{@"DeltaPOCS0Minus1": deltaArr};
+
+    // Try many property name formats
+    NSArray *propKeys = @[
+        @"UserRPSForFaceTime",
+        @"UserRPS",
+        @"AVEUserRPSForFaceTime",
+        @"AVE.UserRPSForFaceTime",
+        @"kVTCompressionPropertyKey_UserRPSForFaceTime",
+        @"H9UserRPSForFaceTime",
+        @"RPS",
+        @"ReferencePictureSet",
+        @"AVE_HEVC_RPS",
+        @"AVE_ST_RPS",
+        @"FaceTimeRPS",
+    ];
+
+    // Try different value formats
+    NSArray *propValues = @[
+        rpsDict,           // dictionary with DeltaPOCS0Minus1
+        @[rpsDict],        // array of dictionaries
+        deltaArr,          // raw array
+    ];
+
+    for (NSString *key in propKeys) {
+        for (id val in propValues) {
+            status = VTSessionSetProperty(session,
+                (__bridge CFStringRef)key,
+                (__bridge CFPropertyListRef)val);
+            if (status == 0) {
+                [report appendFormat:@"*** SUCCESS: %@ = %@ ***\n", key, val];
+            } else {
+                [report appendFormat:@"fail %d: %@\n", (int)status, key];
+            }
+        }
+    }
+
+    // Also try setting as frame property during encode
+    [report appendString:@"\n--- Phase 2b: frame property scan ---\n"];
+    {
+        CVPixelBufferRef pb2 = NULL;
+        CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
+                             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                             NULL, &pb2);
+        if (pb2) {
+            CVPixelBufferLockBaseAddress(pb2, 0);
+            memset(CVPixelBufferGetBaseAddress(pb2), 0x80, CVPixelBufferGetDataSize(pb2));
+            CVPixelBufferUnlockBaseAddress(pb2, 0);
+
+            for (NSString *key in propKeys) {
+                NSDictionary *fp = @{key: rpsDict};
+                VTEncodeInfoFlags fl = 0;
+                CMTime p = CMTimeMake(0, 30);
+                CMTime d = CMTimeMake(1, 30);
+                status = VTCompressionSessionEncodeFrame(
+                    session, pb2, p, d,
+                    (__bridge CFDictionaryRef)fp, NULL, &fl);
+                [report appendFormat:@"frame %@: %d\n", key, (int)status];
+                if (status == 0) {
+                    [report appendFormat:@"*** FRAME PROP SUCCESS: %@ ***\n", key];
+                    break;
+                }
+            }
+            CVPixelBufferRelease(pb2);
+        }
+    }
+
+
