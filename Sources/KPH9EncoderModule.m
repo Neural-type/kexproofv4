@@ -403,12 +403,26 @@
             }
             [report appendFormat:@"  surfaces created: %lu\n", (unsigned long)surfRefs.count];
 
-            // NOW set UserDPBFramesForFaceTime=24 (after surfaces)
+            // Set UserDPB = IOSurface array (AVE27: this BEFORE UserDPBFrames!)
+            if (surfRefs.count > 0) {
+                // Build CFArray of IOSurfaceRef pointers
+                void **surfPtrs = calloc(surfRefs.count, sizeof(void *));
+                for (NSUInteger i = 0; i < surfRefs.count; i++) {
+                    surfPtrs[i] = [surfRefs[i] pointerValue];
+                }
+                CFArrayRef surfArray = CFArrayCreate(kCFAllocatorDefault, (const void **)surfPtrs, surfRefs.count, &kCFTypeArrayCallBacks);
+                OSStatus stDPBSet = VTSessionSetProperty(sDPB, CFSTR("UserDPB"), surfArray);
+                [report appendFormat:@"  UserDPB (IOSurface array %lu) -> %d\n", (unsigned long)surfRefs.count, (int)stDPBSet];
+                if (surfArray) CFRelease(surfArray);
+                free(surfPtrs);
+            }
+
+            // NOW set UserDPBFramesForFaceTime=24 (after UserDPB)
             int dpbFrames = 24;
             CFNumberRef nf = CFNumberCreate(NULL, kCFNumberIntType, &dpbFrames);
             OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), nf);
             CFRelease(nf);
-            [report appendFormat:@"  UserDPBFramesForFaceTime=24 (after surfaces) -> %d\n", (int)stFrames];
+            [report appendFormat:@"  UserDPBFramesForFaceTime=24 (after UserDPB) -> %d\n", (int)stFrames];
 
             // DPBRequirements
             NSMutableArray *dpbReq = [NSMutableArray array];
