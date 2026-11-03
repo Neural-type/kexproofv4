@@ -199,6 +199,52 @@
          bp, directOK ? @"OK" : @"BLOCKED", dataStr];
     }
 
+    // Phase 6: send INFile to intents_helper via XPC
+    [report appendString:@"\n--- Phase 6: intents_helper XPC ---\n"];
+    {
+        void *xpcLib = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
+        typedef void *(*XPCConnCreateFn)(const char *, void *, uint64_t);
+        typedef void (*XPCConnFn)(void *);
+        typedef void (*XPCConnSendFn)(void *, void *, void *, void *);
+        typedef int (*XPCDictDupFdFn)(void *, const char *);
+
+        XPCConnCreateFn xpcCreate = (XPCConnCreateFn)dlsym(xpcLib, "xpc_connection_create_mach_service");
+        XPCConnFn xpcResume = (XPCConnFn)dlsym(xpcLib, "xpc_connection_resume");
+        XPCConnFn xpcCancel = (XPCConnFn)dlsym(xpcLib, "xpc_connection_cancel");
+        XPCConnSendFn xpcSend = (XPCConnSendFn)dlsym(xpcLib, "xpc_connection_send_message_with_reply");
+        XPCDictDupFdFn xpcDupFd = (XPCDictDupFdFn)dlsym(xpcLib, "xpc_dictionary_dup_fd");
+
+        [report appendFormat:@"XPC: create=%p send=%p dup_fd=%p\n", xpcCreate, xpcSend, xpcDupFd];
+
+        if (xpcCreate && xpcSend) {
+            void *conn = xpcCreate("com.apple.intents.intents-helper", NULL, 0);
+            if (conn) {
+                [report appendString:@"intents_helper connection CREATED\n"];
+                xpcResume(conn);
+
+                // Send a simple message
+                __block void *reply = NULL;
+                // Use a minimal xpc_dictionary as message
+                typedef void *(*XPCDictCreateFn)(void *, void *, unsigned long);
+                XPCDictCreateFn xpcDictCreate = (XPCDictCreateFn)dlsym(xpcLib, "xpc_dictionary_create");
+                void *msg = xpcDictCreate ? xpcDictCreate(NULL, NULL, 0) : NULL;
+                if (msg && xpcSend) {
+                    xpcSend(conn, msg, NULL, (__bridge void *)^(void *r) { reply = r; });
+                    usleep(200000);
+                    [report appendFormat:@"reply: %p\n", reply];
+                } else {
+                    [report appendString:@"msg create failed\n"];
+                }
+                xpcCancel(conn);
+                [report appendString:@"connection cancelled\n"];
+            } else {
+                [report appendString:@"intents_helper connection FAILED\n"];
+            }
+        } else {
+            [report appendString:@"XPC functions not available\n"];
+        }
+    }
+
     // Verdict
     [report appendString:@"\n"];
     [report appendString:@"VERDICT: INFILE_RECON_COMPLETE\n"];
