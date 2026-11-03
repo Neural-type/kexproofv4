@@ -3,8 +3,8 @@
 #import "KPLog.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
-#import <IOSurface/IOSurface.h>
 #import <mach/mach.h>
+#import <dlfcn.h>
 
 @interface KPH9EncoderModule ()
 @property (nonatomic, copy) NSString *identifier;
@@ -295,41 +295,57 @@
         }
     }
 
-    // === IOSurface kernel write detection ===
+    // === IOSurface kernel write detection (dlopen pattern) ===
     [report appendString:@"\n--- IOSurface kernel write detection ---\n"];
-    NSDictionary *surfProps = @{
-        (id)kIOSurfaceWidth: @(64),
-        (id)kIOSurfaceHeight: @(64),
-        (id)kIOSurfaceBytesPerElement: @(4),
-        (id)kIOSurfacePixelFormat: @(0x42475241), // BGRA
-    };
-    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)surfProps);
-    if (surf) {
-        IOSurfaceLock(surf, 0, NULL);
-        void *surfBase = IOSurfaceGetBaseAddress(surf);
-        size_t surfSize = IOSurfaceGetSize(surf);
-        // Fill with known pattern
-        memset(surfBase, 0x41, surfSize);
-        uint32_t *p32 = (uint32_t *)surfBase;
-        for (int i = 0; i < 16; i++) p32[i] = 0xDEAD0000 + i;
-        IOSurfaceUnlock(surf, 0, NULL);
-        [report appendFormat:@"  IOSurface created: %zu bytes at %p\n", surfSize, surfBase];
-
-        // Read back after a moment — if kernel wrote, we'll see it
-        IOSurfaceLock(surf, 0, NULL);
-        uint32_t *check = (uint32_t *)IOSurfaceGetBaseAddress(surf);
-        int kernelWrites = 0;
-        for (int i = 0; i < 16; i++) {
-            if (check[i] != 0xDEAD0000 + i) {
-                [report appendFormat:@"  CHANGED [%d]: 0x%08x (was 0x%08x)\n", i, check[i], 0xDEAD0000 + i];
-                kernelWrites++;
+    void *isLib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+    if (isLib) {
+        typedef void *(*ISCreateFn)(CFDictionaryRef);
+        typedef int (*ISLockFn)(void *, uint32_t, void *);
+        typedef int (*ISUnlockFn)(void *, uint32_t, void *);
+        typedef void *(*ISGetBaseFn)(void *);
+        typedef size_t (*ISGetSizeFn)(void *);
+        ISCreateFn isCreate = (ISCreateFn)dlsym(isLib, "IOSurfaceCreate");
+        ISLockFn isLock = (ISLockFn)dlsym(isLib, "IOSurfaceLock");
+        ISUnlockFn isUnlock = (ISUnlockFn)dlsym(isLib, "IOSurfaceUnlock");
+        ISGetBaseFn isGetBase = (ISGetBaseFn)dlsym(isLib, "IOSurfaceGetBaseAddress");
+        ISGetSizeFn isGetSize = (ISGetSizeFn)dlsym(isLib, "IOSurfaceGetSize");
+        if (isCreate && isLock && isUnlock && isGetBase) {
+            NSDictionary *surfProps = @{
+                @"IOSurfaceWidth": @64,
+                @"IOSurfaceHeight": @64,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @0x42475241,
+            };
+            void *surf = isCreate((__bridge CFDictionaryRef)surfProps);
+            if (surf) {
+                isLock(surf, 0, NULL);
+                void *surfBase = isGetBase(surf);
+                size_t surfSize = isGetSize ? isGetSize(surf) : 64*64*4;
+                memset(surfBase, 0x41, surfSize);
+                uint32_t *p32 = (uint32_t *)surfBase;
+                for (int i = 0; i < 16; i++) p32[i] = 0xDEAD0000 + i;
+                isUnlock(surf, 0, NULL);
+                [report appendFormat:@"  IOSurface: %zu bytes at %p\n", surfSize, surfBase];
+                // Read back
+                isLock(surf, 0, NULL);
+                uint32_t *check = (uint32_t *)isGetBase(surf);
+                int kw = 0;
+                for (int i = 0; i < 16; i++) {
+                    if (check[i] != 0xDEAD0000 + i) {
+                        [report appendFormat:@"  CHANGED [%d]: 0x%08x\n", i, check[i]];
+                        kw++;
+                    }
+                }
+                isUnlock(surf, 0, NULL);
+                [report appendFormat:@"  kernel writes detected: %d\n", kw];
+            } else {
+                [report appendString:@"  IOSurfaceCreate returned NULL\n"];
             }
+        } else {
+            [report appendFormat:@"  dlsym failed: create=%p lock=%p\n", isCreate, isLock];
         }
-        IOSurfaceUnlock(surf, 0, NULL);
-        [report appendFormat:@"  kernel writes detected: %d\n", kernelWrites];
-        CFRelease(surf);
     } else {
-        [report appendString:@"  IOSurfaceCreate FAILED\n"];
+        [report appendString:@"  dlopen IOSurface failed\n"];
     }
 
     // === UserDPB properties (AVE27 stage12) ===
