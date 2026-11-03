@@ -239,7 +239,6 @@ static void H9EncodeCallback(void *outputCallbackRefCon,
 
     const uint8_t *paramSets[] = { vps, sps, pps };
     size_t paramSetSizes[] = { sizeof(vps), sizeof(sps), sizeof(pps) };
-    int nalTypes[] = { 32, 33, 34 }; // VPS=32, SPS=33, PPS=34
 
     CMFormatDescriptionRef fmtDesc = NULL;
     OSStatus status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
@@ -247,7 +246,6 @@ static void H9EncodeCallback(void *outputCallbackRefCon,
         3,          // num param sets
         paramSets,
         paramSetSizes,
-        nalTypes,
         4,          // nalUnitHeaderLength
         &fmtDesc
     );
