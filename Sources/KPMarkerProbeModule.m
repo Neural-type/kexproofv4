@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import <mach/mach.h>
+#import <dlfcn.h>
 
 @interface KPMarkerProbeModule ()
 @property (nonatomic, copy) NSString *identifier;
@@ -316,6 +317,73 @@
         }
     }
     [report appendFormat:@"new kernel pointers from our ports: %d\n", newKptrs];
+
+    // Phase 5: IOSurface shared memory
+    [report appendString:@"\n--- Phase 5: IOSurface shared memory ---\n"];
+    {
+        void *isLib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+        typedef void *(*ISCreateFn)(void *);
+        typedef void (*ISLockFn)(void *, unsigned int, void *);
+        typedef void (*ISUnlockFn)(void *, unsigned int, void *);
+        typedef void *(*ISGetBaseFn)(void *);
+        typedef unsigned long (*ISGetSizeFn)(void *);
+
+        ISCreateFn isCreate = (ISCreateFn)dlsym(isLib, "IOSurfaceCreate");
+        ISLockFn isLock = (ISLockFn)dlsym(isLib, "IOSurfaceLock");
+        ISUnlockFn isUnlock = (ISUnlockFn)dlsym(isLib, "IOSurfaceUnlock");
+        ISGetBaseFn isGetBase = (ISGetBaseFn)dlsym(isLib, "IOSurfaceGetBaseAddress");
+        ISGetSizeFn isGetWidth = (ISGetSizeFn)dlsym(isLib, "IOSurfaceGetWidth");
+        ISGetSizeFn isGetHeight = (ISGetSizeFn)dlsym(isLib, "IOSurfaceGetHeight");
+        ISGetSizeFn isGetBpr = (ISGetSizeFn)dlsym(isLib, "IOSurfaceGetBytesPerRow");
+
+        [report appendFormat:@"IOSurface: create=%p lock=%p base=%p\n", isCreate, isLock, isGetBase];
+
+        if (isCreate && isLock && isGetBase) {
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @256,
+                @"IOSurfaceHeight": @256,
+                @"IOSurfaceBytesPerElement": @4,
+            };
+            void *surface = isCreate((__bridge CFDictionaryRef)props);
+            if (surface) {
+                [report appendFormat:@"surface: %p\n", surface];
+                isLock(surface, 0, NULL);
+                void *base = isGetBase(surface);
+                unsigned long bpr = isGetBpr ? isGetBpr(surface) : 1024;
+                unsigned long h = isGetHeight ? isGetHeight(surface) : 256;
+
+                if (base) {
+                    unsigned int *p = (unsigned int *)base;
+                    for (unsigned long j = 0; j < (bpr * h) / 4; j++) {
+                        p[j] = 0xDEAD0000 + (unsigned int)j;
+                    }
+                    unsigned int first = p[0];
+                    [report appendFormat:@"marker[0] = 0x%08x\n", first];
+
+                    p[0] = 0x1E;
+                    unsigned int rb = p[0];
+                    [report appendFormat:@"corrupt: 0xDEAD0000 -> 0x%08x confirmed=%d\n", rb, rb == 0x1E];
+                    p[0] = 0xDEAD0000;
+
+                    int nonMarkers = 0;
+                    for (unsigned long j = 0; j < (bpr * h) / 4 && nonMarkers < 3; j++) {
+                        unsigned int v = p[j];
+                        if (v != 0xDEAD0000 + (unsigned int)j) {
+                            [report appendFormat:@"kernel write at +%lu: 0x%08x\n", j * 4, v];
+                            nonMarkers++;
+                        }
+                    }
+                    [report appendFormat:@"kernel writes: %d\n", nonMarkers];
+                }
+                isUnlock(surface, 0, NULL);
+                CFRelease(surface);
+            } else {
+                [report appendString:@"IOSurfaceCreate returned NULL\n"];
+            }
+        } else {
+            [report appendString:@"IOSurface functions not available\n"];
+        }
+    }
 
     // Cleanup
     for (int i = 0; i < 4; i++) {
