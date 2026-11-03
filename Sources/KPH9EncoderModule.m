@@ -247,6 +247,7 @@ static void H9EncodeCallback(void *outputCallbackRefCon,
         paramSets,
         paramSetSizes,
         4,          // nalUnitHeaderLength
+        NULL,       // extensions
         &fmtDesc
     );
 
