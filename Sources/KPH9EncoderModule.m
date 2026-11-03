@@ -177,6 +177,43 @@
         CFRelease(s2);
     }
 
+    // === B-frame DPB overflow ===
+    [report appendString:@"\n--- B-frame DPB overflow ---\n"];
+    VTCompressionSessionRef s3 = NULL;
+    OSStatus st3 = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
+        NULL, NULL, NULL, NULL, NULL, &s3);
+    if (st3 == noErr && s3) {
+        VTSessionSetProperty(s3, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
+        int gop = 30, fps = 30;
+        CFNumberRef n3;
+        n3 = CFNumberCreate(NULL, kCFNumberIntType, &gop);
+        VTSessionSetProperty(s3, kVTCompressionPropertyKey_MaxKeyFrameInterval, n3);
+        CFRelease(n3);
+        n3 = CFNumberCreate(NULL, kCFNumberIntType, &fps);
+        VTSessionSetProperty(s3, kVTCompressionPropertyKey_ExpectedFrameRate, n3);
+        CFRelease(n3);
+        st3 = VTCompressionSessionPrepareToEncodeFrames(s3);
+        if (st3 == noErr) {
+            int enc = 0;
+            for (int i = 0; i < 8; i++) {
+                CVPixelBufferRef pb3 = NULL;
+                CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, NULL, &pb3);
+                if (!pb3) continue;
+                CVPixelBufferLockBaseAddress(pb3, 0);
+                memset(CVPixelBufferGetBaseAddress(pb3), 0x80, CVPixelBufferGetDataSize(pb3));
+                CVPixelBufferUnlockBaseAddress(pb3, 0);
+                VTEncodeInfoFlags f3 = 0;
+                st3 = VTCompressionSessionEncodeFrame(s3, pb3, CMTimeMake(i, fps), kCMTimeInvalid, NULL, NULL, &f3);
+                if (st3 == noErr) enc++;
+                CVPixelBufferRelease(pb3);
+            }
+            [report appendFormat:@"  B-frame encode: %d/8 frames\n", enc];
+        }
+        VTCompressionSessionCompleteFrames(s3, kCMTimeInvalid);
+        CFRelease(s3);
+    }
+
     [report appendString:@"\nVERDICT: H9_NTL_SWEEP_COMPLETE\n"];
     return report;
 }
