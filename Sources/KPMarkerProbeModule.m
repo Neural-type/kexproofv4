@@ -237,22 +237,37 @@
             [report appendFormat:@"  cluster 0x%llx: %d ptrs\n", clusterBase[c], clusterCount[c]];
         }
 
-        // Look for proc-like patterns: kernel pointers close together
-        [report appendString:@"\nproc-like patterns (close pointers):\n"];
+        // Look for proc-like patterns: specific gaps (PID=0x60, ucred=0x28, task=0x08)
+        [report appendString:@"\nproc-like patterns (specific gaps):\n"];
         int procCands = 0;
-        for (int i = 0; i < nkptrs && procCands < 5; i++) {
+        for (int i = 0; i < nkptrs && procCands < 10; i++) {
+            uint64_t a = kptrs[i];
+            if (a == 0xFFFFFFFFFFFFFFFFULL || a == 0) continue;
             for (int j = i + 1; j < nkptrs; j++) {
-                uint64_t diff = (kptrs[i] > kptrs[j]) ? kptrs[i] - kptrs[j] : kptrs[j] - kptrs[i];
-                if (diff > 0 && diff < 0x100) {
-                    uint64_t lo = (kptrs[i] < kptrs[j]) ? kptrs[i] : kptrs[j];
-                    [report appendFormat:@"  pair: 0x%llx and 0x%llx (gap=0x%llx)\n",
-                     kptrs[i], kptrs[j], diff];
+                uint64_t b = kptrs[j];
+                if (b == 0xFFFFFFFFFFFFFFFFULL || b == 0) continue;
+                uint64_t diff = (a > b) ? a - b : b - a;
+                // Look for exact struct offsets
+                if (diff == 0x60 || diff == 0x28 || diff == 0x08 || diff == 0x18) {
+                    uint64_t lo = (a < b) ? a : b;
+                    [report appendFormat:@"  pair: 0x%llx and 0x%llx (gap=0x%llx)\n", a, b, diff];
                     procCands++;
-                    if (procCands >= 5) break;
+                    if (procCands >= 10) break;
                 }
             }
         }
-        [report appendFormat:@"close pairs found: %d\n", procCands];
+        [report appendFormat:@"proc-like pairs found: %d\n", procCands];
+
+        // Also show kernel heap pointers (most likely proc/task)
+        [report appendString:@"\nkernel heap pointers (0xffffffe0...):\n"];
+        int heapPtrs = 0;
+        for (int i = 0; i < nkptrs && heapPtrs < 10; i++) {
+            if ((kptrs[i] >> 32) == 0xffffffe0ULL || (kptrs[i] >> 32) == 0xffffffe1ULL) {
+                [report appendFormat:@"  heap kptr: 0x%llx at +0x%lx\n", kptrs[i], (unsigned long)kptrLocs[i]];
+                heapPtrs++;
+            }
+        }
+        [report appendFormat:@"heap pointers found: %d\n", heapPtrs];
     }
 
     // Cleanup
