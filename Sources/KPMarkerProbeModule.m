@@ -173,6 +173,88 @@
         }
     }
 
+    // Phase 4: kernel pointer analysis (recon)
+    [report appendString:@"\n--- Phase 4: kernel pointer analysis ---\n"];
+    {
+        vm_address_t sa = 0; vm_size_t ss = 0;
+        vm_region_submap_info_data_64_t si;
+        mach_msg_type_number_t sc;
+
+        #define MAX_KPTRS 512
+        uint64_t kptrs[MAX_KPTRS] = {0};
+        size_t kptrLocs[MAX_KPTRS] = {0};
+        int nkptrs = 0;
+
+        while (1) {
+            sa = (sa == 0) ? 0 : sa + ss;
+            sc = VM_REGION_SUBMAP_INFO_COUNT_64;
+            uint32_t d = 0;
+            if (vm_region_recurse_64(mach_task_self(), &sa, &ss, &d,
+                                      (vm_region_recurse_info_t)&si, &sc) != KERN_SUCCESS) break;
+            if (si.is_submap) continue;
+            if (!(si.protection & VM_PROT_WRITE)) continue;
+            if (ss > 16 * 1024 * 1024) continue;
+
+            volatile uint64_t *p = (volatile uint64_t *)sa;
+            size_t words = ss / 8;
+            for (size_t j = 0; j < words && nkptrs < MAX_KPTRS; j++) {
+                uint64_t v = p[j];
+                if ((v >> 32) >= 0xffffffe0ULL) {
+                    kptrs[nkptrs] = v;
+                    kptrLocs[nkptrs] = sa + j * 8;
+                    nkptrs++;
+                }
+            }
+        }
+
+        [report appendFormat:@"total kernel pointers: %d\n", nkptrs];
+
+        // Cluster by kernel address range (1MB buckets)
+        #define MAX_CLUSTERS 64
+        uint64_t clusterBase[MAX_CLUSTERS] = {0};
+        int clusterCount[MAX_CLUSTERS] = {0};
+        int nclusters = 0;
+
+        for (int i = 0; i < nkptrs; i++) {
+            uint64_t bucket = kptrs[i] & ~0xFFFFFULL;
+            BOOL found = NO;
+            for (int c = 0; c < nclusters; c++) {
+                if (clusterBase[c] == bucket) {
+                    clusterCount[c]++;
+                    found = YES;
+                    break;
+                }
+            }
+            if (!found && nclusters < MAX_CLUSTERS) {
+                clusterBase[nclusters] = bucket;
+                clusterCount[nclusters] = 1;
+                nclusters++;
+            }
+        }
+
+        [report appendFormat:@"kernel clusters (1MB): %d\n", nclusters];
+        for (int c = 0; c < nclusters && c < 10; c++) {
+            [report appendFormat:@"  cluster 0x%llx: %d ptrs\n", clusterBase[c], clusterCount[c]];
+        }
+
+        // Look for proc-like patterns: kernel pointers close together
+        [report appendString:@"\nproc-like patterns (close pointers):\n"];
+        int procCands = 0;
+        for (int i = 0; i < nkptrs && procCands < 5; i++) {
+            for (int j = i + 1; j < nkptrs; j++) {
+                uint64_t diff = (kptrs[i] > kptrs[j]) ? kptrs[i] - kptrs[j] : kptrs[j] - kptrs[i];
+                if (diff > 0 && diff < 0x100) {
+                    uint64_t lo = (kptrs[i] < kptrs[j]) ? kptrs[i] : kptrs[j];
+                    [report appendFormat:@"  pair: 0x%llx and 0x%llx (gap=0x%llx)\n",
+                     kptrs[i], kptrs[j], diff];
+                    procCands++;
+                    if (procCands >= 5) break;
+                }
+            }
+        }
+        [report appendFormat:@"close pairs found: %d\n", procCands];
+    }
+
     // Cleanup
     for (int i = 0; i < MARKER_COUNT; i++) {
         free(markers[i]);
