@@ -167,6 +167,38 @@
         [report appendFormat:@"EXCEPTION: %@\n", e.reason];
     }
 
+    // Phase 5: test on sandbox-blocked files
+    [report appendString:@"\n--- Phase 5: test blocked files ---\n"];
+    NSArray *blockedPaths = @[
+        @"/private/var/mobile/Library/Logs/CrashReporter/",
+        @"/private/var/mobile/Library/Preferences/com.apple.springboard.plist",
+        @"/System/Library/Caches/com.apple.kernelcaches/kernelcache",
+        @"/usr/sbin/syslogd",
+    ];
+    for (NSString *bp in blockedPaths) {
+        int fd = open(bp.fileSystemRepresentation, O_RDONLY);
+        BOOL directOK = (fd >= 0);
+        if (directOK) close(fd);
+        NSString *dataStr = @"nil";
+        @try {
+            SEL initSel = NSSelectorFromString(@"initWithURL:");
+            if ([inFileCls instancesRespondToSelector:initSel]) {
+                NSURL *url = [NSURL fileURLWithPath:bp];
+                id inFile = [inFileCls alloc];
+                [inFile performSelector:initSel withObject:url];
+                SEL dataSel = NSSelectorFromString(@"data");
+                if ([inFile respondsToSelector:dataSel]) {
+                    NSData *data = [inFile performSelector:dataSel];
+                    dataStr = data ? [NSString stringWithFormat:@"%lu bytes", (unsigned long)data.length] : @"nil";
+                }
+            }
+        } @catch (NSException *e) {
+            dataStr = [NSString stringWithFormat:@"EXC: %@", e.reason];
+        }
+        [report appendFormat:@"%@\n  direct=%@ infile_data=%@\n",
+         bp, directOK ? @"OK" : @"BLOCKED", dataStr];
+    }
+
     // Verdict
     [report appendString:@"\n"];
     [report appendString:@"VERDICT: INFILE_RECON_COMPLETE\n"];
