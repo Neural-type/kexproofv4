@@ -180,7 +180,7 @@
         vm_region_submap_info_data_64_t si;
         mach_msg_type_number_t sc;
 
-        #define MAX_KPTRS 512
+        #define MAX_KPTRS 2048
         uint64_t kptrs[MAX_KPTRS] = {0};
         size_t kptrLocs[MAX_KPTRS] = {0};
         int nkptrs = 0;
@@ -257,6 +257,40 @@
             }
         }
         [report appendFormat:@"proc-like pairs found: %d\n", procCands];
+
+        // Detailed pair analysis
+        if (procCands > 0) {
+            [report appendString:@"\n--- pair detail analysis ---\n"];
+            int myPID = getpid();
+            int myUID = getuid();
+            [report appendFormat:@"our pid=%d uid=%d\n", myPID, myUID];
+
+            for (int i = 0; i < nkptrs; i++) {
+                uint64_t a = kptrs[i];
+                if (a == 0xFFFFFFFFFFFFFFFFULL || a == 0) continue;
+                for (int j = i + 1; j < nkptrs; j++) {
+                    uint64_t b = kptrs[j];
+                    if (b == 0xFFFFFFFFFFFFFFFFULL || b == 0) continue;
+                    uint64_t diff = (a > b) ? a - b : b - a;
+                    if (diff == 0x60 || diff == 0x28 || diff == 0x08 || diff == 0x18) {
+                        uint64_t lo = (a < b) ? a : b;
+                        [report appendFormat:@"PAIR: lo=0x%llx hi=0x%llx gap=0x%llx\n", lo, lo + diff, diff];
+                        [report appendFormat:@"  user loc: 0x%lx and 0x%lx\n",
+                         (unsigned long)kptrLocs[i], (unsigned long)kptrLocs[j]];
+
+                        // Check if either value looks like our PID/UID
+                        uint32_t a32 = (uint32_t)(a & 0xFFFFFFFF);
+                        uint32_t b32 = (uint32_t)(b & 0xFFFFFFFF);
+                        if (a32 == (uint32_t)myPID || b32 == (uint32_t)myPID) {
+                            [report appendFormat:@"  *** PID MATCH! ***\n"];
+                        }
+                        if (a32 == (uint32_t)myUID || b32 == (uint32_t)myUID) {
+                            [report appendFormat:@"  *** UID MATCH! ***\n");
+                        }
+                    }
+                }
+            }
+        }
 
         // Also show kernel heap pointers (most likely proc/task)
         [report appendString:@"\nkernel heap pointers (0xffffffe0...):\n"];
