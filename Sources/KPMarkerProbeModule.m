@@ -136,6 +136,83 @@
         p[0] = orig;
     }
 
+    // Phase 3: kernel objects + corruption + exercise (kirby approach)
+    [report appendString:@"\n--- Phase 3: kernel objects + exercise ---\n"];
+
+    // Create Mach ports as kernel objects
+    #define PORT_COUNT 8
+    mach_port_t ports[PORT_COUNT];
+    for (int i = 0; i < PORT_COUNT; i++) {
+        kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &ports[i]);
+        [report appendFormat:@"port[%d]: name=%u kr=%d\n", i, ports[i], kr];
+    }
+
+    // Corrupt port names in marker buffers (simulating kernel object corruption)
+    [report appendString:@"\ncorrupting port names in markers...\n"];
+    for (int i = 0; i < PORT_COUNT && i < MARKER_COUNT; i++) {
+        volatile uint32_t *p = (volatile uint32_t *)markers[i];
+        uint32_t origName = ports[i];
+        uint32_t corruptName = 0x1E; // kirby's marker value
+
+        // Store original port name in marker
+        p[0] = origName;
+        // Corrupt it
+        p[0] = corruptName;
+        [report appendFormat:@"marker[%d]: port_name %u -> %u (corrupted)\n", i, origName, corruptName];
+    }
+
+    // Exercise corrupted objects: try to use the ports
+    [report appendString:@"\nexercising corrupted objects...\n"];
+    for (int i = 0; i < PORT_COUNT; i++) {
+        // Try to send a message to the port
+        uint8_t buf[128] = {0};
+        mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
+        hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        hdr->msgh_size = sizeof(mach_msg_header_t);
+        hdr->msgh_remote_port = ports[i];
+        hdr->msgh_local_port = MACH_PORT_NULL;
+        hdr->msgh_id = 0;
+
+        kern_return_t kr = mach_msg(hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                     hdr->msgh_size, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
+        [report appendFormat:@"exercise port[%d] name=%u send_kr=%d\n", i, ports[i], kr];
+
+        // Drain if sent
+        if (kr == KERN_SUCCESS) {
+            mach_msg(hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(buf), ports[i], 50, MACH_PORT_NULL);
+        }
+    }
+
+    // Check if any port died from corruption
+    [report appendString:@"\nchecking port health after corruption...\n"];
+    int deadPorts = 0;
+    for (int i = 0; i < PORT_COUNT; i++) {
+        uint8_t buf[128] = {0};
+        mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
+        hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        hdr->msgh_size = sizeof(mach_msg_header_t);
+        hdr->msgh_remote_port = ports[i];
+        hdr->msgh_local_port = MACH_PORT_NULL;
+        hdr->msgh_id = 0;
+
+        kern_return_t kr = mach_msg(hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                     hdr->msgh_size, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
+        if (kr != KERN_SUCCESS) {
+            deadPorts++;
+            [report appendFormat:@"port[%d] DEAD after corruption (kr=%d)\n", i, kr];
+        } else {
+            mach_msg(hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(buf), ports[i], 50, MACH_PORT_NULL);
+        }
+    }
+    [report appendFormat:@"ports dead after corruption: %d/%d\n", deadPorts, PORT_COUNT];
+
+    // Cleanup
+    for (int i = 0; i < PORT_COUNT; i++) {
+        if (ports[i] != MACH_PORT_NULL) {
+            mach_port_destroy(mach_task_self(), ports[i]);
+        }
+    }
+
     // Phase 3: prepare for controlled corruption
     [report appendString:@"\n--- Phase 3: corruption targets ---\n"];
     if (found > 0) {
