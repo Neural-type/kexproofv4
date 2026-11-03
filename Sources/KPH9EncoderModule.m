@@ -387,12 +387,28 @@
                 CVPixelBufferRelease(pb0);
             }
 
-            // NOW set UserDPBFramesForFaceTime=24 (after init)
+            // Create 24 IOSurfaces (AVE27 stage12 order: surfaces BEFORE UserDPB)
+            NSMutableArray *surfRefs = [NSMutableArray array];
+            void *isLib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+            if (isLib) {
+                typedef void *(*ISCreateFn)(CFDictionaryRef);
+                ISCreateFn isCreate = (ISCreateFn)dlsym(isLib, "IOSurfaceCreate");
+                if (isCreate) {
+                    for (int i = 0; i < 24; i++) {
+                        NSDictionary *sp = @{ @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerElement": @4 };
+                        void *surf = isCreate((__bridge CFDictionaryRef)sp);
+                        if (surf) [surfRefs addObject:[NSValue valueWithPointer:surf]];
+                    }
+                }
+            }
+            [report appendFormat:@"  surfaces created: %lu\n", (unsigned long)surfRefs.count];
+
+            // NOW set UserDPBFramesForFaceTime=24 (after surfaces)
             int dpbFrames = 24;
             CFNumberRef nf = CFNumberCreate(NULL, kCFNumberIntType, &dpbFrames);
             OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), nf);
             CFRelease(nf);
-            [report appendFormat:@"  UserDPBFramesForFaceTime=24 (after init) -> %d\n", (int)stFrames];
+            [report appendFormat:@"  UserDPBFramesForFaceTime=24 (after surfaces) -> %d\n", (int)stFrames];
 
             // DPBRequirements
             NSMutableArray *dpbReq = [NSMutableArray array];
