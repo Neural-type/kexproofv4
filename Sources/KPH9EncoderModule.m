@@ -415,21 +415,35 @@
             }
         }
 
-        // Readback
-        CFNumberRef rb = NULL;
+        // Readback (check type before converting!)
+        CFTypeRef rb = NULL;
         VTSessionCopyProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), NULL, &rb);
         if (rb) {
-            int v = 0;
-            CFNumberGetValue(rb, kCFNumberIntType, &v);
-            [report appendFormat:@"  readback UserDPBFramesForFaceTime=%d\n", v];
+            CFTypeID t = CFGetTypeID(rb);
+            if (t == CFNumberGetTypeID()) {
+                int v = 0;
+                CFNumberGetValue((CFNumberRef)rb, kCFNumberIntType, &v);
+                [report appendFormat:@"  readback UserDPBFramesForFaceTime=%d (number)\n", v];
+            } else if (t == CFArrayGetTypeID()) {
+                [report appendFormat:@"  readback UserDPBFramesForFaceTime=array(%ld)\n", (long)CFArrayGetCount((CFArrayRef)rb)];
+            } else {
+                [report appendFormat:@"  readback UserDPBFramesForFaceTime=type(%lu)\n", (unsigned long)t];
+            }
             CFRelease(rb);
         }
-        CFNumberRef rb2 = NULL;
+        CFTypeRef rb2 = NULL;
         VTSessionCopyProperty(sDPB, CFSTR("EnableUserRefForFacetime"), NULL, &rb2);
         if (rb2) {
-            BOOL v2 = false;
-            CFNumberGetValue(rb2, kCFNumberIntType, &v2);
-            [report appendFormat:@"  readback EnableUserRefForFacetime=%d\n", (int)v2];
+            CFTypeID t2 = CFGetTypeID(rb2);
+            if (t2 == CFNumberGetTypeID()) {
+                int v2 = 0;
+                CFNumberGetValue((CFNumberRef)rb2, kCFNumberIntType, &v2);
+                [report appendFormat:@"  readback EnableUserRefForFacetime=%d\n", v2];
+            } else if (t2 == CFBooleanGetTypeID()) {
+                [report appendFormat:@"  readback EnableUserRefForFacetime=%d (bool)\n", (int)CFBooleanGetValue((CFBooleanRef)rb2)];
+            } else {
+                [report appendFormat:@"  readback EnableUserRefForFacetime=type(%lu)\n", (unsigned long)t2];
+            }
             CFRelease(rb2);
         }
 

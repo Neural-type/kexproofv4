@@ -35,8 +35,8 @@ static NSString *KPSafeIdentifier(NSString *identifier) {
     NSString *name = [NSString stringWithFormat:@"kexproofv3-%@-%@.txt", KPSafeIdentifier(identifier), KPReportTimestamp()];
     NSURL *URL = [NSURL fileURLWithPath:[documents stringByAppendingPathComponent:name]];
     NSString *full = [NSString stringWithFormat:
-                      @"=== KexProofV3 module report ===\nModule: %@\nSaved: %@\n\n%@\n\n--- Full session transcript ---\n%@",
-                      identifier, [NSDate date], report, KPLog.shared.transcript];
+                      @"=== KexProofV3 module report ===\nModule: %@\nSaved: %@\n\n%@\n",
+                      identifier, [NSDate date], report];
     return [full writeToURL:URL atomically:YES encoding:NSUTF8StringEncoding error:error] ? URL : nil;
 }
 
