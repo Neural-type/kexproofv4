@@ -418,17 +418,15 @@
             }
 
             // NOW set UserDPBFramesForFaceTime=24 (after UserDPB)
-            int dpbFrames = 24;
-            CFNumberRef nf = CFNumberCreate(NULL, kCFNumberIntType, &dpbFrames);
-            OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), nf);
-            CFRelease(nf);
-            [report appendFormat:@"  UserDPBFramesForFaceTime=24 (after UserDPB) -> %d\n", (int)stFrames];
+            // Try NSDictionary format (AVE27 stage12: n=24, shape=1)
+            NSDictionary *dpbDict = @{ @"n": @24, @"shape": @1 };
+            OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFDictionaryRef)dpbDict);
+            [report appendFormat:@"  UserDPBFramesForFaceTime dict(n=24,shape=1) -> %d\n", (int)stFrames];
 
-            // DPBRequirements
-            NSMutableArray *dpbReq = [NSMutableArray array];
-            for (int i = 0; i < 24; i++) [dpbReq addObject:@(i)];
-            OSStatus stReq = VTSessionSetProperty(sDPB, CFSTR("DPBRequirements"), (__bridge CFArrayRef)dpbReq);
-            [report appendFormat:@"  DPBRequirements(24) -> %d\n", (int)stReq];
+            // DPBRequirements as dictionary
+            NSDictionary *dpbReqDict = @{ @"n": @24, @"shape": @1 };
+            OSStatus stReq = VTSessionSetProperty(sDPB, CFSTR("DPBRequirements"), (__bridge CFDictionaryRef)dpbReqDict);
+            [report appendFormat:@"  DPBRequirements dict(n=24,shape=1) -> %d\n", (int)stReq];
 
             // Encode more frames
             for (int i = 1; i < 4; i++) {
