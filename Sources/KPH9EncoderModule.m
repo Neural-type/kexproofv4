@@ -90,14 +90,16 @@
         @"DeltaPOCS1Minus1": @[@0],
     };
 
-    NSDictionary *userRPS = @{
-        @"UserRPSForFaceTime": rpsDict,
-    };
-
-    // Set property on session
-    status = VTSessionSetProperty(session, CFSTR("UserRPSForFaceTime"),
-                                   (__bridge CFPropertyListRef)userRPS);
-    [report appendFormat:@"VTSessionSetProperty: %d\n", (int)status];
+    // Try multiple property formats
+    NSArray *propNames = @[@"UserRPSForFaceTime", @"UserRPS", @"RPS"];
+    NSArray *propValues = @[rpsDict, @[rpsDict], deltaArray];
+    for (int p = 0; p < (int)propNames.count; p++) {
+        status = VTSessionSetProperty(session,
+            (__bridge CFStringRef)propNames[p],
+            (__bridge CFPropertyListRef)propValues[p]);
+        [report appendFormat:@"SetProperty %@: %d\n", propNames[p], (int)status];
+        if (status == 0) break;
+    }
 
     // Phase 3: trigger OOB (property setting triggers AVE_HEVC_ST_RPS_Retrieve)
     [report appendString:@"\n--- Phase 3: trigger OOB ---\n"];
