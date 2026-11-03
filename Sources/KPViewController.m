@@ -119,6 +119,7 @@
         [[KPAuditIPCModule alloc] initWithNameSweep],
         [[KPKReadProbeModule alloc] initWithNameSweep],
         [[KPKASLRBypassModule alloc] initWithNameSweep],
+        [[KPMarkerProbeModule alloc] initWithNameSweep],
         [[KPFDLeakModule alloc] initWithArmed:YES],
         [[KPINFileLeakModule alloc] initWithNameSweep],
         [[KPAuditLP112621Module alloc] initWithArmed:NO],
