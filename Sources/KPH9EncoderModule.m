@@ -123,9 +123,10 @@
         CMTime pts = CMTimeMake(0, 30);
         CMTime duration = CMTimeMake(1, 30);
 
+        VTEncodeInfoFlags flags = 0;
         status = VTCompressionSessionEncodeFrame(
             session, pixelBuffer, pts, duration,
-            NULL, NULL, &sampleBuffer
+            NULL, &flags, &sampleBuffer
         );
         [report appendFormat:@"encode[0]: %d\n", (int)status];
 
@@ -135,9 +136,10 @@
 
         // Encode second frame (triggers FPS::Add with overwritten pointer)
         pts = CMTimeMake(1, 30);
+        VTEncodeInfoFlags flags = 0;
         status = VTCompressionSessionEncodeFrame(
             session, pixelBuffer, pts, duration,
-            NULL, NULL, &sampleBuffer
+            NULL, &flags, &sampleBuffer
         );
         [report appendFormat:@"encode[1]: %d\n", (int)status];
 
