@@ -404,18 +404,19 @@
             [report appendFormat:@"  surfaces created: %lu\n", (unsigned long)surfRefs.count];
 
             // Set UserDPB = IOSurface array (AVE27: this BEFORE UserDPBFrames!)
-            if (surfRefs.count > 0) {
-                // Build CFArray of IOSurfaceRef pointers
-                void **surfPtrs = calloc(surfRefs.count, sizeof(void *));
-                for (NSUInteger i = 0; i < surfRefs.count; i++) {
-                    surfPtrs[i] = [surfRefs[i] pointerValue];
-                }
-                CFArrayRef surfArray = CFArrayCreate(kCFAllocatorDefault, (const void **)surfPtrs, surfRefs.count, &kCFTypeArrayCallBacks);
-                OSStatus stDPBSet = VTSessionSetProperty(sDPB, CFSTR("UserDPB"), surfArray);
-                [report appendFormat:@"  UserDPB (IOSurface array %lu) -> %d\n", (unsigned long)surfRefs.count, (int)stDPBSet];
-                if (surfArray) CFRelease(surfArray);
-                free(surfPtrs);
-            }
+            // DISABLED: was causing containsKey: crash in videocodecd
+            // if (surfRefs.count > 0) {
+            //     void **surfPtrs = calloc(surfRefs.count, sizeof(void *));
+            //     for (NSUInteger i = 0; i < surfRefs.count; i++) {
+            //         surfPtrs[i] = [surfRefs[i] pointerValue];
+            //     }
+            //     CFArrayRef surfArray = CFArrayCreate(kCFAllocatorDefault, (const void **)surfPtrs, surfRefs.count, &kCFTypeArrayCallBacks);
+            //     OSStatus stDPBSet = VTSessionSetProperty(sDPB, CFSTR("UserDPB"), surfArray);
+            //     [report appendFormat:@"  UserDPB (IOSurface array %lu) -> %d\n", (unsigned long)surfRefs.count, (int)stDPBSet];
+            //     if (surfArray) CFRelease(surfArray);
+            //     free(surfPtrs);
+            // }
+            [report appendFormat:@"  UserDPB DISABLED (was causing crash)\n"];
 
             // NOW set UserDPBFramesForFaceTime=24 (after UserDPB)
             // Try NSDictionary format (AVE27 stage12: n=24, shape=1)
