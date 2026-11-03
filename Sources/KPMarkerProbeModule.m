@@ -98,8 +98,12 @@
             uint32_t v = p[j];
             for (int m = 0; m < MARKER_COUNT; m++) {
                 if (v == markerIDs[m]) {
-                    [report appendFormat:@"FOUND marker[%d] at region+0x%lx (value=0x%08x)\n",
-                     m, (unsigned long)(scanAddr + j * 4), v];
+                    // Only log first match per marker
+                    static int logged[8] = {0};
+                    if (!logged[m]) {
+                        [report appendFormat:@"FOUND marker[%d] at region+0x%lx\n", m, (unsigned long)(scanAddr + j * 4)];
+                        logged[m] = 1;
+                    }
                     found++;
                     break;
                 }
@@ -108,6 +112,29 @@
     }
 
     [report appendFormat:@"markers found in memory: %d\n", found];
+
+    // Phase 2b: controlled corruption (kirby approach)
+    [report appendString:@"\n--- Phase 2b: controlled corruption ---\n"];
+    for (int i = 0; i < MARKER_COUNT; i++) {
+        uint32_t orig = markerIDs[i];
+        uint32_t corrupted = 0x1E; // kirby's marker value
+
+        // Corrupt: change marker value
+        volatile uint32_t *p = (volatile uint32_t *)markers[i];
+        p[0] = corrupted;
+
+        // Read back
+        uint32_t readback = p[0];
+        if (readback == corrupted) {
+            [report appendFormat:@"CORRUPTED marker[%d]: 0x%08x -> 0x%08x (confirmed)\n",
+             i, orig, readback];
+        } else {
+            [report appendFormat:@"marker[%d]: corruption FAILED (read=0x%08x)\n", i, readback];
+        }
+
+        // Restore
+        p[0] = orig;
+    }
 
     // Phase 3: prepare for controlled corruption
     [report appendString:@"\n--- Phase 3: corruption targets ---\n"];
