@@ -122,7 +122,62 @@
     VTCompressionSessionInvalidate(session);
     CFRelease(session);
 
-    [report appendString:@"\nVERDICT: H9_RECON_COMPLETE\n"];
+    // === AVE27 stage13: NTL sweep (safe, below trigger) ===
+    [report appendString:@"\n--- AVE27 stage13: NTL sweep (safe) ---\n"];
+    [report appendString:@"Trigger: EncoderUsage=1 RCMode=20 NTL=N\n"];
+    int ntlVals[] = { 1, 100, 1000, 8000, 16000, 16447, 16462 };
+    for (int i = 0; i < 7; i++) {
+        int ntl = ntlVals[i];
+        VTCompressionSessionRef s2 = NULL;
+        OSStatus st2 = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
+            NULL, NULL, NULL, NULL, NULL, &s2);
+        if (st2 != noErr || !s2) {
+            [report appendFormat:@"  NTL=%d session_create=%d FAILED\n", ntl, (int)st2];
+            continue;
+        }
+        CFNumberRef n;
+        int usage = 1, rcMode = 20;
+        n = CFNumberCreate(NULL, kCFNumberIntType, &usage);
+        VTSessionSetProperty(s2, CFSTR("EncoderUsage"), n);
+        CFRelease(n);
+        n = CFNumberCreate(NULL, kCFNumberIntType, &rcMode);
+        VTSessionSetProperty(s2, CFSTR("RCMode"), n);
+        CFRelease(n);
+        n = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
+        OSStatus setSt = VTSessionSetProperty(s2, CFSTR("NumberOfTemporalLayers"), n);
+        CFRelease(n);
+        int rb = 0;
+        CFNumberRef rbn = NULL;
+        VTSessionCopyProperty(s2, CFSTR("NumberOfTemporalLayers"), NULL, &rbn);
+        if (rbn) { CFNumberGetValue(rbn, kCFNumberIntType, &rb); CFRelease(rbn); }
+        VTSessionSetProperty(s2, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+        st2 = VTCompressionSessionPrepareToEncodeFrames(s2);
+        if (st2 != noErr) {
+            [report appendFormat:@"  NTL=%d set=%d readback=%d prepare=%d FAILED\n", ntl, (int)setSt, rb, (int)st2];
+            CFRelease(s2);
+            continue;
+        }
+        CVPixelBufferRef pb2 = NULL;
+        CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, NULL, &pb2);
+        if (!pb2) {
+            [report appendFormat:@"  NTL=%d PIXELBUFFER_FAILED\n", ntl];
+            CFRelease(s2);
+            continue;
+        }
+        CVPixelBufferLockBaseAddress(pb2, 0);
+        memset(CVPixelBufferGetBaseAddress(pb2), 0x80, CVPixelBufferGetDataSize(pb2));
+        CVPixelBufferUnlockBaseAddress(pb2, 0);
+        VTEncodeInfoFlags f2 = 0;
+        st2 = VTCompressionSessionEncodeFrame(s2, pb2, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f2);
+        [report appendFormat:@"  NTL=%d set=%d readback=%d encode=%d %s\n", ntl, (int)setSt, rb, (int)st2,
+               (st2 == noErr) ? "SURVIVED" : "FAILED"];
+        CVPixelBufferRelease(pb2);
+        VTCompressionSessionCompleteFrames(s2, kCMTimeInvalid);
+        CFRelease(s2);
+    }
+
+    [report appendString:@"\nVERDICT: H9_NTL_SWEEP_COMPLETE\n"];
     return report;
 }
 
