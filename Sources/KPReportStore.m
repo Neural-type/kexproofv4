@@ -45,31 +45,12 @@ static NSString *KPSafeIdentifier(NSString *identifier) {
     if (!documents) return nil;
     NSString *name = [NSString stringWithFormat:@"kexproofv3-share-%@.txt", KPReportTimestamp()];
     NSURL *URL = [NSURL fileURLWithPath:[documents stringByAppendingPathComponent:name]];
+    // Share what the user SEES in the app (live transcript)
     NSMutableString *output = [NSMutableString stringWithFormat:
-                               @"=== KexProofV3 share ===\nCreated: %@\nVersion: %@\n\n",
+                               @"=== KexProofV3 share ===\nCreated: %@\nVersion: %@\n\n--- App log ---\n%@\n",
                                [NSDate date],
-                               [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"3.4.0"];
-
-    // Only include the LATEST module report (not all files)
-    NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:documents error:nil] ?: @[];
-    NSArray<NSString *> *sorted = [files sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
-    NSString *latestReport = nil;
-    NSString *latestName = nil;
-    for (NSString *file in [sorted reverseObjectEnumerator]) {
-        if (![file hasPrefix:@"kexproofv3-"] || [file hasPrefix:@"kexproofv3-share-"]) continue;
-        if (![file hasSuffix:@".txt"]) continue;
-        NSString *path = [documents stringByAppendingPathComponent:file];
-        NSString *body = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-        if (!body) continue;
-        latestReport = body;
-        latestName = file;
-        break;
-    }
-    if (latestReport) {
-        [output appendFormat:@"--- Latest report: %@ ---\n%@\n", latestName, latestReport];
-    } else {
-        [output appendString:@"No reports found.\n"];
-    }
+                               [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"3.4.0",
+                               KPLog.shared.transcript];
     return [output writeToURL:URL atomically:YES encoding:NSUTF8StringEncoding error:error] ? URL : nil;
 }
 
