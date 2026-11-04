@@ -486,12 +486,16 @@
     NSMutableArray *kptrs2 = [NSMutableArray array];
     vm_address_t sAddr = 0;
     vm_size_t sSize = 0;
-    vm_region_basic_info_data_64_t sInfo;
-    mach_msg_type_number_t sCnt = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t sObj = 0;
+    vm_region_submap_info_data_64_t sInfo;
+    mach_msg_type_number_t sCnt = VM_REGION_SUBMAP_INFO_COUNT_64;
 
-    while (vm_region(mach_task_self(), &sAddr, &sSize, VM_REGION_BASIC_INFO_64,
-                     (vm_region_info_t)&sInfo, &sCnt, &sObj) == KERN_SUCCESS) {
+    while (1) {
+        sAddr = (sAddr == 0) ? 0 : sAddr + sSize;
+        sCnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        uint32_t sDepth = 0;
+        if (vm_region_recurse_64(mach_task_self(), &sAddr, &sSize, &sDepth,
+                                  (vm_region_recurse_info_t)&sInfo, &sCnt) != KERN_SUCCESS) break;
+        if (sInfo.is_submap) continue;
         if ((sInfo.protection & VM_PROT_READ) && (sInfo.protection & VM_PROT_WRITE)) {
             uint64_t *p = (uint64_t *)sAddr;
             size_t words = sSize / 8;
@@ -502,8 +506,6 @@
                 }
             }
         }
-        sAddr += sSize;
-        sCnt = VM_REGION_BASIC_INFO_COUNT_64;
     }
     [report appendFormat:@"  kernel pointers: %lu\n", (unsigned long)kptrs2.count];
 
