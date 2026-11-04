@@ -15,6 +15,7 @@
 #import "KPKASLRBypassModule.h"
 #import "KPMarkerProbeModule.h"
 #import "KPH9EncoderModule.h"
+#import "KPRootExploitModule.h"
 #import "KPFDLeakModule.h"
 #import "KPINFileLeakModule.h"
 #import "KPAuditUAF84495Module.h"
@@ -123,6 +124,7 @@
         [[KPKASLRBypassModule alloc] initWithNameSweep],
         [[KPMarkerProbeModule alloc] initWithNameSweep],
         [[KPH9EncoderModule alloc] initWithNameSweep],
+        [[KPRootExploitModule alloc] initWithNameSweep],
         [[KPFDLeakModule alloc] initWithArmed:YES],
         [[KPINFileLeakModule alloc] initWithNameSweep],
         [[KPAuditLP112621Module alloc] initWithArmed:NO],
@@ -130,7 +132,7 @@
         [[KPAuditGlyph86950Module alloc] initWithArmed:NO],
         [[KPAuditGlyph86950Module alloc] initWithArmed:YES],
         [[KPAuditPDF112611Module alloc] initWithArmed:NO],
-        // CG PDF armed: disabled — OOB write corrupts system memory, causes crashes
+        // CG PDF armed: disabled ï¿½ OOB write corrupts system memory, causes crashes
         // [[KPAuditPDF112611Module alloc] initWithArmed:YES],
         [[KPAuditRPU112688Module alloc] initWithArmed:NO],
         [[KPAuditRPU112688Module alloc] initWithArmed:YES],

