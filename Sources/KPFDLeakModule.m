@@ -550,7 +550,7 @@ static NSString *KPBSSHA256(NSData *data) {
         for (NSString *t in targets) {
             NSString *outName = [@"bs-" stringByAppendingString:t.lastPathComponent];
             NSURL *outURL = [NSURL fileURLWithPath:[documents stringByAppendingPathComponent:outName]];
-            // Fresh session per file — connection must be alive
+            // Fresh session per file -- connection must be alive
             KPByteStreamSession *s2 = [[KPByteStreamSession alloc] init];
             s2.journalFD = journalFD;
             s2.report = [NSMutableString string];

@@ -2,12 +2,10 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/// KRW lane #4 — KASLR bypass via user-space RW region scan.
-/// Technique ref: asuka4scape — kernel leaves pointers in user-accessible
-/// memory. Scan all RW VM regions for kernel pointer range values,
-/// subtract known static segment bases, pick most frequent slide.
-///
-/// Also scans for: task/proc pointers, known structure offsets.
+/// Read-only KASLR candidate scan over selected user-space RW regions.
+/// Stack, malloc regions and known diagnostic constants are excluded.
+/// Address-shaped values and alignment-derived slides remain unverified until
+/// corroborated by an independent kernel-backed oracle.
 @interface KPKASLRBypassModule : NSObject <KPTestModule>
 - (instancetype)initWithNameSweep;
 @end

