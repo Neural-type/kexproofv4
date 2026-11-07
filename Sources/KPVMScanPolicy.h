@@ -5,6 +5,10 @@
 #import <mach/vm_statistics.h>
 #import <stdint.h>
 
+#ifndef VM_MEMORY_MALLOC_PROB_GUARD
+#define VM_MEMORY_MALLOC_PROB_GUARD 13
+#endif
+
 static BOOL KPVMRangeOverlaps(vm_address_t address, vm_size_t size,
                               vm_address_t excludedAddress, vm_size_t excludedSize) {
     if (!excludedAddress || !excludedSize) return NO;
@@ -20,7 +24,7 @@ static BOOL KPVMShouldSkipRegion(const vm_region_submap_info_data_64_t *info,
                                  size_t excludedCount) {
     unsigned int tag = info->user_tag;
     if (tag == VM_MEMORY_STACK || tag == VM_MEMORY_DYLD_MALLOC) return YES;
-    if (tag >= VM_MEMORY_MALLOC && tag <= VM_MEMORY_MALLOC_PGUARD) return YES;
+    if (tag >= VM_MEMORY_MALLOC && tag <= VM_MEMORY_MALLOC_PROB_GUARD) return YES;
 
     uintptr_t marker = (uintptr_t)stackMarker;
     if (marker && marker >= address && marker < address + size) return YES;
