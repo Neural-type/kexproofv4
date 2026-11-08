@@ -3,6 +3,7 @@
 #import "KPLog.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreVideo/CoreVideo.h>
+#import <unistd.h>
 
 @interface KPAuditAVE112705Module ()
 @property (nonatomic, assign) int ntl;
@@ -120,7 +121,7 @@
     result[@"encode_status"] = @(status);
     [self journal:[NSString stringWithFormat:@"ENCODE_RETURNED[0] status=%d — device survived the first encode", (int)status]];
 
-    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    usleep(500000); // bounded: never CompleteFrames(kCMTimeInvalid) - hangs on faulted sessions
     [self journal:@"COMPLETE_FRAMES_RETURNED — no panic"];
 
     VTCompressionSessionInvalidate(session);

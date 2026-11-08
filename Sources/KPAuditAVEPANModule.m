@@ -4,6 +4,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreVideo/CoreVideo.h>
 #import <sys/mman.h>
+#import <unistd.h>
 
 @interface KPAuditAVEPANModule ()
 @property (nonatomic, assign) int ntl;
@@ -117,7 +118,7 @@
     [self journal:[NSString stringWithFormat:@"BEFORE_PAN_ENCODE ntl=%d write_addr=0x%llx (device may reboot)", ntl, writeAddr]];
     if (pb) {
         VTCompressionSessionEncodeFrame(session, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
-        VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+        usleep(500000); // bounded: never CompleteFrames(kCMTimeInvalid) - hangs on faulted sessions
     }
     [self journal:@"AFTER_PAN_ENCODE survived — checking the page"];
 

