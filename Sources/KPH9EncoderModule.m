@@ -7,6 +7,9 @@
 #import <mach/mach.h>
 #import <dlfcn.h>
 
+// Public CoreVideo API missing from the CI syntax-check SDK headers.
+extern size_t CVPixelBufferGetDataSizeForPlane(CVPixelBufferRef pixelBuffer, size_t planeIndex);
+
 @interface KPH9EncoderModule ()
 @property (nonatomic, copy) NSString *identifier;
 @property (nonatomic, copy) NSString *title;
