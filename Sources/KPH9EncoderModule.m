@@ -178,6 +178,10 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
         CFNumberRef nu4 = CFNumberCreate(NULL, kCFNumberIntType, &usage4);
         VTSessionSetProperty(s4, CFSTR("EncoderUsage"), nu4);
         CFRelease(nu4);
+        // ollie: without PrepareToEncodeFrames the frameProps RPS dict is
+        // rejected at the first frame (-19640) — init the encoder context first.
+        OSStatus prep4 = VTCompressionSessionPrepareToEncodeFrames(s4);
+        [report appendFormat:@"s4 PrepareToEncodeFrames -> %d\n", (int)prep4];
     }
     CVPixelBufferRef pb = NULL;
     CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
@@ -217,6 +221,41 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
         VTCompressionSessionInvalidate(s4);
         CFRelease(s4);
     }
+
+    // === RCMode acceptance sweep (ollie): which mode un-clamps NTL? ===
+    // Probe: EncoderUsage=1 + temporal gates + RCMode=rc + NTL=3, then readback.
+    // readback==3 means NTL survives VT validation — that mode arms the driver.
+    [report appendString:@"\n--- RCMode sweep 0..63 (NTL=3 probe) ---\n"];
+    int unclampedRC[64];
+    int unclampedCount = 0;
+    for (int rc = 0; rc < 64; rc++) {
+        VTCompressionSessionRef sR = NULL;
+        if (VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+                                       NULL, NULL, NULL, NULL, NULL, &sR) != noErr || !sR) continue;
+        int usageR = 1;
+        CFNumberRef nn = CFNumberCreate(NULL, kCFNumberIntType, &usageR);
+        VTSessionSetProperty(sR, CFSTR("EncoderUsage"), nn); CFRelease(nn);
+        VTSessionSetProperty(sR, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
+        VTSessionSetProperty(sR, CFSTR("RealTime"), kCFBooleanTrue);
+        nn = CFNumberCreate(NULL, kCFNumberIntType, &rc);
+        OSStatus rcSet = VTSessionSetProperty(sR, CFSTR("RCMode"), nn); CFRelease(nn);
+        int probeN = 3;
+        nn = CFNumberCreate(NULL, kCFNumberIntType, &probeN);
+        VTSessionSetProperty(sR, CFSTR("NumberOfTemporalLayers"), nn); CFRelease(nn);
+        int back = -1;
+        CFNumberRef bn = NULL;
+        if (VTSessionCopyProperty(sR, CFSTR("NumberOfTemporalLayers"), NULL, &bn) == noErr && bn) {
+            CFNumberGetValue(bn, kCFNumberIntType, &back); CFRelease(bn);
+        }
+        if (rcSet == 0 && back == 3) {
+            unclampedRC[unclampedCount++] = rc;
+            [report appendFormat:@"  RCMode=%d set=%d readback=%d UNCLAMPED\n", rc, (int)rcSet, back];
+        }
+        VTCompressionSessionInvalidate(sR);
+        CFRelease(sR);
+    }
+    [report appendFormat:@"RCMode unclamped NTL=3: %d mode(s)%s\n", unclampedCount,
+     unclampedCount ? "" : " (NTL clamped for every mode — deeper gate or entitlement)"];
 
     // === AVE27 stage13: NTL sweep on the proven trigger config (ollie) ===
     // Confirmed trigger (KPAuditAVE112705Module): 1280x720 + 420YpCbCr8BiPlanarVideoRange.
@@ -290,10 +329,11 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
         VTSessionSetProperty(s2, CFSTR("EncoderUsage"), n);
         CFRelease(n);
         if (useRC) {
-            // ollie: AllowTemporalCompression is the master switch for NTL>1 on
-            // H16 — without it VT silently clamps NTL to 1 even with RCMode=20.
-            // Rates must be set BEFORE NTL.
+            // ollie: AllowTemporalCompression + RealTime are the master switches
+            // for NTL>1 on H16 — without them VT clamps NTL to 1 even with
+            // RCMode=20. Rates must be set BEFORE NTL.
             OSStatus atc = VTSessionSetProperty(s2, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
+            OSStatus rt = VTSessionSetProperty(s2, CFSTR("RealTime"), kCFBooleanTrue);
             VTSessionSetProperty(s2, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
             double rate = 30.0;
             n = CFNumberCreate(NULL, kCFNumberDoubleType, &rate);
@@ -304,7 +344,20 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
             n = CFNumberCreate(NULL, kCFNumberIntType, &rc);
             rcSt = VTSessionSetProperty(s2, CFSTR("RCMode"), n);
             CFRelease(n);
-            [report appendFormat:@"    temporal gate: AllowTemporalCompression=%d\n", (int)atc];
+            // Read back gate VALUES — status 0 means "set ok", not "value 0".
+            int atcVal = -1, rcVal = -1;
+            CFTypeRef gv = NULL;
+            if (VTSessionCopyProperty(s2, CFSTR("AllowTemporalCompression"), NULL, &gv) == noErr && gv) {
+                if (CFGetTypeID(gv) == CFBooleanGetTypeID()) atcVal = CFBooleanGetValue((CFBooleanRef)gv);
+                CFRelease(gv);
+            }
+            gv = NULL;
+            if (VTSessionCopyProperty(s2, CFSTR("RCMode"), NULL, &gv) == noErr && gv) {
+                if (CFGetTypeID(gv) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)gv, kCFNumberIntType, &rcVal);
+                CFRelease(gv);
+            }
+            [report appendFormat:@"    temporal gate: setATC=%d setRT=%d valueATC=%d valueRC=%d\n",
+             (int)atc, (int)rt, atcVal, rcVal];
         }
         n = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
         OSStatus setSt = VTSessionSetProperty(s2, CFSTR("NumberOfTemporalLayers"), n);
@@ -335,7 +388,7 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
         st2 = VTCompressionSessionEncodeFrame(s2, pb2, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f2);
         [report appendFormat:@"  [%@] NTL=%d set=%d readback=%d encode=%d %s\n",
          useRC ? @"RC20" : @"noRC", ntl, (int)setSt, rb, (int)st2,
-                (st2 == noErr) ? "SURVIVED" : "FAILED"];
+                (rb != ntl) ? "SKIPPED_CLAMPED" : ((st2 == noErr) ? "SURVIVED" : "FAILED")];
         CVPixelBufferRelease(pb2);
         VTCompressionSessionCompleteFrames(s2, kCMTimeInvalid);
         CFRelease(s2);
@@ -604,6 +657,24 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
             OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"),
                                                      (__bridge CFArrayRef)dpbArray);
             [report appendFormat:@"  UserDPBFramesForFaceTime=array[24] (after init) -> %d\n", (int)stFrames];
+
+            // ollie: DPB slot threshold sweep like the OOL probe (borders 15/16/17)
+            uint32_t dpbLastOK = 0, dpbFirstReject = 0;
+            for (uint32_t n2 = 1; n2 <= 24; n2++) {
+                NSMutableArray *arr = [NSMutableArray arrayWithCapacity:n2];
+                for (uint32_t i2 = 0; i2 < n2; i2++) {
+                    [arr addObject:@{
+                        @"FrameIndex": @(i2), @"PicOrderCnt": @(i2 * 2),
+                        @"IsLongTerm": @(NO), @"SlotIndex": @(i2 & 0x1F)
+                    }];
+                }
+                OSStatus stA = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"),
+                                                    (__bridge CFArrayRef)arr);
+                if (stA == 0) dpbLastOK = n2;
+                else if (dpbFirstReject == 0) dpbFirstReject = n2;
+            }
+            [report appendFormat:@"  DPB array threshold: last_ok=%u first_rejection=%u\n",
+             dpbLastOK, dpbFirstReject];
 
             // DPBRequirements
             NSMutableArray *dpbReq = [NSMutableArray array];
