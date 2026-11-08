@@ -223,6 +223,7 @@
         int ntl = ntlVals[i];
         uint64_t x0 = ((uint64_t)(int32_t)(ntl - 16463) << 32) | 0x59ULL;
         int64_t kOff = 16463 - (int64_t)ntl;
+        OSStatus rcSt = 0;
 
         // Spray only for steered kheap windows (k=17..496).
         CFMutableArrayRef surfArray = NULL;
@@ -260,7 +261,6 @@
         n = CFNumberCreate(NULL, kCFNumberIntType, &usage);
         VTSessionSetProperty(s2, CFSTR("EncoderUsage"), n);
         CFRelease(n);
-        OSStatus rcSt = 0;
         if (useRC) {
             int rc = 20;
             n = CFNumberCreate(NULL, kCFNumberIntType, &rc);
