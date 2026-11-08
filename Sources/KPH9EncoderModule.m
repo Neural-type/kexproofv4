@@ -27,6 +27,29 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
                                                const void *inputStruct, size_t inputStructCnt,
                                                void *outputStruct, size_t *outputStructCnt);
 
+// Records CMSampleBuffer attachments per encoded frame — the reference-frame
+// tokens/POC/slots the DPB parser wants fed BACK into UserDPBFramesForFaceTime.
+static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags fl, CMSampleBufferRef sb) {
+    NSMutableArray *sink = (__bridge NSMutableArray *)refCon;
+    if (!sink) return;
+    if (!sb) {
+        [sink addObject:[NSString stringWithFormat:@"cb st=%d no-sample", (int)st]];
+        return;
+    }
+    CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, sb,
+                                                          kCMAttachmentMode_ShouldPropagate);
+    if (atts) {
+        NSDictionary *d = (__bridge NSDictionary *)atts;
+        [sink addObject:[NSString stringWithFormat:@"cb st=%d atts=%@", (int)st, d.allKeys]];
+        for (NSString *k in d) {
+            [sink addObject:[NSString stringWithFormat:@"    %@ = %@", k, d[k]]];
+        }
+        CFRelease(atts);
+    } else {
+        [sink addObject:[NSString stringWithFormat:@"cb st=%d atts=(none)", (int)st]];
+    }
+}
+
 @interface KPH9EncoderModule ()
 @property (nonatomic, copy) NSString *identifier;
 @property (nonatomic, copy) NSString *title;
@@ -307,6 +330,50 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
          (int)setH, backH];
         VTCompressionSessionInvalidate(sH);
         CFRelease(sH);
+    }
+
+    // === NTL creation-spec probe (analyst): maybe NTL>1 is only accepted when
+    // the keys ride in encoderSpecification at VTCompressionSessionCreate, and
+    // the clamp happens inside VTSessionSetProperty in our own process (before
+    // the XPC to mediaserverd). Readback PRE/POST prepare shows WHERE it dies.
+    [report appendString:@"\n--- NTL creation-spec probe (readback pre/post prepare) ---\n"];
+    NSArray<NSDictionary *> *ntlSpecs = @[
+        @{@"EncoderUsage": @1, @"NumberOfTemporalLayers": @3, @"AllowTemporalCompression": @YES},
+        @{@"EncoderUsage": @2, @"NumberOfTemporalLayers": @3, @"AllowTemporalCompression": @YES},
+        @{@"EncoderUsage": @0, @"NumberOfTemporalLayers": @3, @"RealTime": @YES},
+        @{@"EncoderUsage": @1, @"NumberOfTemporalLayers": @3, @"RealTime": @YES,
+          @"ExpectedFrameRate": @60, @"AverageBitRate": @4000000, @"BaseLayerFrameRate": @15},
+    ];
+    for (NSUInteger idx = 0; idx < ntlSpecs.count; idx++) {
+        VTCompressionSessionRef sN = NULL;
+        OSStatus stN = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+            (__bridge CFDictionaryRef)ntlSpecs[idx], NULL, NULL, NULL, NULL, &sN);
+        if (stN != noErr || !sN) {
+            [report appendFormat:@"  spec[%lu] create -> %d (rejected)\n", (unsigned long)idx, (int)stN];
+            continue;
+        }
+        VTSessionSetProperty(sN, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
+        VTSessionSetProperty(sN, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+        VTSessionSetProperty(sN, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@60);
+        VTSessionSetProperty(sN, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@4000000);
+        VTSessionSetProperty(sN, kVTCompressionPropertyKey_BaseLayerFrameRate, (__bridge CFNumberRef)@15);
+        VTSessionSetProperty(sN, kVTCompressionPropertyKey_NumberOfTemporalLayers, (__bridge CFNumberRef)@3);
+        int pre = -1, post = -1;
+        CFNumberRef rbPre = NULL;
+        if (VTSessionCopyProperty(sN, kVTCompressionPropertyKey_NumberOfTemporalLayers, NULL, &rbPre) == noErr && rbPre) {
+            CFNumberGetValue(rbPre, kCFNumberIntType, &pre); CFRelease(rbPre);
+        }
+        VTCompressionSessionPrepareToEncodeFrames(sN);
+        CFNumberRef rbPost = NULL;
+        if (VTSessionCopyProperty(sN, kVTCompressionPropertyKey_NumberOfTemporalLayers, NULL, &rbPost) == noErr && rbPost) {
+            CFNumberGetValue(rbPost, kCFNumberIntType, &post); CFRelease(rbPost);
+        }
+        [report appendFormat:@"  spec[%lu] create=%d readback PRE=%d POST=%d %s\n",
+         (unsigned long)idx, (int)stN, pre, post,
+         (post == 3) ? "UNCLAMPED" : ((pre == 3) ? "CLAMPED_AT_PREPARE" : "CLAMPED_AT_SET")];
+        VTCompressionSessionInvalidate(sN);
+        CFRelease(sN);
     }
 
     // === AVE27 stage13: NTL sweep on the proven trigger config (ollie) ===
@@ -783,6 +850,79 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
 
         VTCompressionSessionCompleteFrames(sDPB, kCMTimeInvalid);
         CFRelease(sDPB);
+    }
+
+    // === UserDPB element schema probe (analyst) ===
+    // last_ok=0/first_rejection=1 means the validator rejects the ELEMENT
+    // structure, not the array length. Candidates: CFNumber token, CFData blob,
+    // dicts with POC/Slot / FrameID / Index — fed both via VTSessionSetProperty
+    // AND via frameProperties. The encode callback dumps the sample-buffer
+    // attachments — those are the reference-frame tokens the parser wants back.
+    [report appendString:@"\n--- UserDPB element schema probe ---\n"];
+    NSMutableArray *cbSink = [NSMutableArray array];
+    NSDictionary *encSpec = @{
+        @"EncoderUsage": @1,
+        @"EnableUserRefForFacetime": @YES,
+    };
+    VTCompressionSessionRef sS = NULL;
+    OSStatus stS = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+        (__bridge CFDictionaryRef)encSpec, NULL, NULL,
+        KPH9AttsCB, (__bridge void *)cbSink, &sS);
+    [report appendFormat:@"create with encSpec(EncoderUsage+EnableUserRef) -> %d\n", (int)stS];
+    if (stS == noErr && sS) {
+        VTSessionSetProperty(sS, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        OSStatus prepS = VTCompressionSessionPrepareToEncodeFrames(sS);
+        CVPixelBufferRef pbS = NULL;
+        CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
+                            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pbS);
+        OSStatus stE0 = -1;
+        if (pbS) {
+            stE0 = VTCompressionSessionEncodeFrame(sS, pbS, CMTimeMake(0, 30), kCMTimeInvalid,
+                                                   NULL, NULL, NULL);
+            VTCompressionSessionCompleteFrames(sS, kCMTimeInvalid);
+        }
+        [report appendFormat:@"prepare=%d encode[0] IDR -> %d\n", (int)prepS, (int)stE0];
+        for (NSString *line in cbSink) {
+            [report appendFormat:@"  %@\n", line];
+        }
+        [cbSink removeAllObjects];
+
+        uint64_t z8 = 0;
+        uint8_t z32[32] = {0};
+        NSMutableArray *cands = [NSMutableArray array];
+        [cands addObject:@[ @0 ]];                                                  // CFNumber(0)
+        [cands addObject:@[ @1 ]];                                                  // CFNumber(1)
+        [cands addObject:@[ [NSData dataWithBytes:&z8 length:8] ]];                  // CFData 8B
+        [cands addObject:@[ [NSData dataWithBytes:z32 length:32] ]];                 // CFData 32B
+        [cands addObject:@[ @{@"POC": @0, @"Slot": @0} ]];                          // Dict POC/Slot
+        [cands addObject:@[ @{@"FrameID": @0, @"LT": @NO} ]];                       // Dict FrameID
+        [cands addObject:@[ @{@"Index": @0} ]];                                     // Dict Index
+        [cands addObject:@[ @{@"FrameIndex": @0, @"PicOrderCnt": @0,
+                              @"IsLongTerm": @NO, @"SlotIndex": @0} ]];             // our dict
+        for (NSUInteger ci = 0; ci < cands.count; ci++) {
+            NSArray *arr = cands[ci];
+            OSStatus sProp = VTSessionSetProperty(sS, CFSTR("UserDPBFramesForFaceTime"),
+                                                  (__bridge CFTypeRef)arr);
+            NSDictionary *frameProps = @{ @"UserDPBFramesForFaceTime": arr };
+            OSStatus fProp = -1;
+            if (pbS) {
+                fProp = VTCompressionSessionEncodeFrame(sS, pbS,
+                                                        CMTimeMake((int64_t)(ci + 1), 30),
+                                                        kCMTimeInvalid,
+                                                        (__bridge CFDictionaryRef)frameProps,
+                                                        NULL, NULL);
+                VTCompressionSessionCompleteFrames(sS, kCMTimeInvalid);
+            }
+            [report appendFormat:@"  cand[%lu] sessionSet=%d frameEncode=%d\n",
+             (unsigned long)ci, (int)sProp, (int)fProp];
+        }
+        for (NSString *line in cbSink) {
+            [report appendFormat:@"  %@\n", line];
+        }
+        if (pbS) CVPixelBufferRelease(pbS);
+        VTCompressionSessionInvalidate(sS);
+        CFRelease(sS);
     }
 
     // === stage9 PANIC RUNG — DISABLED ===

