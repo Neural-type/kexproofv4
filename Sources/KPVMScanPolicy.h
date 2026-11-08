@@ -89,6 +89,34 @@ static inline BOOL KPIsPlausibleKernelHeap(uint64_t raw, uint64_t *untagged) {
     return NO;
 }
 
+// Per ollie: the two big false-positive classes on-device are packed int32
+// pairs from codec quant/motion tables (0xffffffedffff0d00 = [-19,-62208]) and
+// non-canonical TBI junk (0xe7ffff...). Classify before trusting a candidate.
+typedef enum {
+    KPTR_REJECT_PACKED_INT32 = 0,
+    KPTR_REJECT_BAD_TBI,
+    KPTR_REJECT_UNALIGNED,
+    KPTR_CANDIDATE_ZONE_HEAP,
+    KPTR_CANDIDATE_KERNEL_TEXT_DATA
+} kptr_class_t;
+
+static inline kptr_class_t KPClassifyKPtr(uint64_t raw) {
+    // Canonical kernel VAs have top byte 0xFF (PAC/TBI tags like 0xe7 are junk here)
+    if ((raw >> 56) != 0xFF) return KPTR_REJECT_BAD_TBI;
+    // Packed negative int32 pairs: low half looks like a negative 32-bit coeff
+    uint32_t lo32 = (uint32_t)(raw & 0xFFFFFFFFULL);
+    if (lo32 >= 0xF8000000U || (lo32 & 0xFFFF0000U) == 0xFFFF0000U) return KPTR_REJECT_PACKED_INT32;
+    // Code pointers are 4-aligned; data pointers 8-aligned (ollie: 8 min, we keep
+    // 4 so ktext function pointers are not cut).
+    if ((raw & 0x3ULL) != 0) return KPTR_REJECT_UNALIGNED;
+    uint32_t hi32 = (uint32_t)(raw >> 32);
+    if (hi32 >= 0xFFFFFFF0U && hi32 <= 0xFFFFFFFBU) return KPTR_CANDIDATE_KERNEL_TEXT_DATA;
+    if (hi32 >= 0xFFFFFFE0U && hi32 <= 0xFFFFFFEFU) {
+        return ((raw & 0x7ULL) == 0) ? KPTR_CANDIDATE_ZONE_HEAP : KPTR_REJECT_UNALIGNED;
+    }
+    return KPTR_REJECT_UNALIGNED;
+}
+
 static BOOL KPIsKernelPointerCandidate(uint64_t value) {
     if ((value & 0x3) != 0 || value == UINT64_MAX) return NO;
 

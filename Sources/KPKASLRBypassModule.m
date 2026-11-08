@@ -183,10 +183,15 @@ static const int kStaticCount = sizeof(kStaticBases) / sizeof(kStaticBases[0]);
      totalKptrs, foundCount, filteredConstantCount];
 
     // --- Phase 2: report address-shaped candidates ---
+    static const char *kClassNames[] = {
+        "REJECT_PACKED_INT32", "REJECT_BAD_TBI", "REJECT_UNALIGNED",
+        "ZONE_HEAP", "KERNEL_TEXT_DATA"
+    };
     [report appendString:@"\n--- Phase 2: address-shaped candidates (unverified) ---\n"];
     for (int i = 0; i < foundCount && i < 16; i++) {
-        [report appendFormat:@"  [%d] @ user=0x%llx -> value=0x%llx\n",
-         i, foundKptrAddrs[i], foundKptrs[i]];
+        kptr_class_t cls = KPClassifyKPtr(foundKptrs[i]);
+        [report appendFormat:@"  [%d] @ user=0x%llx -> value=0x%llx  %s\n",
+         i, foundKptrAddrs[i], foundKptrs[i], kClassNames[cls]];
     }
 
     // --- Phase 3: slide candidates ---
@@ -225,6 +230,9 @@ static const int kStaticCount = sizeof(kStaticBases) / sizeof(kStaticBases[0]);
     int heapShapedCount = 0;
     for (int i = 0; i < foundCount; i++) {
         uint64_t v = foundKptrs[i];
+        // Per ollie: only real zone-map shapes count; packed int32 pairs from
+        // codec quant/motion tables must not inflate the heap tally.
+        if (KPClassifyKPtr(v) != KPTR_CANDIDATE_ZONE_HEAP) continue;
         uint64_t heapVA = 0;
         if (KPIsPlausibleKernelHeap(v, &heapVA)) {
             heapShapedCount++;

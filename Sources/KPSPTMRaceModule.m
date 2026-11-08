@@ -131,6 +131,21 @@ static void *sptm_write_thread(void *arg) {
      successes, RACE_ATTEMPTS,
      (float)successes / RACE_ATTEMPTS * 100.0f];
 
+    // Per ollie: with max_protection == VM_PROT_ALL (0x7) the sibling thread's
+    // vm_protect(READ|WRITE) legally reopens a RW window and vm_write succeeds
+    // there — that is NOT a SPTM/RO-write primitive. Check maxProt before any
+    // verdict.
+    vm_address_t rAddr = page;
+    vm_size_t rSize = 0;
+    uint32_t rDepth = 0;
+    vm_region_submap_info_data_64_t rInfo;
+    mach_msg_type_number_t rCount = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t rKr = vm_region_recurse_64(mach_task_self(), &rAddr, &rSize, &rDepth,
+                                             (vm_region_recurse_info_t)&rInfo, &rCount);
+    [report appendFormat:@"page region: kr=%d curProt=0x%x maxProt=0x%x\n",
+     rKr, rInfo.protection, rInfo.max_protection];
+    BOOL maxAllowsWrite = (rKr == KERN_SUCCESS) && (rInfo.max_protection & VM_PROT_WRITE);
+
     if (successes == 0) {
         vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ | VM_PROT_WRITE);
         vm_deallocate(mach_task_self(), page, 4096);
@@ -139,7 +154,34 @@ static void *sptm_write_thread(void *arg) {
         [report appendString:@"Try: different core pairs, longer race, or usleep=0.\n"];
         return report;
     }
-    [report appendString:@"*** SPTM RACE CONFIRMED ***\n"];
+    if (maxAllowsWrite) {
+        [report appendString:@"*** NOT A PRIMITIVE ***\n"];
+        [report appendString:@"vm_write successes are the legal RW window: maxProt has VM_PROT_WRITE.\n"];
+        [report appendString:@"(ollie: user-space vm_protect race at maxProt=0x7 is not a SPTM break.)\n"];
+    } else {
+        [report appendString:@"*** SPTM RACE CONFIRMED ***\n"];
+    }
+
+    // Strict RO-write check (ollie): on a FRESH page lower the ceiling with
+    // set_maximum=TRUE to READ, then attempt a marker write. Any success here
+    // would be a real write-into-RO primitive.
+    [report appendString:@"\n--- Phase 2b: strict RO-write check (set_maximum=TRUE) ---\n"];
+    vm_address_t roPage = 0;
+    if (vm_allocate(mach_task_self(), &roPage, 4096, VM_FLAGS_ANYWHERE) == KERN_SUCCESS) {
+        memset((void *)roPage, 0x11, 4096);
+        kern_return_t mk = vm_protect(mach_task_self(), roPage, 4096, TRUE, VM_PROT_READ);
+        [report appendFormat:@"set_maximum=TRUE READ -> %d\n", mk];
+        uint32_t marker = 0xDEADBEEF;
+        kern_return_t wk = vm_write(mach_task_self(), roPage, (vm_offset_t)&marker, sizeof(marker));
+        uint32_t got = *(volatile uint32_t *)roPage;
+        [report appendFormat:@"vm_write into max-READ page: kr=%d readback=0x%x\n", wk, got];
+        if (wk == KERN_SUCCESS && got == 0xDEADBEEF) {
+            [report appendString:@"RO_WRITE_PRIMITIVE: YES (write into max-READ page landed!)\n"];
+        } else {
+            [report appendString:@"RO_WRITE_PRIMITIVE: NO (ceiling holds; earlier successes were the RW window)\n"];
+        }
+        vm_deallocate(mach_task_self(), roPage, 4096);
+    }
 
     // Verify write landed (set_maximum must be false to restore cur_protection)
     vm_protect(mach_task_self(), page, 4096, false, VM_PROT_READ | VM_PROT_WRITE);
