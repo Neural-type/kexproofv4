@@ -6,6 +6,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <mach/mach.h>
 #import <dlfcn.h>
+#import <unistd.h>
 
 // IOKit userclient API (declared manually â€” CI SDK headers vary). This is the
 // bypass path around VideoToolbox's NTL clamp (ollie: IOConnectCallStructMethod
@@ -50,6 +51,22 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     }
 }
 
+// Bounded drain (H9 hang fix): VTCompressionSessionCompleteFrames with
+// kCMTimeInvalid blocks FOREVER once the encoder latches a fault (-12912 /
+// -17691) - and every probe creates exactly such sessions. Poll the callback
+// sink for a bounded time instead; Invalidate cleans up without waiting.
+static void KPH9Drain(VTCompressionSessionRef s, NSMutableArray *sink, int timeoutMs) {
+    if (!s) return;
+    int waited = 0, last = -1;
+    while (waited < timeoutMs) {
+        int now = sink ? (int)sink.count : 0;
+        if (sink && now > 0 && now == last) break;
+        last = now;
+        usleep(2000);
+        waited += 2;
+    }
+}
+
 // One isolated DPB test on a FRESH session (analyst 222830: the first -12912
 // latches the session into permanent malfunction - every later row on it is
 // fiction). Builds the EnableUserRef-only recipe, clean IDR, then set+encode.
@@ -68,7 +85,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
                         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pb);
     if (pb) {
         VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
-        VTCompressionSessionCompleteFrames(s, kCMTimeInvalid);
+        KPH9Drain(s, sink, 250);
     }
     OSStatus sProp = VTSessionSetProperty(s, CFSTR("UserDPBFramesForFaceTime"),
                                           (__bridge CFTypeRef)payload);
@@ -78,7 +95,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
         NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": payload };
         fProp = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(ptsSeed, 30), kCMTimeInvalid,
                                                 (__bridge CFDictionaryRef)fp, NULL, NULL);
-        VTCompressionSessionCompleteFrames(s, kCMTimeInvalid);
+        KPH9Drain(s, sink, 250);
     }
     NSString *cb = sink.count ? sink[0] : @"(no cb)";
     if (pb) CVPixelBufferRelease(pb);
@@ -217,7 +234,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
 
     // Tear down the property-probe session (ollie: failed Phase 3 sets poison
     // the encoder state machine and the next EncodeFrame dies with -19640).
-    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    KPH9Drain(session, nil, 100);
     VTCompressionSessionInvalidate(session);
     CFRelease(session);
     session = NULL;
@@ -278,7 +295,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
         for (int w = 1; w <= 18; w++) {
             VTCompressionSessionEncodeFrame(s4, pb, CMTimeMake(w, 30), dur, NULL, NULL, &flags);
         }
-        VTCompressionSessionCompleteFrames(s4, kCMTimeInvalid);
+        KPH9Drain(s4, s4sink, 300);
         [report appendString:@"DPB warmed with 18 P-frames before smash\n"];
 
         NSDictionary *frameProps = @{
@@ -296,7 +313,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
         // Analyst: sync return 0 only means queued - drain the pipeline first,
         // then the async cb status shows whether the 32+32 RPS actually reached
         // AVE_HEVC_ST_RPS_Retrieve.
-        VTCompressionSessionCompleteFrames(s4, kCMTimeInvalid);
+        KPH9Drain(s4, s4sink, 300);
         for (NSString *line in s4sink) {
             [report appendFormat:@"  s4cb %@\n", line];
         }
@@ -304,7 +321,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     }
     if (pb) CVPixelBufferRelease(pb);
     if (s4) {
-        VTCompressionSessionCompleteFrames(s4, kCMTimeInvalid);
+        KPH9Drain(s4, s4sink, 300);
         VTCompressionSessionInvalidate(s4);
         CFRelease(s4);
     }
@@ -526,7 +543,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             if (pbX) {
                 VTCompressionSessionEncodeFrame(sX, pbX, CMTimeMake(0, 30), kCMTimeInvalid,
                                                 NULL, NULL, NULL);
-                VTCompressionSessionCompleteFrames(sX, kCMTimeInvalid);
+                KPH9Drain(sX, nil, 100);
             }
             // Path (i): post-prepare session setter with no re-prepare
             int smash = 16000;
@@ -551,7 +568,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             if (pbX) {
                 encSmash = VTCompressionSessionEncodeFrame(sX, pbX, CMTimeMake(1, 30), kCMTimeInvalid,
                                                            (__bridge CFDictionaryRef)smashProps, NULL, NULL);
-                VTCompressionSessionCompleteFrames(sX, kCMTimeInvalid);
+                KPH9Drain(sX, nil, 100);
             }
             [report appendFormat:@"  path-ii frameProps NTL=16000 encode -> %d\n", (int)encSmash];
             if (pbX) CVPixelBufferRelease(pbX);
@@ -731,7 +748,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
          useRC ? @"RC20" : @"noRC", ntl, (int)setSt, (int)prepSt, rb, (int)st2,
                 (rb == ntl) ? ((st2 == noErr) ? "ARMED" : "FAILED") : "RAN_READBACK_MISMATCH"];
         CVPixelBufferRelease(pb2);
-        VTCompressionSessionCompleteFrames(s2, kCMTimeInvalid);
+        KPH9Drain(s2, nil, 100);
         CFRelease(s2);
 
         // Marker scan: did stp x0,x0,[x0] land in one of our surfaces?
@@ -800,7 +817,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             }
             [report appendFormat:@"  B-frame encode: %d/8 frames\n", enc];
         }
-        VTCompressionSessionCompleteFrames(s3, kCMTimeInvalid);
+        KPH9Drain(s3, nil, 100);
         CFRelease(s3);
     }
 
@@ -1084,7 +1101,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             CFRelease(rb2);
         }
 
-        VTCompressionSessionCompleteFrames(sDPB, kCMTimeInvalid);
+        KPH9Drain(sDPB, nil, 150);
         CFRelease(sDPB);
     }
 
@@ -1114,7 +1131,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             if (pbS) {
                 VTCompressionSessionEncodeFrame(sS, pbS, CMTimeMake(0, 30), kCMTimeInvalid,
                                                 NULL, NULL, NULL);
-                VTCompressionSessionCompleteFrames(sS, kCMTimeInvalid);
+                KPH9Drain(sS, cbSink, 150);
             }
             [report appendString:@"clean IDR prologue done\n"];
             for (NSString *line in cbSink) [report appendFormat:@"  %@\n", line];
@@ -1215,12 +1232,12 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             if (pbW) {
                 VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(0, 30), kCMTimeInvalid,
                                                 NULL, NULL, NULL);
-                VTCompressionSessionCompleteFrames(sW, kCMTimeInvalid);
+                KPH9Drain(sW, sink, 250);
                 for (int w = 1; w <= 18; w++) {
                     VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(w, 30), kCMTimeInvalid,
                                                     NULL, NULL, NULL);
                 }
-                VTCompressionSessionCompleteFrames(sW, kCMTimeInvalid);
+                KPH9Drain(sW, sink, 250);
             }
             [report appendString:@"  DPB warmed with 1 IDR + 18 P-frames\n"];
             int lastOK = 0, firstReject = 0;
@@ -1236,7 +1253,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
                     fe = VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(30 + n, 30),
                                                          kCMTimeInvalid,
                                                          (__bridge CFDictionaryRef)fp, NULL, NULL);
-                    VTCompressionSessionCompleteFrames(sW, kCMTimeInvalid);
+                    KPH9Drain(sW, sink, 250);
                 }
                 if (st == 0) lastOK = n;
                 else if (!firstReject) firstReject = n;
