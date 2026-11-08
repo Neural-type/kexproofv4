@@ -196,7 +196,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         @"EnableUserRefForFacetime": @YES,
     };
     OSStatus st4 = VTCompressionSessionCreate(
-        kCFAllocatorDefault, 1920, 1080,
+        kCFAllocatorDefault, 1280, 720,
         kCMVideoCodecType_HEVC,
         (__bridge CFDictionaryRef)s4spec, NULL, NULL, NULL, NULL, &s4);
     [report appendFormat:@"fresh session create -> %d\n", (int)st4];
@@ -213,12 +213,15 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         [report appendFormat:@"s4 PrepareToEncodeFrames -> %d\n", (int)prep4];
     }
     CVPixelBufferRef pb = NULL;
-    CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
+    CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
                          kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                          NULL, &pb);
     if (st4 == noErr && s4 && pb) {
         CVPixelBufferLockBaseAddress(pb, 0);
-        memset(CVPixelBufferGetBaseAddress(pb), 0x80, CVPixelBufferGetDataSize(pb));
+        memset(CVPixelBufferGetBaseAddressOfPlane(pb, 0), 0x40,
+               CVPixelBufferGetBytesPerRowOfPlane(pb, 0) * 720);
+        memset(CVPixelBufferGetBaseAddressOfPlane(pb, 1), 0x80,
+               CVPixelBufferGetBytesPerRowOfPlane(pb, 1) * 360);
         CVPixelBufferUnlockBaseAddress(pb, 0);
 
         VTEncodeInfoFlags flags = 0;
@@ -380,6 +383,59 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
          (post == 3) ? "UNCLAMPED" : ((pre == 3) ? "CLAMPED_AT_PREPARE" : "CLAMPED_AT_SET")];
         VTCompressionSessionInvalidate(sN);
         CFRelease(sN);
+    }
+
+    // NTL boundary ladder (analyst 213316): NTL=3 survives spec+prepare but
+    // 100..16462 come back as 1. Either Prepare range-checks the layer count,
+    // or the transport (setter / EncoderUsage) stomps the encSpec value.
+    // mode 0: encSpec only, no post-create setter
+    // mode 1: encSpec + VTSessionSetProperty afterwards (stage13 shape)
+    // mode 2: encSpec WITHOUT EncoderUsage (is usage=1 the stomp?)
+    [report appendString:@"\n--- NTL boundary ladder (0=spec-only 1=spec+set 2=no-usage) ---\n"];
+    int ladderVals[] = { 3, 4, 5, 6, 7, 8, 12, 16, 32, 64, 128, 1000, 16000 };
+    for (int mode = 0; mode < 3; mode++) {
+        for (int li = 0; li < 13; li++) {
+            int lv = ladderVals[li];
+            NSMutableDictionary *specL = [NSMutableDictionary dictionary];
+            if (mode != 2) specL[@"EncoderUsage"] = @1;
+            specL[@"NumberOfTemporalLayers"] = @(lv);
+            specL[@"AllowTemporalCompression"] = @YES;
+            specL[@"RealTime"] = @YES;
+            VTCompressionSessionRef sL = NULL;
+            OSStatus stL = VTCompressionSessionCreate(
+                kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+                (__bridge CFDictionaryRef)specL, NULL, NULL, NULL, NULL, &sL);
+            if (stL != noErr || !sL) {
+                [report appendFormat:@"  m%d ntl=%-5d create=%d FAIL\n", mode, lv, (int)stL];
+                continue;
+            }
+            if (mode == 1) {
+                CFNumberRef ln = CFNumberCreate(NULL, kCFNumberIntType, &lv);
+                VTSessionSetProperty(sL, CFSTR("NumberOfTemporalLayers"), ln);
+                CFRelease(ln);
+            }
+            VTSessionSetProperty(sL, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
+            VTSessionSetProperty(sL, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+            double rateL = 30.0;
+            CFNumberRef ln2 = CFNumberCreate(NULL, kCFNumberDoubleType, &rateL);
+            VTSessionSetProperty(sL, kVTCompressionPropertyKey_ExpectedFrameRate, ln2); CFRelease(ln2);
+            ln2 = CFNumberCreate(NULL, kCFNumberDoubleType, &rateL);
+            VTSessionSetProperty(sL, kVTCompressionPropertyKey_BaseLayerFrameRate, ln2); CFRelease(ln2);
+            int preL = -1, postL = -1;
+            CFNumberRef rbL = NULL;
+            if (VTSessionCopyProperty(sL, CFSTR("NumberOfTemporalLayers"), NULL, &rbL) == noErr && rbL) {
+                CFNumberGetValue(rbL, kCFNumberIntType, &preL); CFRelease(rbL);
+            }
+            VTCompressionSessionPrepareToEncodeFrames(sL);
+            rbL = NULL;
+            if (VTSessionCopyProperty(sL, CFSTR("NumberOfTemporalLayers"), NULL, &rbL) == noErr && rbL) {
+                CFNumberGetValue(rbL, kCFNumberIntType, &postL); CFRelease(rbL);
+            }
+            [report appendFormat:@"  m%d ntl=%-5d PRE=%d POST=%d %s\n", mode, lv, preL, postL,
+             (postL == lv) ? "UNCLAMPED" : "CLAMPED"];
+            VTCompressionSessionInvalidate(sL);
+            CFRelease(sL);
+        }
     }
 
     // === AVE27 stage13: NTL sweep on the proven trigger config (ollie) ===
@@ -742,7 +798,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         @"EnableUserRefForFacetime": @YES,
     };
     OSStatus stDPB = VTCompressionSessionCreate(
-        kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
+        kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
         (__bridge CFDictionaryRef)dpbSpec, NULL, NULL, NULL, NULL, &sDPB);
     if (stDPB != noErr || !sDPB) {
         [report appendFormat:@"  session create: %d\n", (int)stDPB];
@@ -767,10 +823,14 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         if (stPrep == noErr) {
             // First encode (initialize)
             CVPixelBufferRef pb0 = NULL;
-            CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, NULL, &pb0);
+            CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
+                                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pb0);
             if (pb0) {
                 CVPixelBufferLockBaseAddress(pb0, 0);
-                memset(CVPixelBufferGetBaseAddress(pb0), 0x80, CVPixelBufferGetDataSize(pb0));
+                memset(CVPixelBufferGetBaseAddressOfPlane(pb0, 0), 0x40,
+                       CVPixelBufferGetBytesPerRowOfPlane(pb0, 0) * 720);
+                memset(CVPixelBufferGetBaseAddressOfPlane(pb0, 1), 0x80,
+                       CVPixelBufferGetBytesPerRowOfPlane(pb0, 1) * 360);
                 CVPixelBufferUnlockBaseAddress(pb0, 0);
                 VTEncodeInfoFlags f0 = 0;
                 OSStatus stE0 = VTCompressionSessionEncodeFrame(sDPB, pb0, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f0);
@@ -822,10 +882,14 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
             // Encode more frames
             for (int i = 1; i < 4; i++) {
                 CVPixelBufferRef pbD = NULL;
-                CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, NULL, &pbD);
+                CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
+                                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pbD);
                 if (!pbD) continue;
                 CVPixelBufferLockBaseAddress(pbD, 0);
-                memset(CVPixelBufferGetBaseAddress(pbD), 0x80, CVPixelBufferGetDataSize(pbD));
+                memset(CVPixelBufferGetBaseAddressOfPlane(pbD, 0), 0x40,
+                       CVPixelBufferGetBytesPerRowOfPlane(pbD, 0) * 720);
+                memset(CVPixelBufferGetBaseAddressOfPlane(pbD, 1), 0x80,
+                       CVPixelBufferGetBytesPerRowOfPlane(pbD, 1) * 360);
                 CVPixelBufferUnlockBaseAddress(pbD, 0);
                 VTEncodeInfoFlags fD = 0;
                 OSStatus stE = VTCompressionSessionEncodeFrame(sDPB, pbD, CMTimeMake(i, 30), kCMTimeInvalid, NULL, NULL, &fD);
