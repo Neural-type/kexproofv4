@@ -289,7 +289,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
         };
         for (int fi = 1; fi <= 2; fi++) {
             status = VTCompressionSessionEncodeFrame(
-                s4, pb, CMTimeMake(fi, 30), dur,
+                s4, pb, CMTimeMake(20 + fi, 30), dur,
                 (__bridge CFDictionaryRef)frameProps, NULL, &flags);
             [report appendFormat:@"encode[%d] RPS smash -> %d\n", fi, (int)status];
         }
