@@ -8,6 +8,10 @@
 #import <fcntl.h>
 #import <unistd.h>
 
+#ifndef F_SETPIPE_SZ
+#define F_SETPIPE_SZ 73
+#endif
+
 @interface KPAuditAVESpriteModule ()
 @property (nonatomic, assign) int sprayCount;
 @property (nonatomic, assign) uint32_t marker;
@@ -231,8 +235,9 @@
     for (int p = 0; p < 48; p++) {
         pipeFds[p][0] = pipeFds[p][1] = -1;
         if (pipe(pipeFds[p]) != 0) continue;
-        fcntl(pipeFds[p][1], F_SETPIPE_SZ, 256 * 1024);
-        if (tile && write(pipeFds[p][1], tile, 256 * 1024) == 256 * 1024) pipesMade++;
+        fcntl(pipeFds[p][1], F_SETPIPE_SZ, 256 * 1024); // ignored if unsupported
+        fcntl(pipeFds[p][1], F_SETFL, O_NONBLOCK);
+        if (tile && write(pipeFds[p][1], tile, 256 * 1024) > 0) pipesMade++;
     }
     [report appendFormat:@"pipe spray: %d x 256KB\n", pipesMade];
 
