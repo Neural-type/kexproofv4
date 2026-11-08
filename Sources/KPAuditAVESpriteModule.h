@@ -15,6 +15,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// so the spray lands AFTER the victim in the zone (the OOB reads forward).
 @interface KPAuditAVESpriteModule : NSObject <KPTestModule>
 - (instancetype)initWithSprayCount:(int)count marker:(uint32_t)marker;
+/// Steered variant: NTL<16463 computes x0 = ((NTL-16463)<<32)|0x59 into the
+/// kheap band 0xfffffe10..3f; the spray carries those exact candidate values.
+- (instancetype)initWithSprayCount:(int)count marker:(uint32_t)marker ntl:(int)ntl;
 @end
 
 NS_ASSUME_NONNULL_END

