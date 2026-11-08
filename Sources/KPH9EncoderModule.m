@@ -189,10 +189,16 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     // the smashed RPS via frameProps.
     [report appendString:@"\n--- Phase 4: fresh session, clean IDR then RPS smash ---\n"];
     VTCompressionSessionRef s4 = NULL;
+    // Analyst: -19640 on the clean IDR was the missing encSpec binding
+    // (EncoderUsage + EnableUserRefForFacetime at Create).
+    NSDictionary *s4spec = @{
+        @"EncoderUsage": @1,
+        @"EnableUserRefForFacetime": @YES,
+    };
     OSStatus st4 = VTCompressionSessionCreate(
         kCFAllocatorDefault, 1920, 1080,
         kCMVideoCodecType_HEVC,
-        NULL, NULL, NULL, NULL, NULL, &s4);
+        (__bridge CFDictionaryRef)s4spec, NULL, NULL, NULL, NULL, &s4);
     [report appendFormat:@"fresh session create -> %d\n", (int)st4];
     if (st4 == noErr && s4) {
         // ollie: Stage 13 encoded clean because its sessions carried
@@ -399,9 +405,10 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     ISGetBaseFn2 isGetBase2 = isLib2 ? (ISGetBaseFn2)dlsym(isLib2, "IOSurfaceGetBaseAddress") : NULL;
     ISGetSizeFn2 isGetSize2 = isLib2 ? (ISGetSizeFn2)dlsym(isLib2, "IOSurfaceGetAllocSize") : NULL;
 
-    // stage9 recipe recovered from the ave27 binary: EncoderUsage=1 + RCMode=20
-    // is what arms NTL (the panic rung reads "EncoderUsage=1 RCMode=20 NTL=").
-    // Pass 0 = RCMode=20 + rate companions; pass 1 = control without RCMode.
+    // stage9 recipe + analyst creation-spec finding: NTL rides in
+    // encoderSpecification at Create and the unclamp COMMITS at Prepare
+    // (readback PRE=1, POST=N). Pass 0 = RCMode=20 + rate companions,
+    // pass 1 = control without RCMode.
     int ntlVals[] = { 1, 100, 15967, 16000, 16014, 16115, 16223, 16270, 16431, 16438, 16446, 16447, 16462 };
     for (int pass = 0; pass < 2; pass++) {
     BOOL useRC = (pass == 0);
@@ -434,9 +441,14 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
          useRC ? @"RC20" : @"noRC", ntl, x0, surfArray ? (long)CFArrayGetCount(surfArray) : 0L, (int)rcSt];
 
         VTCompressionSessionRef s2 = NULL;
+        NSDictionary *spec2 = @{
+            @"EncoderUsage": @1,
+            @"NumberOfTemporalLayers": @(ntl),
+            @"AllowTemporalCompression": @YES,
+        };
         OSStatus st2 = VTCompressionSessionCreate(
             kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
-            NULL, NULL, NULL, NULL, NULL, &s2);
+            (__bridge CFDictionaryRef)spec2, NULL, NULL, NULL, NULL, &s2);
         if (st2 != noErr || !s2) {
             [report appendFormat:@"  NTL=%d session_create=%d FAILED\n", ntl, (int)st2];
             if (surfArray) CFRelease(surfArray);
@@ -481,13 +493,13 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         n = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
         OSStatus setSt = VTSessionSetProperty(s2, CFSTR("NumberOfTemporalLayers"), n);
         CFRelease(n);
+        // Analyst 212023: the unclamp COMMITS at PrepareToEncodeFrames - readback
+        // before prepare shows the wrapper's clamped 1, after prepare the real N.
+        OSStatus prepSt = VTCompressionSessionPrepareToEncodeFrames(s2);
         int rb = 0;
         CFNumberRef rbn = NULL;
         VTSessionCopyProperty(s2, CFSTR("NumberOfTemporalLayers"), NULL, &rbn);
         if (rbn) { CFNumberGetValue(rbn, kCFNumberIntType, &rb); CFRelease(rbn); }
-        // Per ollie + AVE112705 reference: NO PrepareToEncodeFrames and NO
-        // AllowFrameReordering â€” Prepare makes VideoToolbox clamp NTL to 1 in
-        // user-space (readback=1 at every N) and the kernel formula never runs.
         CVPixelBufferRef pb2 = NULL;
         CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
                             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pb2);
@@ -505,9 +517,9 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         CVPixelBufferUnlockBaseAddress(pb2, 0);
         VTEncodeInfoFlags f2 = 0;
         st2 = VTCompressionSessionEncodeFrame(s2, pb2, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f2);
-        [report appendFormat:@"  [%@] NTL=%d set=%d readback=%d encode=%d %s\n",
-         useRC ? @"RC20" : @"noRC", ntl, (int)setSt, rb, (int)st2,
-                (rb != ntl) ? "SKIPPED_CLAMPED" : ((st2 == noErr) ? "SURVIVED" : "FAILED")];
+        [report appendFormat:@"  [%@] NTL=%d set=%d prepare=%d readback_POST=%d encode=%d %s\n",
+         useRC ? @"RC20" : @"noRC", ntl, (int)setSt, (int)prepSt, rb, (int)st2,
+                (rb == ntl) ? ((st2 == noErr) ? "ARMED" : "FAILED") : "RAN_READBACK_MISMATCH"];
         CVPixelBufferRelease(pb2);
         VTCompressionSessionCompleteFrames(s2, kCMTimeInvalid);
         CFRelease(s2);
@@ -723,9 +735,15 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     [report appendString:@"\n--- UserDPB overflow trigger ---\n"];
 
     VTCompressionSessionRef sDPB = NULL;
+    // Analyst 212023: the encSpec binding is what opens the door — the old
+    // setter-only path rejected every DPB element with -12912.
+    NSDictionary *dpbSpec = @{
+        @"EncoderUsage": @1,
+        @"EnableUserRefForFacetime": @YES,
+    };
     OSStatus stDPB = VTCompressionSessionCreate(
         kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
-        NULL, NULL, NULL, NULL, NULL, &sDPB);
+        (__bridge CFDictionaryRef)dpbSpec, NULL, NULL, NULL, NULL, &sDPB);
     if (stDPB != noErr || !sDPB) {
         [report appendFormat:@"  session create: %d\n", (int)stDPB];
     } else {

