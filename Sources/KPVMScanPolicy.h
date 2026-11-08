@@ -37,11 +37,25 @@ static BOOL KPVMShouldSkipRegion(const vm_region_submap_info_data_64_t *info,
 
 static BOOL KPIsKernelPointerCandidate(uint64_t value) {
     if ((value & 0x3) != 0 || value == UINT64_MAX) return NO;
-    // Reject values with low 24 bits = 0 (packed int32+float pairs, not real kernel pointers)
+    // Reject SIMD/float/NaN noise: low 16 bits = 0 with 0xfffffff0..ff prefix
+    if ((value & 0xffffULL) == 0) {
+        uint8_t byte5 = (value >> 40) & 0xff;
+        if (byte5 >= 0xf0) return NO; // SIMD/float constants
+    }
+    // Reject packed int32+float pairs (low 24 bits = 0)
     if ((value & 0xFFFFFULL) == 0) return NO;
-    uint32_t high = (uint32_t)(value >> 32);
-    return (high >= 0xffffffe0U && high <= 0xffffffe1U) ||
-           (high >= 0xfffffff0U && high <= 0xfffffffdU);
+
+    uint8_t byte5 = (value >> 40) & 0xff;
+    // ARM64e A17 Pro (T8130) kernel layout:
+    //   0xfffffe00... = kernel text/data (unslid base 0xfffffe0007004000)
+    //   0xfffffe10..3f... = kernel heap (zone map)
+    if (byte5 == 0xfe) {
+        uint8_t byte4 = (value >> 32) & 0xff;
+        if (byte4 >= 0x00 && byte4 <= 0x3f) return YES; // ktext + kheap
+    }
+    // Also accept old-style 0xfffffff0... for compatibility
+    if (byte5 >= 0xf0 && byte5 <= 0xfd) return YES;
+    return NO;
 }
 
 static BOOL KPIsKnownDiagnosticConstant(uint64_t value) {
