@@ -290,7 +290,8 @@
 
     // Allocate enough entries to cover both `real` and `count` (plus padding),
     // so the kernel's copyin never reads past our buffer.
-    uint32_t allocEntries = (count > real ? count : real) + 32;
+    // Allocate enough entries to cover max sweep count (4096) plus padding
+    uint32_t allocEntries = 4096 + 32;
     mach_port_t *ports = calloc(allocEntries, sizeof(mach_port_t));
     // Fill first 'real' entries with valid ports, rest with INVALID names
     // (MACH_PORT_NULL is legal in OOL arrays — kernel accepts it without error)
