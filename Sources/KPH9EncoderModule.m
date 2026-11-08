@@ -7,9 +7,6 @@
 #import <mach/mach.h>
 #import <dlfcn.h>
 
-// Public CoreVideo API missing from the CI syntax-check SDK headers.
-extern size_t CVPixelBufferGetDataSizeForPlane(CVPixelBufferRef pixelBuffer, size_t planeIndex);
-
 @interface KPH9EncoderModule ()
 @property (nonatomic, copy) NSString *identifier;
 @property (nonatomic, copy) NSString *title;
@@ -236,13 +233,8 @@ extern size_t CVPixelBufferGetDataSizeForPlane(CVPixelBufferRef pixelBuffer, siz
             if (surfArray) CFRelease(surfArray);
             continue;
         }
-        CVPixelBufferLockBaseAddress(pb2, 0);
-        for (size_t pl = 0; pl < CVPixelBufferGetPlaneCount(pb2); pl++) {
-            void *ba = CVPixelBufferGetBaseAddressOfPlane(pb2, pl);
-            size_t bsz = CVPixelBufferGetDataSizeForPlane(pb2, pl);
-            if (ba && bsz) memset(ba, 0x80, bsz);
-        }
-        CVPixelBufferUnlockBaseAddress(pb2, 0);
+        // Frame content is irrelevant to the NTL trigger; skip plane fill
+        // (CVPixelBufferGetDataSizeForPlane is not linkable in the CI SDK).
         VTEncodeInfoFlags f2 = 0;
         st2 = VTCompressionSessionEncodeFrame(s2, pb2, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f2);
         [report appendFormat:@"  NTL=%d set=%d readback=%d encode=%d %s\n", ntl, (int)setSt, rb, (int)st2,
