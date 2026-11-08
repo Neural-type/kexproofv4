@@ -135,6 +135,15 @@
     }
     int ntl = self.ntl;
     VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+    // Rate-ratio recipe (analyst 214237): NTL appears validated against
+    // ExpectedFrameRate/BaseLayerFrameRate - spec[0..3] held NTL=3 with 60/15.
+    // Scale EFR with N so the ratio covers the requested layer count.
+    VTSessionSetProperty(victim, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
+    VTSessionSetProperty(victim, CFSTR("RealTime"), kCFBooleanTrue);
+    int vEfr = ntl * 15;
+    VTSessionSetProperty(victim, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@(vEfr));
+    VTSessionSetProperty(victim, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@4000000);
+    VTSessionSetProperty(victim, kVTCompressionPropertyKey_BaseLayerFrameRate, (__bridge CFNumberRef)@15);
     OSStatus vprep = VTCompressionSessionPrepareToEncodeFrames(victim);
     int vrb = -1;
     CFNumberRef vbn = NULL;

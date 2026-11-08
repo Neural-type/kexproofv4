@@ -195,10 +195,12 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         @"EncoderUsage": @1,
         @"EnableUserRefForFacetime": @YES,
     };
+    NSMutableArray *s4sink = [NSMutableArray array];
     OSStatus st4 = VTCompressionSessionCreate(
         kCFAllocatorDefault, 1280, 720,
         kCMVideoCodecType_HEVC,
-        (__bridge CFDictionaryRef)s4spec, NULL, NULL, NULL, NULL, &s4);
+        (__bridge CFDictionaryRef)s4spec, NULL, NULL,
+        KPH9AttsCB, (__bridge void *)s4sink, &s4);
     [report appendFormat:@"fresh session create -> %d\n", (int)st4];
     if (st4 == noErr && s4) {
         // ollie: Stage 13 encoded clean because its sessions carried
@@ -246,6 +248,12 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
                 (__bridge CFDictionaryRef)frameProps, NULL, &flags);
             [report appendFormat:@"encode[%d] RPS smash -> %d\n", fi, (int)status];
         }
+        // Analyst: sync return 0 only means queued - the async cb status shows
+        // whether the 32+32 RPS actually reached AVE_HEVC_ST_RPS_Retrieve.
+        for (NSString *line in s4sink) {
+            [report appendFormat:@"  s4cb %@\n", line];
+        }
+        [s4sink removeAllObjects];
     }
     if (pb) CVPixelBufferRelease(pb);
     if (s4) {
@@ -385,22 +393,23 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         CFRelease(sN);
     }
 
-    // NTL boundary ladder (analyst 213316): NTL=3 survives spec+prepare but
-    // 100..16462 come back as 1. Either Prepare range-checks the layer count,
-    // or the transport (setter / EncoderUsage) stomps the encSpec value.
-    // mode 0: encSpec only, no post-create setter
-    // mode 1: encSpec + VTSessionSetProperty afterwards (stage13 shape)
-    // mode 2: encSpec WITHOUT EncoderUsage (is usage=1 the stomp?)
-    [report appendString:@"\n--- NTL boundary ladder (0=spec-only 1=spec+set 2=no-usage) ---\n"];
-    int ladderVals[] = { 3, 4, 5, 6, 7, 8, 12, 16, 32, 64, 128, 1000, 16000 };
+    // NTL boundary ladder v2 (analyst 214237 + rate-ratio theory): ladder v1
+    // died even on ntl=3 while spec[0..3] held POST=3 - the difference is the
+    // dependency recipe. spec[0..3] set EFR=60 / BLFR=15 (ratio 4, fits NTL=3);
+    // v1 set 30/30 (ratio 1 -> everything clamps). If NTL is validated against
+    // the EFR/BLFR ratio, only scaled rates can carry NTL=16000.
+    //   mode 0: EXACT spec[0] recipe (probe B: EFR=60 ABR=4M BLFR=15, ints)
+    //   mode 1: ratio-scaled rates (EFR = N*15, BLFR=15)
+    //   mode 2: no rate setters at all (control)
+    [report appendString:@"\n--- NTL boundary ladder v2 (0=exact 1=ratio 2=no-rates) ---\n"];
+    int ladderVals[] = { 3, 4, 5, 8, 16, 64, 256, 1000, 16000 };
     for (int mode = 0; mode < 3; mode++) {
-        for (int li = 0; li < 13; li++) {
+        for (int li = 0; li < 9; li++) {
             int lv = ladderVals[li];
             NSMutableDictionary *specL = [NSMutableDictionary dictionary];
-            if (mode != 2) specL[@"EncoderUsage"] = @1;
+            specL[@"EncoderUsage"] = @1;
             specL[@"NumberOfTemporalLayers"] = @(lv);
             specL[@"AllowTemporalCompression"] = @YES;
-            specL[@"RealTime"] = @YES;
             VTCompressionSessionRef sL = NULL;
             OSStatus stL = VTCompressionSessionCreate(
                 kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
@@ -409,18 +418,22 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
                 [report appendFormat:@"  m%d ntl=%-5d create=%d FAIL\n", mode, lv, (int)stL];
                 continue;
             }
-            if (mode == 1) {
+            VTSessionSetProperty(sL, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
+            VTSessionSetProperty(sL, CFSTR("RealTime"), kCFBooleanTrue);
+            if (mode == 0) {
+                VTSessionSetProperty(sL, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@60);
+                VTSessionSetProperty(sL, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@4000000);
+                VTSessionSetProperty(sL, kVTCompressionPropertyKey_BaseLayerFrameRate, (__bridge CFNumberRef)@15);
                 CFNumberRef ln = CFNumberCreate(NULL, kCFNumberIntType, &lv);
-                VTSessionSetProperty(sL, CFSTR("NumberOfTemporalLayers"), ln);
-                CFRelease(ln);
+                VTSessionSetProperty(sL, CFSTR("NumberOfTemporalLayers"), ln); CFRelease(ln);
+            } else if (mode == 1) {
+                int efr = lv * 15;
+                VTSessionSetProperty(sL, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@(efr));
+                VTSessionSetProperty(sL, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@4000000);
+                VTSessionSetProperty(sL, kVTCompressionPropertyKey_BaseLayerFrameRate, (__bridge CFNumberRef)@15);
+                CFNumberRef ln = CFNumberCreate(NULL, kCFNumberIntType, &lv);
+                VTSessionSetProperty(sL, CFSTR("NumberOfTemporalLayers"), ln); CFRelease(ln);
             }
-            VTSessionSetProperty(sL, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
-            VTSessionSetProperty(sL, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-            double rateL = 30.0;
-            CFNumberRef ln2 = CFNumberCreate(NULL, kCFNumberDoubleType, &rateL);
-            VTSessionSetProperty(sL, kVTCompressionPropertyKey_ExpectedFrameRate, ln2); CFRelease(ln2);
-            ln2 = CFNumberCreate(NULL, kCFNumberDoubleType, &rateL);
-            VTSessionSetProperty(sL, kVTCompressionPropertyKey_BaseLayerFrameRate, ln2); CFRelease(ln2);
             int preL = -1, postL = -1;
             CFNumberRef rbL = NULL;
             if (VTSessionCopyProperty(sL, CFSTR("NumberOfTemporalLayers"), NULL, &rbL) == noErr && rbL) {
@@ -954,21 +967,41 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     [report appendFormat:@"create with encSpec(EncoderUsage+EnableUserRef) -> %d\n", (int)stS];
     if (stS == noErr && sS) {
         VTSessionSetProperty(sS, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        // ave27 binary key: the UserRef pipeline may need its buffers allocated
+        VTSessionSetProperty(sS, CFSTR("AllocateRVRABuffers"), kCFBooleanTrue);
         OSStatus prepS = VTCompressionSessionPrepareToEncodeFrames(sS);
         CVPixelBufferRef pbS = NULL;
         CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
                             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pbS);
-        OSStatus stE0 = -1;
-        if (pbS) {
-            stE0 = VTCompressionSessionEncodeFrame(sS, pbS, CMTimeMake(0, 30), kCMTimeInvalid,
-                                                   NULL, NULL, NULL);
-            VTCompressionSessionCompleteFrames(sS, kCMTimeInvalid);
+        [report appendFormat:@"prepare=%d\n", (int)prepS];
+        // -17691 on the IDR (analyst 214237): VCH2 wants a frame-level token
+        // for the FaceTime UserRef IDR or the frame is dropped incomplete.
+        // Fuzz the mandatory frameProperties until the callback produces a sample.
+        NSArray *idrCands = @[
+            @{},
+            @{@"UserDPBFramesForFaceTime": @[]},
+            @{@"FrameIndex": @0},
+            @{@"FrameToken": @0},
+            @{@"UserDPB": @[]},
+            @{@"EnableUserRefForFacetime": @YES},
+            @{@"FrameIndex": @0, @"UserDPBFramesForFaceTime": @[]},
+        ];
+        for (NSUInteger ii = 0; ii < idrCands.count; ii++) {
+            [cbSink removeAllObjects];
+            OSStatus stE0 = -1;
+            if (pbS) {
+                stE0 = VTCompressionSessionEncodeFrame(sS, pbS,
+                                                        CMTimeMake((int64_t)ii, 30), kCMTimeInvalid,
+                                                        (__bridge CFDictionaryRef)idrCands[ii],
+                                                        NULL, NULL);
+                VTCompressionSessionCompleteFrames(sS, kCMTimeInvalid);
+            }
+            [report appendFormat:@"  idr[%lu] props=%@ -> %d\n",
+             (unsigned long)ii, idrCands[ii].allKeys, (int)stE0];
+            for (NSString *line in cbSink) {
+                [report appendFormat:@"    %@\n", line];
+            }
         }
-        [report appendFormat:@"prepare=%d encode[0] IDR -> %d\n", (int)prepS, (int)stE0];
-        for (NSString *line in cbSink) {
-            [report appendFormat:@"  %@\n", line];
-        }
-        [cbSink removeAllObjects];
 
         uint64_t z8 = 0;
         uint8_t z32[32] = {0};
