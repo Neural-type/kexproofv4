@@ -16,6 +16,7 @@
 #import "KPMarkerProbeModule.h"
 #import "KPH9EncoderModule.h"
 #import "KPRootExploitModule.h"
+#import "KPSPTMRaceModule.h"
 #import "KPFDLeakModule.h"
 #import "KPINFileLeakModule.h"
 #import "KPAuditUAF84495Module.h"
@@ -120,6 +121,7 @@
         [[KPDeviceInfoModule alloc] init],
         [[KPResourceLoaderModule alloc] init],
         [[KPAuditIPCModule alloc] initWithNameSweep],
+        [[KPSPTMRaceModule alloc] initWithNameSweep],
         [[KPKReadProbeModule alloc] initWithNameSweep],
         [[KPKASLRBypassModule alloc] initWithNameSweep],
         [[KPMarkerProbeModule alloc] initWithNameSweep],

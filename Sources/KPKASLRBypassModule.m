@@ -130,15 +130,24 @@ static const int kStaticCount = sizeof(kStaticBases) / sizeof(kStaticBases[0]);
             }
 
             totalKptrs++;
-            if (foundCount < MAX_KPTRS) {
+            // Per ollie: dedup by value — repeated struct headers at a fixed
+            // stride otherwise drown the first log slots with one constant field.
+            BOOL seen = NO;
+            for (int s = 0; s < foundCount; s++) {
+                if (foundKptrs[s] == v) { seen = YES; break; }
+            }
+            if (!seen && foundCount < MAX_KPTRS) {
                 foundKptrs[foundCount] = v;
                 foundKptrAddrs[foundCount] = addr + i * 8;
                 foundCount++;
             }
 
+            uint64_t untagged = 0;
+            if (!KPIsPlausibleKernelText(v, &untagged)) continue;
+
             for (int b = 0; b < kStaticCount; b++) {
-                if (v > kStaticBases[b]) {
-                    uint64_t slide = v - kStaticBases[b];
+                if (untagged > kStaticBases[b]) {
+                    uint64_t slide = untagged - kStaticBases[b];
                     if ((slide & 0x3FFF) == 0 && slide < (1024ULL << 20)) {
                         static const uint64_t kStaticSizes[] = {
                             0x8000, 0xcd4000, 0x5d0000, 0x4c000,
@@ -146,7 +155,7 @@ static const int kStaticCount = sizeof(kStaticBases) / sizeof(kStaticBases[0]);
                         };
                         uint64_t segEnd = kStaticBases[b] + kStaticSizes[b];
                         uint64_t runtimeSegEnd = segEnd + slide;
-                        if (v < runtimeSegEnd) {
+                        if (untagged < runtimeSegEnd) {
                             BOOL found = NO;
                             for (int c = 0; c < candidateCount; c++) {
                                 if (slideCandidates[c] == slide) {
@@ -170,8 +179,8 @@ static const int kStaticCount = sizeof(kStaticBases) / sizeof(kStaticBases[0]);
     [report appendFormat:@"regions enumerated: %d (RW: %d, scanned: %d)\n",
      regionCount, rwRegionCount, scannedRWRegionCount];
     [report appendFormat:@"regions filtered: %d (oversized: %d)\n", skippedRegionCount, oversizedRegionCount];
-    [report appendFormat:@"address-shaped candidates: %d (known constants filtered: %d)\n",
-     totalKptrs, filteredConstantCount];
+    [report appendFormat:@"address-shaped candidates: %d (distinct recorded: %d, known constants filtered: %d)\n",
+     totalKptrs, foundCount, filteredConstantCount];
 
     // --- Phase 2: report address-shaped candidates ---
     [report appendString:@"\n--- Phase 2: address-shaped candidates (unverified) ---\n"];
@@ -216,11 +225,12 @@ static const int kStaticCount = sizeof(kStaticBases) / sizeof(kStaticBases[0]);
     int heapShapedCount = 0;
     for (int i = 0; i < foundCount; i++) {
         uint64_t v = foundKptrs[i];
-        if ((v >> 32) == 0xffffffe0ULL || (v >> 32) == 0xffffffe1ULL) {
+        uint64_t heapVA = 0;
+        if (KPIsPlausibleKernelHeap(v, &heapVA)) {
             heapShapedCount++;
             if (heapShapedCount <= 5) {
-                [report appendFormat:@"  heap-shaped value: 0x%llx (from user=0x%llx)\n",
-                 v, foundKptrAddrs[i]];
+                [report appendFormat:@"  heap-shaped value: 0x%llx -> va=0x%llx (from user=0x%llx)\n",
+                 v, heapVA, foundKptrAddrs[i]];
             }
         }
     }

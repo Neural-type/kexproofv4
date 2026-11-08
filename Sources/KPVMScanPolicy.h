@@ -25,12 +25,63 @@ static BOOL KPVMShouldSkipRegion(const vm_region_submap_info_data_64_t *info,
     unsigned int tag = info->user_tag;
     if (tag == VM_MEMORY_STACK || tag == VM_MEMORY_DYLD_MALLOC) return YES;
     if (tag >= VM_MEMORY_MALLOC && tag <= VM_MEMORY_MALLOC_PROB_GUARD) return YES;
-
     uintptr_t marker = (uintptr_t)stackMarker;
     if (marker && marker >= address && marker < address + size) return YES;
-
     for (size_t i = 0; i < excludedCount; i++) {
         if (KPVMRangeOverlaps(address, size, excludedAddresses[i], excludedSizes[i])) return YES;
+    }
+    return NO;
+}
+
+// Per ollie: arm64e kernel pointers MUST have bit 55 = 1 and valid kernel VA prefix
+static inline uint64_t KPStripPACKernel(uint64_t raw) {
+    if ((raw & (1ULL << 55)) == 0) return 0; // not a kernel pointer
+    uint8_t top8 = (uint8_t)((raw >> 56) & 0xff);
+    uint8_t byte5 = (uint8_t)((raw >> 40) & 0xff);
+    // Require canonical untagged (0xffff) or plausible PAC tag (non-zero top byte)
+    // and valid kernel VA byte5 (0xf0, 0xfe, 0xff, 0xe0..0xef)
+    if (top8 == 0x00) return 0;
+    if (byte5 != 0xf0 && byte5 != 0xfe && byte5 != 0xff && (byte5 < 0xe0 || byte5 > 0xef)) {
+        return 0;
+    }
+    return (raw & 0x000000ffffffffffULL) | 0xfffffe0000000000ULL;
+}
+
+static inline BOOL KPIsPlausibleKernelText(uint64_t raw, uint64_t *untagged) {
+    if ((raw & 0x3ULL) != 0 || (raw & (1ULL << 55)) == 0) return NO;
+    uint8_t top8 = (uint8_t)((raw >> 56) & 0xff);
+    uint8_t byte5 = (uint8_t)((raw >> 40) & 0xff);
+    uint8_t byte4 = (uint8_t)((raw >> 32) & 0xff);
+    if (top8 == 0x00) return NO;
+    // Match 0xfffffff0... or 0xfffffe00... kernelcache text/data ranges.
+    // Canonical untagged ktext (kernelcache link base 0xfffffff007004000) has
+    // byte5=0xff byte4=0xf0 — the T8130 runtime family 0xfffffe00 has byte5=0xfe.
+    if (byte5 == 0xf0 || (byte5 == 0xff && byte4 == 0xf0) || (byte5 == 0xfe && byte4 < 0x10)) {
+        uint64_t norm = 0xfffffff000000000ULL | (raw & 0x0000000fffffffffULL);
+        if (norm >= 0xfffffff007004000ULL && norm < 0xfffffff090000000ULL) {
+            if (untagged) *untagged = norm;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static inline BOOL KPIsPlausibleKernelHeap(uint64_t raw, uint64_t *untagged) {
+    if ((raw & 0x7ULL) != 0 || (raw & (1ULL << 55)) == 0) return NO;
+    uint8_t top8 = (uint8_t)((raw >> 56) & 0xff);
+    uint8_t byte5 = (uint8_t)((raw >> 40) & 0xff);
+    uint8_t byte4 = (uint8_t)((raw >> 32) & 0xff);
+    if (top8 == 0x00) return NO;
+    // kalloc / zone map on arm64e: 0xfffffe10..0xfffffe3f or 0xffffffe0..0xffffffe9
+    if (byte5 == 0xfe && byte4 >= 0x10 && byte4 < 0x40) {
+        uint64_t norm = 0xfffffe0000000000ULL | (raw & 0x000000ffffffffffULL);
+        if (untagged) *untagged = norm;
+        return YES;
+    }
+    if (byte5 == 0xff && byte4 >= 0xe0 && byte4 < 0xf0) {
+        uint64_t norm = 0xffffff0000000000ULL | (raw & 0x000000ffffffffffULL);
+        if (untagged) *untagged = norm;
+        return YES;
     }
     return NO;
 }
@@ -38,28 +89,24 @@ static BOOL KPVMShouldSkipRegion(const vm_region_submap_info_data_64_t *info,
 static BOOL KPIsKernelPointerCandidate(uint64_t value) {
     if ((value & 0x3) != 0 || value == UINT64_MAX) return NO;
 
-    // Reject PAC user-space pointers (untagged 36-bit user VA 0x100000000-0x300000000)
+    // Per ollie: bit 55 MUST be 1 for arm64e kernel pointers
+    if ((value & (1ULL << 55)) == 0) return NO;
+
+    // Reject PAC user-space pointers (untagged 36-bit user VA)
     uint64_t untagged = value & 0x0000000fffffffffULL;
     if (untagged >= 0x100000000ULL && untagged < 0x300000000ULL) return NO;
 
-    // Reject SIMD/float/NaN noise: low 16 bits = 0 with 0xfffffff0..ff prefix
+    // Reject SIMD/float/NaN noise
     if ((value & 0xffffULL) == 0) {
         uint8_t byte5 = (value >> 40) & 0xff;
         if (byte5 >= 0xf0) return NO;
     }
-    // Reject packed int32+float pairs (low 24 bits = 0)
     if ((value & 0xFFFFFULL) == 0) return NO;
 
-    uint8_t byte5 = (value >> 40) & 0xff;
-    // ARM64e A17 Pro (T8130) kernel layout:
-    //   0xfffffe00... = kernel text/data
-    //   0xfffffe10..3f... = kernel heap (zone map)
-    if (byte5 == 0xfe) {
-        uint8_t byte4 = (value >> 32) & 0xff;
-        if (byte4 >= 0x00 && byte4 <= 0x3f) return YES;
-    }
-    if (byte5 >= 0xf0 && byte5 <= 0xfd) return YES;
-    return NO;
+    // Check canonical kernel VA ranges
+    uint64_t va = KPStripPACKernel(value);
+    if (va == 0) return NO;
+    return (KPIsPlausibleKernelText(value, NULL) || KPIsPlausibleKernelHeap(value, NULL));
 }
 
 static BOOL KPIsKnownDiagnosticConstant(uint64_t value) {
@@ -81,7 +128,6 @@ static BOOL KPIsKnownDiagnosticConstant(uint64_t value) {
     for (size_t i = 0; i < sizeof(constants) / sizeof(constants[0]); i++) {
         if (value == constants[i]) return YES;
     }
-
     static const int ntlValues[] = {
         -1, 0, 1, 2, 3, 100, 1000, 8000, 16000,
         16431, 16447, 16455, 16462, 16463, 16464,

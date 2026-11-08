@@ -246,9 +246,11 @@
                 uint64_t v = *(p + i);
                 if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
                     totalKptrs++;
+                    uint64_t untagged = 0;
+                    if (!KPIsPlausibleKernelText(v, &untagged)) continue;
                     for (int b = 0; b < 4; b++) {
-                        if (v <= kStaticBases[b]) continue;
-                        uint64_t slide = v - kStaticBases[b];
+                        if (untagged <= kStaticBases[b]) continue;
+                        uint64_t slide = untagged - kStaticBases[b];
                         if ((slide & 0x3FFF) == 0 && slide < (1024ULL << 20)) {
                             int found = 0;
                             for (int c = 0; c < candidateCount; c++) {
@@ -514,9 +516,10 @@
         if (checked > 500) break;
         checked++;
 
-        if ((kaddr & 0x7) == 0 && kaddr >= 0xffffffe000000000ULL) {
+        uint64_t heapVA = 0;
+        if (KPIsPlausibleKernelHeap(kaddr, &heapVA)) {
             if (checked <= 20) {
-                [report appendFormat:@"  candidate[%d]: kaddr=0x%llx\n", checked, kaddr];
+                [report appendFormat:@"  candidate[%d]: raw=0x%llx va=0x%llx\n", checked, kaddr, heapVA];
             }
         }
     }
