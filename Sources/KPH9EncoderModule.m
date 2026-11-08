@@ -7,6 +7,26 @@
 #import <mach/mach.h>
 #import <dlfcn.h>
 
+// IOKit userclient API (declared manually — CI SDK headers vary). This is the
+// bypass path around VideoToolbox's NTL clamp (ollie: IOConnectCallStructMethod
+// into AppleAVE2UserClient directly).
+typedef unsigned int kp_io_object_t;
+typedef unsigned int kp_io_service_t;
+typedef unsigned int kp_io_connect_t;
+extern CFMutableDictionaryRef IOServiceMatching(const char *name);
+extern kp_io_service_t IOServiceGetMatchingService(unsigned int mainPort, CFDictionaryRef matching);
+extern kern_return_t IOServiceOpen(kp_io_service_t service, unsigned int owningTask, unsigned int type, kp_io_connect_t *conn);
+extern kern_return_t IOServiceClose(kp_io_connect_t conn);
+extern kern_return_t IOObjectRelease(kp_io_object_t obj);
+extern kern_return_t IOConnectCallMethod(kp_io_connect_t conn, uint32_t selector,
+                                         const uint64_t *input, uint32_t inputCnt,
+                                         const void *inputStruct, size_t inputStructCnt,
+                                         uint64_t *output, uint32_t *outputCnt,
+                                         void *outputStruct, size_t *outputStructCnt);
+extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t selector,
+                                               const void *inputStruct, size_t inputStructCnt,
+                                               void *outputStruct, size_t *outputStructCnt);
+
 @interface KPH9EncoderModule ()
 @property (nonatomic, copy) NSString *identifier;
 @property (nonatomic, copy) NSString *title;
@@ -151,9 +171,17 @@
         kCMVideoCodecType_HEVC,
         NULL, NULL, NULL, NULL, NULL, &s4);
     [report appendFormat:@"fresh session create -> %d\n", (int)st4];
+    if (st4 == noErr && s4) {
+        // ollie: Stage 13 encoded clean because its sessions carried
+        // EncoderUsage=1 + 420v — s4 needs the same profile or encode dies.
+        int usage4 = 1;
+        CFNumberRef nu4 = CFNumberCreate(NULL, kCFNumberIntType, &usage4);
+        VTSessionSetProperty(s4, CFSTR("EncoderUsage"), nu4);
+        CFRelease(nu4);
+    }
     CVPixelBufferRef pb = NULL;
     CVPixelBufferCreate(kCFAllocatorDefault, 1920, 1080,
-                         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                          NULL, &pb);
     if (st4 == noErr && s4 && pb) {
         CVPixelBufferLockBaseAddress(pb, 0);
@@ -262,15 +290,21 @@
         VTSessionSetProperty(s2, CFSTR("EncoderUsage"), n);
         CFRelease(n);
         if (useRC) {
-            int rc = 20;
-            n = CFNumberCreate(NULL, kCFNumberIntType, &rc);
-            rcSt = VTSessionSetProperty(s2, CFSTR("RCMode"), n);
-            CFRelease(n);
+            // ollie: AllowTemporalCompression is the master switch for NTL>1 on
+            // H16 — without it VT silently clamps NTL to 1 even with RCMode=20.
+            // Rates must be set BEFORE NTL.
+            OSStatus atc = VTSessionSetProperty(s2, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
+            VTSessionSetProperty(s2, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
             double rate = 30.0;
             n = CFNumberCreate(NULL, kCFNumberDoubleType, &rate);
             VTSessionSetProperty(s2, CFSTR("BaseLayerFrameRate"), n); CFRelease(n);
             n = CFNumberCreate(NULL, kCFNumberDoubleType, &rate);
             VTSessionSetProperty(s2, CFSTR("ExpectedFrameRate"), n); CFRelease(n);
+            int rc = 20;
+            n = CFNumberCreate(NULL, kCFNumberIntType, &rc);
+            rcSt = VTSessionSetProperty(s2, CFSTR("RCMode"), n);
+            CFRelease(n);
+            [report appendFormat:@"    temporal gate: AllowTemporalCompression=%d\n", (int)atc];
         }
         n = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
         OSStatus setSt = VTSessionSetProperty(s2, CFSTR("NumberOfTemporalLayers"), n);
@@ -700,6 +734,39 @@
     }
 
     [report appendString:@"  candidate scan complete (unverified without kernel oracle)\n"];
+
+    // === AVE2 userclient probe: direct IOKit path around the VT clamp ===
+    [report appendString:@"\n--- AVE2 userclient probe (direct IOKit) ---\n"];
+    kp_io_service_t svc = IOServiceGetMatchingService(0, IOServiceMatching("AppleAVE2"));
+    [report appendFormat:@"AppleAVE2 service=%u\n", svc];
+    if (svc) {
+        kp_io_connect_t conn = 0;
+        kern_return_t ok = IOServiceOpen(svc, (unsigned int)mach_task_self(), 0, &conn);
+        [report appendFormat:@"IOServiceOpen -> %d (conn=%u)\n", ok, conn];
+        if (ok == KERN_SUCCESS) {
+            uint64_t scalarIn = 16463;
+            for (uint32_t sel = 0; sel <= 32; sel++) {
+                uint64_t outVal = 0;
+                uint32_t outCnt = 1;
+                kern_return_t km = IOConnectCallMethod(conn, sel, &scalarIn, 1,
+                                                       NULL, 0, &outVal, &outCnt, NULL, NULL);
+                uint64_t structIn[4] = { 16463, 1, 0x59, 0 };
+                uint8_t structOut[64] = {0};
+                size_t structOutSz = sizeof(structOut);
+                kern_return_t ks = IOConnectCallStructMethod(conn, sel, structIn, sizeof(structIn),
+                                                             structOut, &structOutSz);
+                // Log everything except the plain "no such selector" noise pair
+                if (km != (kern_return_t)0xe00002c2 && ks != (kern_return_t)0xe00002c2) {
+                    [report appendFormat:@"  sel=%-2u method=%d out=0x%llx | struct=%d outSz=%zu\n",
+                     sel, km, outVal, ks, structOutSz];
+                }
+            }
+            IOServiceClose(conn);
+        }
+        IOObjectRelease(svc);
+    } else {
+        [report appendString:@"AppleAVE2 userclient not exposed to this process (sandbox)\n"];
+    }
     return report;
 }
 
