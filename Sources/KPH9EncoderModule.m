@@ -997,7 +997,7 @@ static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags f
                 VTCompressionSessionCompleteFrames(sS, kCMTimeInvalid);
             }
             [report appendFormat:@"  idr[%lu] props=%@ -> %d\n",
-             (unsigned long)ii, idrCands[ii].allKeys, (int)stE0];
+             (unsigned long)ii, ((NSDictionary *)idrCands[ii]).allKeys, (int)stE0];
             for (NSString *line in cbSink) {
                 [report appendFormat:@"    %@\n", line];
             }
