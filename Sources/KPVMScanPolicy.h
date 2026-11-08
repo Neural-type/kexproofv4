@@ -37,6 +37,8 @@ static BOOL KPVMShouldSkipRegion(const vm_region_submap_info_data_64_t *info,
 
 static BOOL KPIsKernelPointerCandidate(uint64_t value) {
     if ((value & 0x3) != 0 || value == UINT64_MAX) return NO;
+    // Reject values with low 24 bits = 0 (packed int32+float pairs, not real kernel pointers)
+    if ((value & 0xFFFFFULL) == 0) return NO;
     uint32_t high = (uint32_t)(value >> 32);
     return (high >= 0xffffffe0U && high <= 0xffffffe1U) ||
            (high >= 0xfffffff0U && high <= 0xfffffffdU);
