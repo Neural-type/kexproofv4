@@ -352,13 +352,12 @@
 - (NSString *)runReport {
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"=== KexProofV4 · IPC translate_receive index OOB ===\n"];
-    [report appendString:@"Fix-diff RE: 27.0.1 has NO bounds check on the 16-byte-stride table\n"];
-    [report appendString:@"index (w2) in ipc_port_translate_receive; 27.2 adds cmp index, capacity.\n"];
-    [report appendString:@"Vuln: read table[w2], set bit 1, write back = OOB bit-set at +16*index.\n"];
-    [report appendString:@"Note: translate_receive runs at RECEIVE time, so the probe sends AND\n"];
-    [report appendString:@"receives; the itable churn probes the ipc_entry_grow_table boundary\n"];
-    [report appendString:@"(the second changed function in the same fix).\n"];
-    [report appendString:@"Oracle: panic far = base + 16*index (index control + table base leak).\n"];
+    [report appendString:@"Fix-diff hypothesis: 27.2 changes bounds handling in the 16-byte-stride\n"];
+    [report appendString:@"ipc_port_translate_receive table walk and in ipc_entry_grow_table.\n"];
+    [report appendString:@"Candidate mechanism under test: table[index] access and bit-set attribution.\n"];
+    [report appendString:@"translate_receive runs at RECEIVE time, so the probe sends AND receives.\n"];
+    [report appendString:@"The measured growth matrix records table_size/table_inuse at each boundary.\n"];
+    [report appendString:@"A crash address alone is not proof; index control and table base require independent evidence.\n"];
     [report appendFormat:@"Target: iOS %@ uid=%d\n", UIDevice.currentDevice.systemVersion, getuid()];
 
     mach_port_t port = MACH_PORT_NULL;
