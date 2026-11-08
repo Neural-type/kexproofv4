@@ -75,14 +75,10 @@ static inline BOOL KPIsPlausibleKernelHeap(uint64_t raw, uint64_t *untagged) {
     uint8_t byte5 = (uint8_t)((raw >> 40) & 0xff);
     uint8_t byte4 = (uint8_t)((raw >> 32) & 0xff);
     if (top8 == 0x00 || byte6 != 0xff) return NO;
-    // kalloc / zone map on arm64e: 0xfffffe10..0xfffffe3f or 0xffffffe0..0xffffffe9
+    // T8130 kalloc / zone map: 0xfffffe10..0xfffffe3f only. The 0xffffffe0..ef
+    // band is LE int32 pairs with negative high halves (codec tables) — reject.
     if (byte5 == 0xfe && byte4 >= 0x10 && byte4 < 0x40) {
         uint64_t norm = 0xfffffe0000000000ULL | (raw & 0x000000ffffffffffULL);
-        if (untagged) *untagged = norm;
-        return YES;
-    }
-    if (byte5 == 0xff && byte4 >= 0xe0 && byte4 < 0xf0) {
-        uint64_t norm = 0xffffff0000000000ULL | (raw & 0x000000ffffffffffULL);
         if (untagged) *untagged = norm;
         return YES;
     }
@@ -110,8 +106,14 @@ static inline kptr_class_t KPClassifyKPtr(uint64_t raw) {
     // 4 so ktext function pointers are not cut).
     if ((raw & 0x3ULL) != 0) return KPTR_REJECT_UNALIGNED;
     uint32_t hi32 = (uint32_t)(raw >> 32);
+    // T8130: the 0xffffffe0..ef band is LE int32 pairs with a small negative high
+    // half (-32..-17), NOT zone-map. Real untagged kheap is 0xfffffe10..3f.
+    if (hi32 >= 0xFFFFFFE0U && hi32 <= 0xFFFFFFEFU) return KPTR_REJECT_PACKED_INT32;
+    // ktext: kernelcache link base 0xfffffff007004000 + slide, or the runtime
+    // 0xfffffe00..0f family (T8130 layout).
     if (hi32 >= 0xFFFFFFF0U && hi32 <= 0xFFFFFFFBU) return KPTR_CANDIDATE_KERNEL_TEXT_DATA;
-    if (hi32 >= 0xFFFFFFE0U && hi32 <= 0xFFFFFFEFU) {
+    if (hi32 >= 0xFFFFFE00U && hi32 <= 0xFFFFFE0FU) return KPTR_CANDIDATE_KERNEL_TEXT_DATA;
+    if (hi32 >= 0xFFFFFE10U && hi32 <= 0xFFFFFE3FU) {
         return ((raw & 0x7ULL) == 0) ? KPTR_CANDIDATE_ZONE_HEAP : KPTR_REJECT_UNALIGNED;
     }
     return KPTR_REJECT_UNALIGNED;
@@ -134,7 +136,10 @@ static BOOL KPIsKernelPointerCandidate(uint64_t value) {
     }
     if ((value & 0xFFFFFULL) == 0) return NO;
 
-    // Check canonical kernel VA ranges
+    // Check canonical kernel VA ranges — KPClassifyKPtr wired in per the
+    // 120328 log analysis (it was dead code, so packed-int32 pairs leaked through).
+    kptr_class_t cls = KPClassifyKPtr(value);
+    if (cls != KPTR_CANDIDATE_ZONE_HEAP && cls != KPTR_CANDIDATE_KERNEL_TEXT_DATA) return NO;
     uint64_t va = KPStripPACKernel(value);
     if (va == 0) return NO;
     return (KPIsPlausibleKernelText(value, NULL) || KPIsPlausibleKernelHeap(value, NULL));

