@@ -237,19 +237,22 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
 
     // -------------------------------------------------------------------------
     // Stage 2: NumberOfTemporalLayers (NTL) Unclamp & Steered x0 Audit
+    //   2A: with ExpectedFrameRate=60 / BaseLayerFrameRate=15 (dyadic clamp -> 3)
+    //   2B: raw EncoderUsage=1 without BaseLayerFrameRate (unclamped readback)
     // -------------------------------------------------------------------------
-    [self journal:@"Stage 2: NTL unclamp & steered x0"];
+    [self journal:@"Stage 2: NTL unclamp & steered x0 (60/15 clamped vs raw unclamped)"];
     [report appendString:@"\n--- Stage 2: NTL Unclamp & Steered x0 Audit ---\n"];
     if (vtHung) {
         [report appendString:@"  skipped (videocodecd XPC timed out in Stage 1)\n"];
     } else {
-        NSString *s2 = KPH9RunTimed(@"Stage2-NTL", 1800, &vtHung, ^NSString *{
+        NSString *s2 = KPH9RunTimed(@"Stage2-NTL", 2500, &vtHung, ^NSString *{
             NSMutableString *out = [NSMutableString string];
             CVPixelBufferRef pb = KPH9CreatePixelBuffer(1280, 720);
             int ntlVals[] = { 3, 8, 16000, 16447 };
+            [out appendString:@"  [2A: with ExpectedFrameRate=60 / BaseLayerFrameRate=15 -> dyadic clamp 1+log2(60/15)=3]\n"];
             for (int i = 0; i < 4; i++) {
                 int ntl = ntlVals[i];
-                uint64_t x0 = ((uint64_t)(int32_t)(ntl - 16463) << 32) | 0x59ULL;
+                uint64_t x0 = ((uint64_t)(uint32_t)(ntl - 16463) << 32) | 0x59ULL;
                 NSDictionary *spec = @{
                     @"EncoderUsage": @1,
                     @"NumberOfTemporalLayers": @(ntl),
@@ -261,7 +264,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                                                          (__bridge CFDictionaryRef)spec,
                                                          NULL, NULL, NULL, NULL, &s);
                 if (st != noErr || !s) {
-                    [out appendFormat:@"  NTL=%-5d create=%d\n", ntl, (int)st];
+                    [out appendFormat:@"  60/15 NTL=%-5d create=%d\n", ntl, (int)st];
                     continue;
                 }
                 VTSessionSetProperty(s, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
@@ -287,8 +290,46 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                 if (pb) {
                     enc = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
                 }
-                [out appendFormat:@"  NTL=%-5d x0=0x%016llx prep=%d PRE=%d POST=%d enc=%d\n",
+                [out appendFormat:@"  60/15 NTL=%-5d x0=0x%016llx prep=%d PRE=%d POST=%d enc=%d\n",
                  ntl, x0, (int)prep, pre, post, (int)enc];
+                VTCompressionSessionInvalidate(s);
+                CFRelease(s);
+            }
+
+            [out appendString:@"  [2B: raw EncoderUsage=1 without BaseLayerFrameRate -> unclamped NTL]\n"];
+            int rawVals[] = { 3, 8, 16000, 16447, 16463 };
+            for (int i = 0; i < 5; i++) {
+                int ntl = rawVals[i];
+                uint64_t x0 = ((uint64_t)(uint32_t)(ntl - 16463) << 32) | 0x59ULL;
+                VTCompressionSessionRef s = NULL;
+                OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720,
+                                                         kCMVideoCodecType_HEVC,
+                                                         NULL, NULL, NULL, NULL, NULL, &s);
+                if (st != noErr || !s) {
+                    [out appendFormat:@"  raw   NTL=%-5d create=%d\n", ntl, (int)st];
+                    continue;
+                }
+                OSStatus uSt = VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+                OSStatus nSt = VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
+                int pre = -1, post = -1;
+                CFNumberRef rb = NULL;
+                if (VTSessionCopyProperty(s, CFSTR("NumberOfTemporalLayers"), NULL, &rb) == noErr && rb) {
+                    CFNumberGetValue(rb, kCFNumberIntType, &pre);
+                    CFRelease(rb);
+                }
+                OSStatus prep = VTCompressionSessionPrepareToEncodeFrames(s);
+                rb = NULL;
+                if (VTSessionCopyProperty(s, CFSTR("NumberOfTemporalLayers"), NULL, &rb) == noErr && rb) {
+                    CFNumberGetValue(rb, kCFNumberIntType, &post);
+                    CFRelease(rb);
+                }
+                NSString *encStr = @"deferred-to-sprite";
+                if (pb && ntl <= 8) {
+                    OSStatus enc = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                    encStr = [NSString stringWithFormat:@"%d", (int)enc];
+                }
+                [out appendFormat:@"  raw   NTL=%-5d x0=0x%016llx usage=%d set=%d PRE=%d prep=%d POST=%d enc=%@\n",
+                 ntl, x0, (int)uSt, (int)nSt, pre, (int)prep, post, encStr];
                 VTCompressionSessionInvalidate(s);
                 CFRelease(s);
             }
@@ -303,12 +344,12 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
     // (Strictly CFNumber elements — NSData/NSDictionary trigger uncaught
     // -[_getValue:forType:] SIGABRT in videocodecd -> launchd 320s throttle)
     // -------------------------------------------------------------------------
-    [self journal:@"Stage 3: UserDPBFramesForFaceTime CFNumber probe"];
+    [self journal:@"Stage 3: UserDPBFramesForFaceTime CFNumber probe (32..64 boundary)"];
     [report appendString:@"\n--- Stage 3: UserDPBFramesForFaceTime (CFNumber Safe Probe) ---\n"];
     if (vtHung) {
         [report appendString:@"  skipped (videocodecd XPC timed out)\n"];
     } else {
-        NSString *s3 = KPH9RunTimed(@"Stage3-DPB", 1800, &vtHung, ^NSString *{
+        NSString *s3 = KPH9RunTimed(@"Stage3-DPB", 3000, &vtHung, ^NSString *{
             NSMutableString *out = [NSMutableString string];
             NSMutableArray *cbSink = [NSMutableArray array];
             NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
@@ -334,8 +375,9 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                 }
             }
 
-            int counts[] = { 1, 16, 24, 32, 64 };
-            for (int ci = 0; ci < 5; ci++) {
+            int counts[] = { 1, 16, 24, 32, 33, 36, 40, 48, 63, 64 };
+            int nCounts = (int)(sizeof(counts) / sizeof(counts[0]));
+            for (int ci = 0; ci < nCounts; ci++) {
                 int n = counts[ci];
                 NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
                 for (int k = 0; k < n; k++) [arr addObject:@(k)];

