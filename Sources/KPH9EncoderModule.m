@@ -1319,7 +1319,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             }
 
             // Value boundaries for MVHEVCVideoLayerIDs & RequiredMVHEVC* (active when MVHEVCVideoLayerIDs=[0,1])
-            int mvVals[] = { 0, 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 31, 32, 36, 48, 60, 62, 63, 64, 65, 127, 128, 129, 191, 192, 254, 255, 256, 65535, -1 };
+            int mvVals[] = { 0, 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 31, 32, 33, 36, 48, 51, 52, 60, 62, 63, 64, 65, 127, 128, 129, 191, 192, 254, 255, 256, 65535, -1 };
             NSMutableArray *mvLayerParts = [NSMutableArray array];
             for (size_t mi = 0; mi < sizeof(mvVals) / sizeof(mvVals[0]); mi++) {
                 int v = mvVals[mi];
@@ -1375,9 +1375,9 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             KPH9SafeTeardown(ps);
         }
 
-        // Audit 72-int (288B) cqpOobRead[plen=21] window on a clean session (with Stage6OutputCallback)
-        // both after PrepareToEncodeFrames (postPrep=0) and after EncodeFrame (postEnc=0, cbCount>=1),
-        // plus a property sweep to check whether any session property modifies oob[+0x40..+0xaf].
+        // Audit 72-int (288B) cqpOobRead[plen=21] window on a clean session (with Stage6OutputCallback):
+        // IMPORTANT: EncodeFrame MUST run BEFORE UserParameterSetsIds is set to pArr21 (setting plen=21
+        // before EncodeFrame wedges the encoder inside EncodeFrame because PPS slots 8..18 read OOB +0x40=256).
         {
             NSMutableArray *pArr21 = [NSMutableArray arrayWithCapacity:21];
             for (int k = 0; k < 21; k++) [pArr21 addObject:@((k < 2) ? (k + 1) : (k - 1))];
@@ -1388,16 +1388,21 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             if (mapRes && VTCompressionSessionCreate(kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
                                                      NULL, NULL, NULL, Stage6OutputCallback, mapRes, &mapS) == noErr && mapS) {
                 KPH9PrimeRealTime(mapS);
-                VTSessionSetProperty(mapS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @1, @2, @1 ]);
                 VTSessionSetProperty(mapS, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpSeed16);
                 OSStatus prepMapSt = VTCompressionSessionPrepareToEncodeFrames(mapS);
+                OSStatus encMapSt = VTCompressionSessionEncodeFrame(mapS, px, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                int w0 = 0;
+                while (mapRes->cbCount < 1 && w0 < 80) { usleep(2000); w0 += 2; }
+
+                // Only AFTER EncodeFrame completes, expand UserParameterSetsIds to 21 elements and read back 72 ints
                 OSStatus postPs21St = VTSessionSetProperty(mapS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr21);
                 CFTypeRef rbPost = NULL;
                 if (VTSessionCopyProperty(mapS, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbPost) == noErr && rbPost) {
                     if (CFGetTypeID(rbPost) == CFArrayGetTypeID()) {
                         NSArray *nsPost = (__bridge NSArray *)rbPost;
-                        KPH9OutAppend(log, @"  cqpOobMap[postPrep=%d,ps21=%d]: rb=%lu [%@]\n",
-                                      (int)prepMapSt, (int)postPs21St, (unsigned long)nsPost.count, [nsPost componentsJoinedByString:@","]);
+                        KPH9OutAppend(log, @"  cqpOobMap[prep=%d,enc=%d,cb=%d,ps21=%d]: rb=%lu [%@]\n",
+                                      (int)prepMapSt, (int)encMapSt, mapRes->cbCount, (int)postPs21St,
+                                      (unsigned long)nsPost.count, [nsPost componentsJoinedByString:@","]);
                         if (nsPost.count >= 72) {
                             NSMutableArray *cb8 = [NSMutableArray arrayWithCapacity:8];
                             NSMutableArray *cr8 = [NSMutableArray arrayWithCapacity:8];
@@ -1416,26 +1421,6 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                         }
                     }
                     CFRelease(rbPost);
-                }
-                VTSessionSetProperty(mapS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @1, @2, @1 ]);
-                OSStatus encMapSt = VTCompressionSessionEncodeFrame(mapS, px, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
-                int w0 = 0;
-                while (mapRes->cbCount < 1 && w0 < 80) { usleep(2000); w0 += 2; }
-                VTSessionSetProperty(mapS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr21);
-                CFTypeRef rbPostEnc = NULL;
-                if (VTSessionCopyProperty(mapS, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbPostEnc) == noErr && rbPostEnc) {
-                    if (CFGetTypeID(rbPostEnc) == CFArrayGetTypeID()) {
-                        NSArray *nsPostEnc = (__bridge NSArray *)rbPostEnc;
-                        if (nsPostEnc.count >= 72) {
-                            NSMutableArray *oobEnc = [NSMutableArray arrayWithCapacity:28];
-                            for (int wi = 8; wi < 36; wi++) {
-                                [oobEnc addObject:nsPostEnc[(NSUInteger)(2 * wi + 1)]];
-                            }
-                            KPH9OutAppend(log, @"  cqpOobMap[postEnc=%d,cb=%d,ps21]: oob[+0x40..+0xaf]=[%@]\n",
-                                          (int)encMapSt, mapRes->cbCount, [oobEnc componentsJoinedByString:@","]);
-                        }
-                    }
-                    CFRelease(rbPostEnc);
                 }
                 // Check whether setting candidate scalar/boolean properties modifies oob[0..27] (+0x40..+0xaf)
                 NSArray *candPairs = @[
@@ -1874,6 +1859,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         { "slices=16(sps=5,pps=9,a=3)",    5,   9,   3,  -99, -99, -99, -99, -99, -99, -99,  16 },
         { "slices=31(sps=5,pps=9,a=3)",    5,   9,   3,  -99, -99, -99, -99, -99, -99, -99,  31 },
         { "slices=32(sps=5,pps=9,a=3)",    5,   9,   3,  -99, -99, -99, -99, -99, -99, -99,  32 },
+        { "slices=33(sps=5,pps=9,a=3)",    5,   9,   3,  -99, -99, -99, -99, -99, -99, -99,  33 },
         { "slices=63(sps=5,pps=9,a=3)",    5,   9,   3,  -99, -99, -99, -99, -99, -99, -99,  63 },
         { "slices=64(sps=5,pps=9,a=3)",    5,   9,   3,  -99, -99, -99, -99, -99, -99, -99,  64 },
     };
