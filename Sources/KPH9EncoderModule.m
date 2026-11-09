@@ -5,6 +5,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <mach/mach.h>
 #import <unistd.h>
 
@@ -331,18 +332,59 @@ static void KPH9EncodeAndFlushTwoCallbacks(VTCompressionSessionRef session,
     }
 }
 
+// --- Analyst (in tree): real IOSurfaceID plumbing for UserDPBFramesForFaceTime ---
+// SetDPBSnapShot resolves each DPB entry through IOSurfaceLookup, so only live
+// IOSurfaceIDs (or 0 = empty slot) survive PrepareToEncodeFrames. The pool buffers
+// MUST stay retained while any session referencing their IDs is alive — freed
+// surfaces make the IDs invalid and the lookup fails.
+static NSString *Stage7ReadbackDPB(VTCompressionSessionRef session);
+
+static uint32_t KPH9GetPixelBufferSurfaceID(CVPixelBufferRef pb) {
+    if (!pb) return 0;
+    IOSurfaceRef surf = CVPixelBufferGetIOSurface(pb);
+    if (!surf) return 0;
+    return (uint32_t)IOSurfaceGetID(surf);
+}
+
+static NSArray<NSNumber *> *KPH9AllocSurfacePool(size_t count,
+                                                 int width,
+                                                 int height,
+                                                 NSMutableArray *retainedBuffersOut) {
+    NSMutableArray<NSNumber *> *ids = [NSMutableArray arrayWithCapacity:count];
+    for (size_t i = 0; i < count; i++) {
+        CVPixelBufferRef pb = CreateDummyNV12Buffer(width, height);
+        if (pb) {
+            [ids addObject:@(KPH9GetPixelBufferSurfaceID(pb))];
+            if (retainedBuffersOut) {
+                [retainedBuffersOut addObject:(__bridge id)pb];
+            }
+            CFRelease(pb);
+        } else {
+            [ids addObject:@0];
+        }
+    }
+    return ids;
+}
+
 static void RunStage6_XPCLeakAndBoundaryAudit(NSMutableString *log) {
     KPH9OutAppend(log, @"\n--- Stage 6: DPB Exact Boundary (1..15, 34..48) & Bitstream/NAL Audit ---\n");
-    int probeCounts[] = {
-        1, 2, 3, 4, 8, 15,
-        34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48
-    };
+    // Analyst: fill DPB arrays with LIVE IOSurfaceIDs (pair = (surfaceID, 0)),
+    // not garbage constants — SetDPBSnapShot does IOSurfaceLookup on each entry.
+    int probeCounts[] = { 1, 2, 4, 8, 16, 30, 32, 33, 34, 35, 36, 48 };
     size_t numProbes = sizeof(probeCounts) / sizeof(probeCounts[0]);
     CVPixelBufferRef px = CreateDummyNV12Buffer(192, 144);
     if (!px) {
         KPH9OutAppend(log, @"  [!] Failed to allocate CVPixelBuffer\n");
         return;
     }
+    NSMutableArray *surfaceHolders = [NSMutableArray array];
+    NSArray<NSNumber *> *poolIDs = KPH9AllocSurfacePool(18, 192, 144, surfaceHolders);
+    KPH9OutAppend(log, @"  [surf pool] n=%lu ids[0..3]=%u,%u,%u,%u\n",
+                  (unsigned long)poolIDs.count,
+                  poolIDs.count > 0 ? poolIDs[0].unsignedIntValue : 0,
+                  poolIDs.count > 1 ? poolIDs[1].unsignedIntValue : 0,
+                  poolIDs.count > 2 ? poolIDs[2].unsignedIntValue : 0,
+                  poolIDs.count > 3 ? poolIDs[3].unsignedIntValue : 0);
     for (size_t i = 0; i < numProbes; i++) {
         int count = probeCounts[i];
         Stage6ProbeResult *res = Stage6AllocResult();
@@ -359,23 +401,28 @@ static void RunStage6_XPCLeakAndBoundaryAudit(NSMutableString *log) {
             continue;
         }
         VTSessionSetProperty(session, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        VTSessionSetProperty(session, CFSTR("EncoderUsage"), (__bridge CFTypeRef)@1);
         KPH9PrimeRealTime(session);
         NSMutableArray *dpbArr = [NSMutableArray arrayWithCapacity:count];
         for (int k = 0; k < count; k++) {
-            uint64_t tagged = 0x4141414141410000ULL | (uint64_t)k;
-            CFNumberRef num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &tagged);
-            [dpbArr addObject:(__bridge_transfer id)num];
+            if ((k % 2) == 0) {
+                NSUInteger pairIdx = (NSUInteger)(k / 2);
+                [dpbArr addObject:(pairIdx < poolIDs.count) ? poolIDs[pairIdx] : @0];
+            } else {
+                [dpbArr addObject:@0];
+            }
         }
         OSStatus setSt = VTSessionSetProperty(
             session,
             CFSTR("UserDPBFramesForFaceTime"),
             (__bridge CFTypeRef)dpbArr);
-        VTCompressionSessionPrepareToEncodeFrames(session);
+        OSStatus prepSt = VTCompressionSessionPrepareToEncodeFrames(session);
         KPH9EncodeAndFlushTwoCallbacks(session, px, NULL, res, NULL, NULL);
         @synchronized ([KPH9EncoderModule class]) {
             res->closed = 1;
-            KPH9OutAppend(log, @"  dpb[tagged x%-2d] set=%-6d cbs=%d | cb1: %s | cb2: %s\n",
-                          count, (int)setSt, res->cbCount, res->first, res->second);
+            KPH9OutAppend(log, @"  dpb[surf x%-2d (%d pairs)] set=%-6d prep=%-6d rb=%@ cbs=%d | cb1: %s | cb2: %s\n",
+                          count, count / 2, (int)setSt, (int)prepSt, Stage7ReadbackDPB(session),
+                          res->cbCount, res->first, res->second);
         }
         KPH9SafeTeardownEx(session, NULL, res);
     }
@@ -622,8 +669,6 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         return;
     }
 
-    long long tagBase = 0x4141414141410000LL;
-
     // 7A: Dump supported property schema from H9 over XPC + safe read-only hidden AVE property probe
     // WARNING: Never blindly call VTSessionSetProperty with kCFBooleanTrue / CFNumber / CFString
     // on untyped hidden properties (e.g. UserParameterSetsIds expects CFArray, DPBRequirements
@@ -656,57 +701,69 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         }
     }
 
-    // 7B: @pre Even-Pair (2..17 pairs = 4..34 int32s) DPB Checks
-    // RE fact:
-    //   1) UserDPBFramesForFaceTime truncates odd length to (count & ~1) (so x1->arr(0), x35->arr(34))
-    //      and truncates each CFNumber to int32_t (0x4141414141410000 -> 0x41410000).
-    //   2) AVE_Client_CheckCommonInfo enforces: 2 <= userDPBnumFrames <= 17 (i.e. x4..x34 elements).
-    //   3) H9 latches UserDPBFramesForFaceTime at PrepareToEncodeFrames (@pre), not @post-idr.
-    KPH9OutAppend(log, @"  [7B: @pre Even-Pair DPB Matrix (4..34 elements = 2..17 pairs)]\n");
-    Stage7RunCustomDPBArrayEx(log, px, @"x4 (0,0,0,0)@pre",           @[ @0, @0, @0, @0 ],         0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x4 (0,0,1,0)@pre",           @[ @0, @0, @1, @0 ],         0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x4 (0,1,0,1)@pre",           @[ @0, @1, @0, @1 ],         0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x4 (1,0,2,0)@pre",           @[ @1, @0, @2, @0 ],         0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x4 (1,1,2,1)@pre",           @[ @1, @1, @2, @1 ],         0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x4 (0,0,1,0)@post-prep",     @[ @0, @0, @1, @0 ],         2, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x4 (0,0,1,0)@lazy",          @[ @0, @0, @1, @0 ],         1, NO);
-
-    NSMutableArray *x34Zero32PlusPair16 = [NSMutableArray arrayWithCapacity:34];
-    NSMutableArray *x34PairRamp         = [NSMutableArray arrayWithCapacity:34];
-    NSMutableArray *x34Ones             = [NSMutableArray arrayWithCapacity:34];
-    for (int k = 0; k < 32; k++) {
-        [x34Zero32PlusPair16 addObject:@0];
+    // 7B: DPB matrix with LIVE IOSurfaceIDs (analyst: SetDPBSnapShot runs
+    // IOSurfaceLookup on each entry — real surface IDs or 0 = empty slot only).
+    KPH9OutAppend(log, @"  [7B: DPB Matrix with live IOSurfaceIDs (4..34 elements = 2..17 pairs)]\n");
+    uint32_t sid0 = KPH9GetPixelBufferSurfaceID(px);
+    CVPixelBufferRef px1 = CreateDummyNV12Buffer(192, 144);
+    uint32_t sid1 = KPH9GetPixelBufferSurfaceID(px1);
+    NSMutableArray *stage7Holders = [NSMutableArray array];
+    if (px1) {
+        [stage7Holders addObject:(__bridge id)px1];
+        CFRelease(px1);
     }
-    // 17th pair (indices 32, 33 — inside the 34-element / 17-pair limit, NOT dropped like index 34!)
-    [x34Zero32PlusPair16 addObject:@(tagBase | 0x20ULL)];
-    [x34Zero32PlusPair16 addObject:@(tagBase | 0x21ULL)];
+    NSArray<NSNumber *> *stage7PoolIDs = KPH9AllocSurfacePool(17, 192, 144, stage7Holders);
+    KPH9OutAppend(log, @"  [surf pool] sid0=0x%x sid1=0x%x pool[0..2]=%u,%u,%u\n",
+                  sid0, sid1,
+                  stage7PoolIDs.count > 0 ? stage7PoolIDs[0].unsignedIntValue : 0,
+                  stage7PoolIDs.count > 1 ? stage7PoolIDs[1].unsignedIntValue : 0,
+                  stage7PoolIDs.count > 2 ? stage7PoolIDs[2].unsignedIntValue : 0);
 
+    NSMutableArray *zero32 = [NSMutableArray arrayWithCapacity:32];
+    for (int i = 0; i < 32; i++) [zero32 addObject:@0];
+    NSMutableArray *zero34 = [NSMutableArray arrayWithCapacity:34];
+    for (int i = 0; i < 34; i++) [zero34 addObject:@0];
+    NSMutableArray *surfPairs32 = [NSMutableArray arrayWithCapacity:32];
+    for (int p = 0; p < 16; p++) {
+        [surfPairs32 addObject:stage7PoolIDs[(NSUInteger)p]];
+        [surfPairs32 addObject:@0];
+    }
+    NSMutableArray *surfPairs34 = [NSMutableArray arrayWithCapacity:34];
     for (int p = 0; p < 17; p++) {
-        [x34PairRamp addObject:@(p)];
-        [x34PairRamp addObject:@0];
-        [x34Ones addObject:@1];
-        [x34Ones addObject:@0];
+        [surfPairs34 addObject:stage7PoolIDs[(NSUInteger)p]];
+        [surfPairs34 addObject:@(sid0)];
     }
+    NSMutableArray *zero32PlusLastSurfPair = [zero32 mutableCopy];
+    [zero32PlusLastSurfPair addObject:stage7PoolIDs[16]];
+    [zero32PlusLastSurfPair addObject:@(sid1)];
 
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 zero32+pair16(32,33)@pre", x34Zero32PlusPair16, 0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 pairRamp(p,0)@pre",        x34PairRamp,         0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 ones(1,0)@pre",            x34Ones,             0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 pairRamp(p,0)@post-prep",  x34PairRamp,         2, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x4 (0,0,0,0)@pre",             @[ @0, @0, @0, @0 ],           0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x4 (sid0,0,0,0)@pre",          @[ @(sid0), @0, @0, @0 ],      0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x4 (sid0,sid1,0,0)@pre",       @[ @(sid0), @(sid1), @0, @0 ], 0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x4 (sid0,0,sid1,0)@pre",       @[ @(sid0), @0, @(sid1), @0 ], 0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x32 allZero@pre",              zero32,                        0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x34 allZero@pre",              zero34,                        0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x32 surfPairs@pre",            surfPairs32,                   0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x34 surfPairs@pre",            surfPairs34,                   0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x34 zero32+surfPair16@pre",    zero32PlusLastSurfPair,        0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x4 (sid0,0,sid1,0)@post-prep", @[ @(sid0), @0, @(sid1), @0 ], 2, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x4 (sid0,0,sid1,0)@post-idr",  @[ @(sid0), @0, @(sid1), @0 ], 3, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x34 surfPairs@post-idr",       surfPairs34,                   3, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x34 surfPairs@post-4p",        surfPairs34,                   4, NO);
 
-    // 7C: UserRPSForFaceTime flat CFNumber array probe REMOVED —
-    // flat CFNumber elements in UserRPSForFaceTime trigger SIGABRT in videocodecd
-    // (320s launchd respawn throttle -> VIDEOCODECD_XPC_TIMEOUT).
-    // Replaced with safe @pre UserDPBFramesForFaceTime boundary pairs (x32 vs x34 vs x36).
-    KPH9OutAppend(log, @"  [7C: UserDPBFramesForFaceTime @pre Pair Boundary (x32, x34, x36) — flat UserRPS removed]\n");
+    // 7C: Pair boundary (x32/x34/x36) filled with live IOSurfaceIDs
+    // (flat UserRPS stays removed — SIGABRT in videocodecd).
+    KPH9OutAppend(log, @"  [7C: UserDPBFramesForFaceTime Pair Boundary (x32, x34, x36) with surf IDs]\n");
     int dpbPairLens[] = { 32, 34, 36 };
     for (size_t di = 0; di < sizeof(dpbPairLens) / sizeof(dpbPairLens[0]); di++) {
         int len = dpbPairLens[di];
         NSMutableArray *pairArr = [NSMutableArray arrayWithCapacity:(NSUInteger)len];
         for (int k = 0; k < len; k += 2) {
-            [pairArr addObject:@(k / 2)];
+            NSUInteger pairIdx = (NSUInteger)(k / 2) % stage7PoolIDs.count;
+            [pairArr addObject:stage7PoolIDs[pairIdx]];
             [pairArr addObject:@0];
         }
-        NSString *lbl = [NSString stringWithFormat:@"x%d pairs@pre", len];
+        NSString *lbl = [NSString stringWithFormat:@"x%d surfPairs@pre", len];
         Stage7RunCustomDPBArrayEx(log, px, lbl, pairArr, 0, NO);
     }
 
