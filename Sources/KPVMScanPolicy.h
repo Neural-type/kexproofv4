@@ -23,8 +23,7 @@ static BOOL KPVMShouldSkipRegion(const vm_region_submap_info_data_64_t *info,
                                  const vm_size_t *excludedSizes,
                                  size_t excludedCount) {
     unsigned int tag = info->user_tag;
-    if (tag == VM_MEMORY_STACK || tag == VM_MEMORY_DYLD_MALLOC) return YES;
-    if (tag >= VM_MEMORY_MALLOC && tag <= VM_MEMORY_MALLOC_PROB_GUARD) return YES;
+    if (tag == VM_MEMORY_STACK || tag == VM_MEMORY_MALLOC_PROB_GUARD) return YES;
     uintptr_t marker = (uintptr_t)stackMarker;
     if (marker && marker >= address && marker < address + size) return YES;
     for (size_t i = 0; i < excludedCount; i++) {
@@ -45,7 +44,7 @@ static inline uint64_t KPStripPACKernel(uint64_t raw) {
     if (byte5 != 0xf0 && byte5 != 0xfe && byte5 != 0xff && (byte5 < 0xe0 || byte5 > 0xef)) {
         return 0;
     }
-    return (raw & 0x000000ffffffffffULL) | 0xfffffe0000000000ULL;
+    return (raw & 0x0000ffffffffffffULL) | 0xffff000000000000ULL;
 }
 
 static inline BOOL KPIsPlausibleKernelText(uint64_t raw, uint64_t *untagged) {
@@ -56,8 +55,6 @@ static inline BOOL KPIsPlausibleKernelText(uint64_t raw, uint64_t *untagged) {
     uint8_t byte4 = (uint8_t)((raw >> 32) & 0xff);
     if (top8 == 0x00 || byte6 != 0xff) return NO;
     // Match 0xfffffff0... or 0xfffffe00... kernelcache text/data ranges.
-    // Canonical untagged ktext (kernelcache link base 0xfffffff007004000) has
-    // byte5=0xff byte4=0xf0 — the T8130 runtime family 0xfffffe00 has byte5=0xfe.
     if (byte5 == 0xf0 || (byte5 == 0xff && byte4 == 0xf0) || (byte5 == 0xfe && byte4 < 0x10)) {
         uint64_t norm = 0xfffffff000000000ULL | (raw & 0x0000000fffffffffULL);
         if (norm >= 0xfffffff007004000ULL && norm < 0xfffffff090000000ULL) {
@@ -75,19 +72,23 @@ static inline BOOL KPIsPlausibleKernelHeap(uint64_t raw, uint64_t *untagged) {
     uint8_t byte5 = (uint8_t)((raw >> 40) & 0xff);
     uint8_t byte4 = (uint8_t)((raw >> 32) & 0xff);
     if (top8 == 0x00 || byte6 != 0xff) return NO;
-    // T8130 kalloc / zone map: 0xfffffe10..0xfffffe3f only. The 0xffffffe0..ef
-    // band is LE int32 pairs with negative high halves (codec tables) — reject.
+    // T8122/T8130 kalloc / zone / kernel_map:
+    //   - 0xfffffe10..0xfffffe3f (zone map)
+    //   - 0xffffffec..0xffffffef (confirmed on iPhone16,1 27.0.1 panic:
+    //     AppleAVE2 outer object = 0xffffffedfd620000, SP = 0xffffffefff31b3f0)
     if (byte5 == 0xfe && byte4 >= 0x10 && byte4 < 0x40) {
         uint64_t norm = 0xfffffe0000000000ULL | (raw & 0x000000ffffffffffULL);
+        if (untagged) *untagged = norm;
+        return YES;
+    }
+    if (byte5 == 0xff && byte4 >= 0xec && byte4 <= 0xef) {
+        uint64_t norm = 0xffffff0000000000ULL | (raw & 0x000000ffffffffffULL);
         if (untagged) *untagged = norm;
         return YES;
     }
     return NO;
 }
 
-// Per ollie: the two big false-positive classes on-device are packed int32
-// pairs from codec quant/motion tables (0xffffffedffff0d00 = [-19,-62208]) and
-// non-canonical TBI junk (0xe7ffff...). Classify before trusting a candidate.
 typedef enum {
     KPTR_REJECT_PACKED_INT32 = 0,
     KPTR_REJECT_BAD_TBI,
@@ -97,23 +98,17 @@ typedef enum {
 } kptr_class_t;
 
 static inline kptr_class_t KPClassifyKPtr(uint64_t raw) {
-    // Canonical kernel VAs have top byte 0xFF (PAC/TBI tags like 0xe7 are junk here)
     if ((raw >> 56) != 0xFF) return KPTR_REJECT_BAD_TBI;
-    // Packed negative int32 pairs: low half looks like a negative 32-bit coeff
     uint32_t lo32 = (uint32_t)(raw & 0xFFFFFFFFULL);
-    if (lo32 >= 0xF8000000U || (lo32 & 0xFFFF0000U) == 0xFFFF0000U) return KPTR_REJECT_PACKED_INT32;
-    // Code pointers are 4-aligned; data pointers 8-aligned (ollie: 8 min, we keep
-    // 4 so ktext function pointers are not cut).
+    // Reject obvious small negative int32 in low half (0xffffxxxx) while allowing
+    // valid kernel VAs like 0xffffffedfd6347b0 / 0xffffffefff31b3f0
+    if ((lo32 & 0xFFFF0000U) == 0xFFFF0000U || lo32 < 0x00001000U) return KPTR_REJECT_PACKED_INT32;
     if ((raw & 0x3ULL) != 0) return KPTR_REJECT_UNALIGNED;
     uint32_t hi32 = (uint32_t)(raw >> 32);
-    // T8130: the 0xffffffe0..ef band is LE int32 pairs with a small negative high
-    // half (-32..-17), NOT zone-map. Real untagged kheap is 0xfffffe10..3f.
-    if (hi32 >= 0xFFFFFFE0U && hi32 <= 0xFFFFFFEFU) return KPTR_REJECT_PACKED_INT32;
-    // ktext: kernelcache link base 0xfffffff007004000 + slide, or the runtime
-    // 0xfffffe00..0f family (T8130 layout).
     if (hi32 >= 0xFFFFFFF0U && hi32 <= 0xFFFFFFFBU) return KPTR_CANDIDATE_KERNEL_TEXT_DATA;
     if (hi32 >= 0xFFFFFE00U && hi32 <= 0xFFFFFE0FU) return KPTR_CANDIDATE_KERNEL_TEXT_DATA;
-    if (hi32 >= 0xFFFFFE10U && hi32 <= 0xFFFFFE3FU) {
+    if ((hi32 >= 0xFFFFFE10U && hi32 <= 0xFFFFFE3FU) ||
+        (hi32 >= 0xFFFFFFECU && hi32 <= 0xFFFFFFEFU)) {
         return ((raw & 0x7ULL) == 0) ? KPTR_CANDIDATE_ZONE_HEAP : KPTR_REJECT_UNALIGNED;
     }
     return KPTR_REJECT_UNALIGNED;
@@ -122,12 +117,8 @@ static inline kptr_class_t KPClassifyKPtr(uint64_t raw) {
 static BOOL KPIsKernelPointerCandidate(uint64_t value) {
     if ((value & 0x3) != 0 || value == UINT64_MAX) return NO;
 
-    // Per ollie: bit 55 MUST be 1 for arm64e kernel pointers
+    // Bit 55 MUST be 1 for arm64e kernel pointers (also excludes all user-space VAs)
     if ((value & (1ULL << 55)) == 0) return NO;
-
-    // Reject PAC user-space pointers (untagged 36-bit user VA)
-    uint64_t untagged = value & 0x0000000fffffffffULL;
-    if (untagged >= 0x100000000ULL && untagged < 0x300000000ULL) return NO;
 
     // Reject SIMD/float/NaN noise
     if ((value & 0xffffULL) == 0) {
@@ -136,8 +127,6 @@ static BOOL KPIsKernelPointerCandidate(uint64_t value) {
     }
     if ((value & 0xFFFFFULL) == 0) return NO;
 
-    // Check canonical kernel VA ranges — KPClassifyKPtr wired in per the
-    // 120328 log analysis (it was dead code, so packed-int32 pairs leaked through).
     kptr_class_t cls = KPClassifyKPtr(value);
     if (cls != KPTR_CANDIDATE_ZONE_HEAP && cls != KPTR_CANDIDATE_KERNEL_TEXT_DATA) return NO;
     uint64_t va = KPStripPACKernel(value);
