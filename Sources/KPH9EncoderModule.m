@@ -63,6 +63,23 @@ static void KPH9Drain(NSMutableArray *sink, int expected, int timeoutMs) {
     }
 }
 
+// Analyst Stage 1: the CompleteFrames OSStatus is the oracle - -12912/-12903
+// means the frameProperties RPS really hit the parser. Runs on a watchdog
+// thread because CompleteFrames itself has no timeout and deadlocks on wedged
+// sessions (INT32_MIN = gave up).
+static OSStatus KPH9CompleteStatus(VTCompressionSessionRef s, int timeoutMs) {
+    if (!s) return INT32_MIN;
+    __block OSStatus rc = INT32_MIN;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        rc = VTCompressionSessionCompleteFrames(s, kCMTimeInvalid);
+        dispatch_semaphore_signal(sem);
+    });
+    long w = dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMs * NSEC_PER_MSEC));
+    return (w == 0) ? rc : INT32_MIN;
+}
+
 static CVPixelBufferRef KPH9CreatePixelBuffer(int width, int height) {
     CVPixelBufferRef pb = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, width, height,
@@ -169,7 +186,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
     // -------------------------------------------------------------------------
     [self journal:@"Stage 1: RPS OOB probe"];
     [report appendString:@"\n--- Stage 1: AVE_HEVC_ST_RPS_Retrieve (UserRPSForFaceTime) ---\n"];
-    NSString *s1 = KPH9RunTimed(@"Stage1-RPS", 1500, &vtHung, ^NSString *{
+    NSString *s1 = KPH9RunTimed(@"Stage1-RPS", 3000, &vtHung, ^NSString *{
         NSMutableString *out = [NSMutableString string];
         NSMutableArray *cbSink = [NSMutableArray array];
         NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
@@ -222,10 +239,23 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             };
             OSStatus e1 = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(1, 30), kCMTimeInvalid,
                                                           (__bridge CFDictionaryRef)fp, NULL, NULL);
-            if (e1 == noErr) KPH9Drain(cbSink, 1, 60);
+            if (e1 == noErr) KPH9Drain(cbSink, 1, 80);
             NSString *cb1 = nil;
-            @synchronized (cbSink) { cb1 = cbSink.firstObject ?: @"(no cb)"; }
+            @synchronized (cbSink) { cb1 = cbSink.firstObject ?: @"(no cb)"; [cbSink removeAllObjects]; }
             [out appendFormat:@"  encode[1] frameProps RPS(32+32) -> %d (%@)\n", (int)e1, cb1];
+
+            // Analyst strike 1: CompleteFrames status is the parser oracle.
+            OSStatus cfSt = KPH9CompleteStatus(s, 500);
+            [out appendFormat:@"  CompleteFrames after smash -> %d%s\n", (int)cfSt,
+             (cfSt == INT32_MIN) ? " (TIMEOUT - pipeline wedged)" : ""];
+            // Survival probe: second P-frame into the same session - did the
+            // XPC worker/encoder die on encode[1] or swallow the 32+32 RPS?
+            OSStatus e2 = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(2, 30), kCMTimeInvalid,
+                                                          NULL, NULL, NULL);
+            if (e2 == noErr) KPH9Drain(cbSink, 1, 80);
+            NSString *cb2 = nil;
+            @synchronized (cbSink) { cb2 = cbSink.firstObject ?: @"(no cb)"; }
+            [out appendFormat:@"  encode[2] post-smash P-frame -> %d (%@)\n", (int)e2, cb2];
             CVPixelBufferRelease(pb);
         }
 
@@ -349,7 +379,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
     if (vtHung) {
         [report appendString:@"  skipped (videocodecd XPC timed out)\n"];
     } else {
-        NSString *s3 = KPH9RunTimed(@"Stage3-DPB", 3000, &vtHung, ^NSString *{
+        NSString *s3 = KPH9RunTimed(@"Stage3-DPB", 12000, &vtHung, ^NSString *{
             NSMutableString *out = [NSMutableString string];
             NSMutableArray *cbSink = [NSMutableArray array];
             NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
@@ -375,24 +405,31 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                 }
             }
 
-            int counts[] = { 1, 16, 24, 32, 33, 36, 40, 48, 63, 64 };
+            // Analyst strike 2/3: full 17..32 matrix + exact cutoff 32..64,
+            // each row tested on TWO P-frames (DPB matching bites beyond IDR).
+            int counts[] = { 1, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+                             29, 30, 31, 32, 33, 34, 48, 63, 64 };
             int nCounts = (int)(sizeof(counts) / sizeof(counts[0]));
             for (int ci = 0; ci < nCounts; ci++) {
                 int n = counts[ci];
                 NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
                 for (int k = 0; k < n; k++) [arr addObject:@(k)];
                 OSStatus sp = VTSessionSetProperty(s, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
-                OSStatus fe = -1;
+                OSStatus fe = -1, fe2 = -1;
                 if (pb) {
                     @synchronized (cbSink) { [cbSink removeAllObjects]; }
                     NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
                     fe = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(pts++, 30), kCMTimeInvalid,
                                                          (__bridge CFDictionaryRef)fp, NULL, NULL);
-                    if (fe == noErr) KPH9Drain(cbSink, 1, 40);
+                    fe2 = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(pts++, 30), kCMTimeInvalid,
+                                                          (__bridge CFDictionaryRef)fp, NULL, NULL);
+                    if (fe == noErr || fe2 == noErr) KPH9Drain(cbSink, 2, 80);
                 }
                 NSString *cb = nil;
-                @synchronized (cbSink) { cb = cbSink.firstObject ?: @"(no cb)"; }
-                [out appendFormat:@"  dpb[num0 x%-2d] set=%d enc=%d cb=%@\n", n, (int)sp, (int)fe, cb];
+                @synchronized (cbSink) {
+                    cb = cbSink.count ? [cbSink componentsJoinedByString:@" | "] : @"(no cb)";
+                }
+                [out appendFormat:@"  dpb[num0 x%-2d] set=%d enc=%d/%d cb=%@\n", n, (int)sp, (int)fe, (int)fe2, cb];
             }
 
             long long vals[] = { 15, 16, 32, -1, 0x4141414141414141LL };
@@ -400,17 +437,21 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                 NSMutableArray *arr = [NSMutableArray arrayWithCapacity:16];
                 for (int k = 0; k < 16; k++) [arr addObject:@(vals[vi])];
                 OSStatus sp = VTSessionSetProperty(s, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
-                OSStatus fe = -1;
+                OSStatus fe = -1, fe2 = -1;
                 if (pb) {
                     @synchronized (cbSink) { [cbSink removeAllObjects]; }
                     NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
                     fe = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(pts++, 30), kCMTimeInvalid,
                                                          (__bridge CFDictionaryRef)fp, NULL, NULL);
-                    if (fe == noErr) KPH9Drain(cbSink, 1, 40);
+                    fe2 = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(pts++, 30), kCMTimeInvalid,
+                                                          (__bridge CFDictionaryRef)fp, NULL, NULL);
+                    if (fe == noErr || fe2 == noErr) KPH9Drain(cbSink, 2, 80);
                 }
                 NSString *cb = nil;
-                @synchronized (cbSink) { cb = cbSink.firstObject ?: @"(no cb)"; }
-                [out appendFormat:@"  dpb[val=0x%llx x16] set=%d enc=%d cb=%@\n", vals[vi], (int)sp, (int)fe, cb];
+                @synchronized (cbSink) {
+                    cb = cbSink.count ? [cbSink componentsJoinedByString:@" | "] : @"(no cb)";
+                }
+                [out appendFormat:@"  dpb[val=0x%llx x16] set=%d enc=%d/%d cb=%@\n", vals[vi], (int)sp, (int)fe, (int)fe2, cb];
             }
 
             if (pb) CVPixelBufferRelease(pb);
