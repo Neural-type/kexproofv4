@@ -76,15 +76,35 @@ static void KPH9OutAppend(NSMutableString *out, NSString *fmt, ...) {
     }
 }
 
-// Asynchronous teardown (consumes caller's +1 create reference) so a wedged
-// session or in-flight frame can never deadlock the stage thread on
-// VTCompressionSessionInvalidate / CFRelease.
-static void KPH9SafeTeardown(VTCompressionSessionRef s) {
-    if (!s) return;
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+// Serial bounded teardown (consumes caller's +1 create reference) and releases
+// retainedRefCon / heapCtx ONLY after VTCompressionSessionInvalidate & CFRelease
+// finish. Waiting up to 350 ms serializes healthy teardowns (<5 ms) so sessions
+// never pile up concurrently in videocodecd, while a wedged session times out
+// cleanly without deadlocking the stage thread or causing a callback UAF.
+static void KPH9SafeTeardownEx(VTCompressionSessionRef s, CFTypeRef retainedRefCon, void *heapCtx) {
+    if (!s) {
+        if (retainedRefCon) CFRelease(retainedRefCon);
+        if (heapCtx) free(heapCtx);
+        return;
+    }
+    static dispatch_queue_t tdQueue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        tdQueue = dispatch_queue_create("com.stealth.kexproofv4.h9.teardown", DISPATCH_QUEUE_SERIAL);
+    });
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    dispatch_async(tdQueue, ^{
         VTCompressionSessionInvalidate(s);
         CFRelease(s);
+        if (retainedRefCon) CFRelease(retainedRefCon);
+        if (heapCtx) free(heapCtx);
+        dispatch_semaphore_signal(done);
     });
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 350 * (int64_t)NSEC_PER_MSEC));
+}
+
+static void KPH9SafeTeardown(VTCompressionSessionRef s) {
+    KPH9SafeTeardownEx(s, NULL, NULL);
 }
 
 // Fast 500 ms probe on a fresh session to check whether videocodecd XPC is
@@ -112,10 +132,20 @@ static BOOL KPH9IsVideoCodecdAlive(void) {
 // with a bounded poll - that call deadlocks on wedged sessions)
 typedef struct {
     volatile int cbCount;
+    volatile int closed;
     OSStatus lastStatus;
     char summary[512];
     char first[512]; // Stage 7: keep cb#1 (IDR, carries the SPS) alongside cb#2
 } Stage6ProbeResult;
+
+static Stage6ProbeResult *Stage6AllocResult(void) {
+    Stage6ProbeResult *res = (Stage6ProbeResult *)calloc(1, sizeof(Stage6ProbeResult));
+    if (res) {
+        snprintf(res->summary, sizeof(res->summary), "(no cb)");
+        snprintf(res->first, sizeof(res->first), "(no cb)");
+    }
+    return res;
+}
 
 static NSString *HexDumpSlice(const uint8_t *buf, size_t len, size_t maxBytes) {
     size_t n = (len < maxBytes) ? len : maxBytes;
@@ -133,14 +163,17 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
                                  CMSampleBufferRef sampleBuffer) {
     (void)sourceFrameRefCon;
     Stage6ProbeResult *res = (Stage6ProbeResult *)outputCallbackRefCon;
-    if (!res) return;
-    res->cbCount++;
-    res->lastStatus = status;
+    if (!res || res->closed) return;
     if (status != noErr || !sampleBuffer) {
-        snprintf(res->summary, sizeof(res->summary),
-                 "cb#%d st=%d info=0x%x sbuf=NULL",
-                 res->cbCount, (int)status, (unsigned)infoFlags);
-        if (res->cbCount == 1) snprintf(res->first, sizeof(res->first), "%s", res->summary);
+        @synchronized ([KPH9EncoderModule class]) {
+            if (res->closed) return;
+            res->cbCount++;
+            res->lastStatus = status;
+            snprintf(res->summary, sizeof(res->summary),
+                     "cb#%d st=%d info=0x%x sbuf=NULL",
+                     res->cbCount, (int)status, (unsigned)infoFlags);
+            if (res->cbCount == 1) snprintf(res->first, sizeof(res->first), "%s", res->summary);
+        }
         return;
     }
     // Real SampleAttachments (array of dicts - CMCopyDictionaryOfAttachments is empty)
@@ -175,12 +208,17 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
             nalHex = HexDumpSlice((const uint8_t *)dataPtr, lengthAtOffset, 24);
         }
     }
-    snprintf(res->summary, sizeof(res->summary),
-             "cb#%d st=%d info=0x%x saKeys=%lu ps=%zu sps=%s nal(%zu)=%s",
-             res->cbCount, (int)status, (unsigned)infoFlags,
-             (unsigned long)saKeys, paramCount,
-             [spsHex UTF8String], totalLen, [nalHex UTF8String]);
-    if (res->cbCount == 1) snprintf(res->first, sizeof(res->first), "%s", res->summary);
+    @synchronized ([KPH9EncoderModule class]) {
+        if (res->closed) return;
+        res->cbCount++;
+        res->lastStatus = status;
+        snprintf(res->summary, sizeof(res->summary),
+                 "cb#%d st=%d info=0x%x saKeys=%lu ps=%zu sps=%s nal(%zu)=%s",
+                 res->cbCount, (int)status, (unsigned)infoFlags,
+                 (unsigned long)saKeys, paramCount,
+                 [spsHex UTF8String], totalLen, [nalHex UTF8String]);
+        if (res->cbCount == 1) snprintf(res->first, sizeof(res->first), "%s", res->summary);
+    }
 }
 
 static CVPixelBufferRef CreateDummyNV12Buffer(int width, int height) {
@@ -208,16 +246,16 @@ static void RunStage6_XPCLeakAndBoundaryAudit(NSMutableString *log) {
     }
     for (size_t i = 0; i < numProbes; i++) {
         int count = probeCounts[i];
-        Stage6ProbeResult res = {0};
-        snprintf(res.summary, sizeof(res.summary), "(no cb)");
-        snprintf(res.first, sizeof(res.first), "(no cb)");
+        Stage6ProbeResult *res = Stage6AllocResult();
+        if (!res) continue;
         VTCompressionSessionRef session = NULL;
         OSStatus st = VTCompressionSessionCreate(
             kCFAllocatorDefault, 192, 144,
             kCMVideoCodecType_HEVC, NULL, NULL, NULL,
-            Stage6OutputCallback, &res, &session);
+            Stage6OutputCallback, res, &session);
         if (st != noErr || !session) {
             KPH9OutAppend(log, @"  dpb[x%-2d] create=%d\n", count, (int)st);
+            free(res);
             continue;
         }
         NSMutableArray *dpbArr = [NSMutableArray arrayWithCapacity:count];
@@ -236,10 +274,18 @@ static void RunStage6_XPCLeakAndBoundaryAudit(NSMutableString *log) {
         VTCompressionSessionEncodeFrame(session, px, pts0, kCMTimeInvalid, NULL, NULL, NULL);
         VTCompressionSessionEncodeFrame(session, px, pts1, kCMTimeInvalid, NULL, NULL, NULL);
         int waited = 0;
-        while (res.cbCount < 2 && waited < 160) { usleep(2000); waited += 2; }
-        KPH9OutAppend(log, @"  dpb[tagged x%-2d] set=%-6d -> %s\n",
-                      count, (int)setSt, res.summary);
-        KPH9SafeTeardown(session);
+        while (res->cbCount < 2 && waited < 60) { usleep(2000); waited += 2; }
+        if (res->cbCount < 2) {
+            VTCompressionSessionEncodeFrame(session, px, CMTimeMake(2, 30), kCMTimeInvalid, NULL, NULL, NULL);
+            VTCompressionSessionEncodeFrame(session, px, CMTimeMake(3, 30), kCMTimeInvalid, NULL, NULL, NULL);
+            while (res->cbCount < 2 && waited < 140) { usleep(2000); waited += 2; }
+        }
+        @synchronized ([KPH9EncoderModule class]) {
+            res->closed = 1;
+            KPH9OutAppend(log, @"  dpb[tagged x%-2d] set=%-6d -> %s\n",
+                          count, (int)setSt, res->summary);
+        }
+        KPH9SafeTeardownEx(session, NULL, res);
     }
     // 6B: NTL clamp steering via extreme ExpectedFrameRate / BaseLayerFrameRate ratios
     KPH9OutAppend(log, @"  [6B: Dyadic Clamp Ratio Steering (ExpectedFrameRate / BaseLayerFrameRate)]\n");
@@ -279,16 +325,15 @@ static void RunStage6_XPCLeakAndBoundaryAudit(NSMutableString *log) {
 // 4 tiny frames (pts 0..3) when cb#2 hasn't fired yet so the reorder lookahead
 // flushes naturally without CompleteFrames or AllowFrameReordering=NO.
 static void Stage7DPBRow(NSMutableString *log, CVPixelBufferRef px, int count, long long val, BOOL afterPrepare) {
-    Stage6ProbeResult res;
-    memset(&res, 0, sizeof(res));
-    snprintf(res.summary, sizeof(res.summary), "(no cb)");
-    snprintf(res.first, sizeof(res.first), "(no cb)");
+    Stage6ProbeResult *res = Stage6AllocResult();
+    if (!res) return;
     VTCompressionSessionRef session = NULL;
     OSStatus st = VTCompressionSessionCreate(
         kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
-        NULL, NULL, NULL, Stage6OutputCallback, &res, &session);
+        NULL, NULL, NULL, Stage6OutputCallback, res, &session);
     if (st != noErr || !session) {
         KPH9OutAppend(log, @"  dpb x%-2d val=0x%llx create=%d\n", count, val, (int)st);
+        free(res);
         return;
     }
     NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
@@ -305,18 +350,21 @@ static void Stage7DPBRow(NSMutableString *log, CVPixelBufferRef px, int count, l
         VTCompressionSessionEncodeFrame(session, px, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
         VTCompressionSessionEncodeFrame(session, px, CMTimeMake(1, 30), kCMTimeInvalid, NULL, NULL, NULL);
         int waited = 0;
-        while (res.cbCount < 2 && waited < 60) { usleep(2000); waited += 2; }
+        while (res->cbCount < 2 && waited < 60) { usleep(2000); waited += 2; }
         // If P-frame callback is buffered in reorder lookahead (no immediate -17691),
         // push 2 more frames to flush pts=1 out of the reorder window cleanly.
-        if (res.cbCount < 2) {
+        if (res->cbCount < 2) {
             VTCompressionSessionEncodeFrame(session, px, CMTimeMake(2, 30), kCMTimeInvalid, NULL, NULL, NULL);
             VTCompressionSessionEncodeFrame(session, px, CMTimeMake(3, 30), kCMTimeInvalid, NULL, NULL, NULL);
-            while (res.cbCount < 2 && waited < 140) { usleep(2000); waited += 2; }
+            while (res->cbCount < 2 && waited < 140) { usleep(2000); waited += 2; }
         }
     }
-    KPH9OutAppend(log, @"  dpb x%-2d val=0x%016llx set@%s=%d cbs=%d | first: %s | last: %s\n",
-                  count, val, afterPrepare ? "post" : "pre", (int)setSt, res.cbCount, res.first, res.summary);
-    KPH9SafeTeardown(session);
+    @synchronized ([KPH9EncoderModule class]) {
+        res->closed = 1;
+        KPH9OutAppend(log, @"  dpb x%-2d val=0x%016llx set@%s=%d cbs=%d | first: %s | last: %s\n",
+                      count, val, afterPrepare ? "post" : "pre", (int)setSt, res->cbCount, res->first, res->summary);
+    }
+    KPH9SafeTeardownEx(session, NULL, res);
 }
 
 static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
@@ -366,17 +414,16 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
     NSArray *cands = @[ @[rpsDict], rpsDict, flat, cfdata ];
     NSArray *names = @[ @"wrapped @[dict]", @"bare dict", @"flat 64 numbers", @"CFData 512B" ];
     for (NSUInteger ci = 0; ci < cands.count; ci++) {
-        Stage6ProbeResult res;
-        memset(&res, 0, sizeof(res));
-        snprintf(res.summary, sizeof(res.summary), "(no cb)");
-        snprintf(res.first, sizeof(res.first), "(no cb)");
+        Stage6ProbeResult *res = Stage6AllocResult();
+        if (!res) continue;
         VTCompressionSessionRef session = NULL;
         NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
         OSStatus st = VTCompressionSessionCreate(
             kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
-            (__bridge CFDictionaryRef)spec, NULL, NULL, Stage6OutputCallback, &res, &session);
+            (__bridge CFDictionaryRef)spec, NULL, NULL, Stage6OutputCallback, res, &session);
         if (st != noErr || !session) {
             KPH9OutAppend(log, @"  rps[%@] create=%d\n", names[ci], (int)st);
+            free(res);
             continue;
         }
         VTSessionSetProperty(session, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
@@ -399,10 +446,13 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             e1 = VTCompressionSessionEncodeFrame(session, px, CMTimeMake(1, 30), kCMTimeInvalid, NULL, NULL, NULL);
         }
         int waited = 0;
-        while (res.cbCount < 2 && waited < 140) { usleep(2000); waited += 2; }
-        KPH9OutAppend(log, @"  rps[%@] setPre=%d setPost=%d frameEncode=%d cbs=%d | first: %s | last: %s\n",
-                      names[ci], (int)setPre, (int)setPost, (int)e1, res.cbCount, res.first, res.summary);
-        KPH9SafeTeardown(session);
+        while (res->cbCount < 2 && waited < 140) { usleep(2000); waited += 2; }
+        @synchronized ([KPH9EncoderModule class]) {
+            res->closed = 1;
+            KPH9OutAppend(log, @"  rps[%@] setPre=%d setPost=%d frameEncode=%d cbs=%d | first: %s | last: %s\n",
+                          names[ci], (int)setPre, (int)setPost, (int)e1, res->cbCount, res->first, res->summary);
+        }
+        KPH9SafeTeardownEx(session, NULL, res);
     }
     CVPixelBufferRelease(px);
 }
@@ -515,17 +565,21 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
     // -------------------------------------------------------------------------
     [self journal:@"Stage 1: RPS OOB probe"];
     [report appendString:@"\n--- Stage 1: AVE_HEVC_ST_RPS_Retrieve (UserRPSForFaceTime) ---\n"];
-    NSString *s1 = KPH9RunTimed(@"Stage1-RPS", 4000, &vtHung, ^(NSMutableString *out) {
+    NSString *s1 = KPH9RunTimed(@"Stage1-RPS", 5000, &vtHung, ^(NSMutableString *out) {
         NSMutableArray *cbSink = [NSMutableArray array];
+        CFTypeRef retainedSink = CFRetain((__bridge CFTypeRef)cbSink);
         NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
         VTCompressionSessionRef s = NULL;
         OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720,
                                                  kCMVideoCodecType_HEVC,
                                                  (__bridge CFDictionaryRef)spec,
                                                  NULL, NULL, KPH9AttsCB,
-                                                 (__bridge void *)cbSink, &s);
+                                                 (void *)retainedSink, &s);
         KPH9OutAppend(out, @"  session create -> %d\n", (int)st);
-        if (st != noErr || !s) return;
+        if (st != noErr || !s) {
+            CFRelease(retainedSink);
+            return;
+        }
 
         VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
         OSStatus prep = VTCompressionSessionPrepareToEncodeFrames(s);
@@ -588,7 +642,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             CVPixelBufferRelease(pb);
         }
 
-        KPH9SafeTeardown(s);
+        KPH9SafeTeardownEx(s, retainedSink, NULL);
     });
     [report appendString:s1];
 
@@ -602,7 +656,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
     if (vtHung) {
         [report appendString:@"  skipped (videocodecd XPC unresponsive)\n"];
     } else {
-        NSString *s2 = KPH9RunTimed(@"Stage2-NTL", 3500, &vtHung, ^(NSMutableString *out) {
+        NSString *s2 = KPH9RunTimed(@"Stage2-NTL", 5000, &vtHung, ^(NSMutableString *out) {
             CVPixelBufferRef pb = KPH9CreatePixelBuffer(1280, 720);
             int ntlVals[] = { 3, 8, 16000, 16447 };
             KPH9OutAppend(out, @"  [2A: with ExpectedFrameRate=60 / BaseLayerFrameRate=15 -> dyadic clamp 1+log2(60/15)=3]\n");
@@ -702,17 +756,19 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
     if (vtHung) {
         [report appendString:@"  skipped (videocodecd XPC unresponsive)\n"];
     } else {
-        NSString *s3 = KPH9RunTimed(@"Stage3-DPB", 12000, &vtHung, ^(NSMutableString *out) {
+        NSString *s3 = KPH9RunTimed(@"Stage3-DPB", 15000, &vtHung, ^(NSMutableString *out) {
             NSMutableArray *cbSink = [NSMutableArray array];
+            CFTypeRef retainedSink = CFRetain((__bridge CFTypeRef)cbSink);
             NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
             VTCompressionSessionRef s = NULL;
             OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720,
                                                      kCMVideoCodecType_HEVC,
                                                      (__bridge CFDictionaryRef)spec,
                                                      NULL, NULL, KPH9AttsCB,
-                                                     (__bridge void *)cbSink, &s);
+                                                     (void *)retainedSink, &s);
             if (st != noErr || !s) {
                 KPH9OutAppend(out, @"  session create -> %d\n", (int)st);
+                CFRelease(retainedSink);
                 return;
             }
             VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
@@ -777,7 +833,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             }
 
             if (pb) CVPixelBufferRelease(pb);
-            KPH9SafeTeardown(s);
+            KPH9SafeTeardownEx(s, retainedSink, NULL);
         });
         [report appendString:s3];
     }
