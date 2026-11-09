@@ -8,6 +8,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <mach/mach.h>
 #import <unistd.h>
+#import <dlfcn.h>
 
 typedef unsigned int kp_io_object_t;
 typedef unsigned int kp_io_service_t;
@@ -442,7 +443,10 @@ static void RunStage6_XPCLeakAndBoundaryAudit(NSMutableString *log) {
     }
     KPH9OutAppend(log, @"  [6B: Dyadic Clamp Ratio Steering (ExpectedFrameRate / BaseLayerFrameRate)]\n");
     double baseRates[] = { 15.0, 7.5, 3.75, 1.0, 0.5, 0.25, 0.0625 };
+    CVPixelBufferRef px6B = CreateDummyNV12Buffer(192, 144);
     for (size_t i = 0; i < sizeof(baseRates) / sizeof(baseRates[0]); i++) {
+        Stage6ProbeResult *res = Stage6AllocResult();
+        if (!res) continue;
         VTCompressionSessionRef session = NULL;
         NSDictionary *spec = @{
             @"EncoderUsage": @1,
@@ -451,7 +455,7 @@ static void RunStage6_XPCLeakAndBoundaryAudit(NSMutableString *log) {
         };
         if (VTCompressionSessionCreate(kCFAllocatorDefault, 192, 144,
                                        kCMVideoCodecType_HEVC, (__bridge CFDictionaryRef)spec, NULL, NULL,
-                                       Stage6OutputCallback, NULL, &session) == noErr && session) {
+                                       Stage6OutputCallback, res, &session) == noErr && session) {
             int expFps = 240;
             double baseFps = baseRates[i];
             CFNumberRef nExp = CFNumberCreate(NULL, kCFNumberIntType, &expFps);
@@ -469,13 +473,24 @@ static void RunStage6_XPCLeakAndBoundaryAudit(NSMutableString *log) {
                 CFNumberGetValue(postNtlRef, kCFNumberIntType, &postNtl);
                 CFRelease(postNtlRef);
             }
-            KPH9OutAppend(log, @"  ratio 240/%.4f -> prep=%d postSet=%d POST_NTL=%d\n",
-                          baseFps, (int)prepSt, (int)postSetSt, postNtl);
+            if (px6B) {
+                VTCompressionSessionEncodeFrame(session, px6B, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                int w0 = 0;
+                while (res->cbCount < 1 && w0 < 80) { usleep(2000); w0 += 2; }
+            }
+            @synchronized ([KPH9EncoderModule class]) {
+                res->closed = 1;
+                KPH9OutAppend(log, @"  ratio 240/%.4f -> prep=%d postSet=%d POST_NTL=%d | %s\n",
+                              baseFps, (int)prepSt, (int)postSetSt, postNtl, res->first);
+            }
             CFRelease(nExp);
             CFRelease(nBase);
-            KPH9SafeTeardown(session);
+            KPH9SafeTeardownEx(session, NULL, res);
+        } else {
+            free(res);
         }
     }
+    if (px6B) CVPixelBufferRelease(px6B);
 }
 
 static NSString *Stage7ReadbackDPB(VTCompressionSessionRef session) {
@@ -695,6 +710,31 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             }
             KPH9SafeTeardown(hs);
         }
+        // Resolve private VideoToolbox CFStringRef constants via dlsym
+        const char *vtSyms[] = {
+            "kVTCompressionPropertyKey_DPBRequirements",
+            "kVTDPBRequirements_NumberOfFrames",
+            "kVTDPBRequirements_AllocateRVRABuffers",
+            "kVTCompressionPropertyKey_UserDPBFramesForFaceTime",
+            "kVTCompressionPropertyKey_UserRPSForFaceTime",
+            "kVTEncodeFrameOptionKey_SetDPB",
+            "kVTEncodeFrameOptionKey_DPB_ReferenceFrames",
+            "kVTEncodeFrameOptionKey_DPB_FrameNumberFromIDR",
+            "kVTEncodeFrameOptionKey_DPB_LongTermFrameNumberFromIDR",
+            "kVTEncodeFrameOptionKey_DPB_HowManyShortTermFromIDR",
+            "kVTEncodeFrameOptionKey_DPB_NumberOfReferenceFrames",
+            "kVTSampleAttachment_GetDPB",
+        };
+        NSMutableArray *symParts = [NSMutableArray array];
+        for (size_t si = 0; si < sizeof(vtSyms) / sizeof(vtSyms[0]); si++) {
+            CFStringRef *symPtr = (CFStringRef *)dlsym(RTLD_DEFAULT, vtSyms[si]);
+            if (symPtr && *symPtr) {
+                [symParts addObject:[NSString stringWithFormat:@"%s=%@", vtSyms[si], (__bridge NSString *)(*symPtr)]];
+            } else {
+                [symParts addObject:[NSString stringWithFormat:@"%s=NULL", vtSyms[si]]];
+            }
+        }
+        KPH9OutAppend(log, @"    vtSyms: %@\n", [symParts componentsJoinedByString:@" | "]);
     }
 
     // 7B: DPB matrix with LIVE ENCODED IOSurfaceIDs (analyst: SetDPBSnapShot
@@ -857,14 +897,63 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         }
     }
 
+    // 7E: ReadWrite CFArray layer & parameter-set ID properties (confirmed tid=19 in 7A)
+    KPH9OutAppend(log, @"  [7E: Layer & Parameter-Set CFArray Properties (tid=19 ReadWrite)]\n");
+    NSArray<NSString *> *arrProps = @[
+        @"MVHEVCVideoLayerIDs",
+        @"HEVCAuxiliaryLayerIDs",
+        @"RequiredMVHEVCSequenceParameterSetIDs",
+        @"RequiredMVHEVCPictureParameterSetIDs",
+        @"RequiredMVHEVCVideoParameterSetAlphaVideoLayerIDs",
+        @"UserParameterSetsIds",
+    ];
+    NSMutableArray *a16 = [NSMutableArray arrayWithCapacity:16];
+    NSMutableArray *a64 = [NSMutableArray arrayWithCapacity:64];
+    for (int i = 0; i < 16; i++) [a16 addObject:@(i)];
+    for (int i = 0; i < 64; i++) [a64 addObject:@(i)];
+    NSArray *shapes = @[
+        @[ @"a1",  @[ @0 ] ],
+        @[ @"a2",  @[ @0, @1 ] ],
+        @[ @"a3",  @[ @65792, @0, @0 ] ],
+        @[ @"a4",  @[ @0, @1, @2, @3 ] ],
+        @[ @"a16", a16 ],
+        @[ @"a64", a64 ],
+    ];
+    for (NSString *propName in arrProps) {
+        VTCompressionSessionRef as = NULL;
+        NSDictionary *aspec = @{ @"EnableUserRefForFacetime": @YES };
+        if (VTCompressionSessionCreate(kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
+                                       (__bridge CFDictionaryRef)aspec, NULL, NULL,
+                                       NULL, NULL, &as) == noErr && as) {
+            NSMutableArray *resParts = [NSMutableArray array];
+            for (NSArray *pair in shapes) {
+                NSString *tag = pair[0];
+                NSArray *val = pair[1];
+                OSStatus st = VTSessionSetProperty(as, (__bridge CFStringRef)propName, (__bridge CFTypeRef)val);
+                CFTypeRef rb = NULL;
+                CFIndex rbCnt = -1;
+                if (VTSessionCopyProperty(as, (__bridge CFStringRef)propName, kCFAllocatorDefault, &rb) == noErr && rb) {
+                    if (CFGetTypeID(rb) == CFArrayGetTypeID()) rbCnt = CFArrayGetCount((CFArrayRef)rb);
+                    CFRelease(rb);
+                }
+                [resParts addObject:[NSString stringWithFormat:@"%@=%d(rb=%ld)", tag, (int)st, (long)rbCnt]];
+            }
+            KPH9OutAppend(log, @"  arrProp[%@]: %@\n", propName, [resParts componentsJoinedByString:@" "]);
+            KPH9SafeTeardown(as);
+        }
+    }
+
     CVPixelBufferRelease(px);
 }
 
 static CVPixelBufferRef KPH9CreatePixelBuffer(int width, int height) {
     CVPixelBufferRef pb = NULL;
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey : @{}
+    };
     if (CVPixelBufferCreate(kCFAllocatorDefault, width, height,
                             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                            NULL, &pb) == kCVReturnSuccess && pb) {
+                            (__bridge CFDictionaryRef)attrs, &pb) == kCVReturnSuccess && pb) {
         CVPixelBufferLockBaseAddress(pb, 0);
         memset(CVPixelBufferGetBaseAddressOfPlane(pb, 0), 0x40,
                CVPixelBufferGetBytesPerRowOfPlane(pb, 0) * (size_t)height);
@@ -1131,6 +1220,8 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             for (int i = 0; i < 4; i++) {
                 int ntl = ntlVals[i];
                 uint64_t x0 = ((uint64_t)(uint32_t)(ntl - 16463) << 32) | 0x59ULL;
+                Stage6ProbeResult *res = Stage6AllocResult();
+                if (!res) continue;
                 NSDictionary *spec = @{
                     @"EncoderUsage": @1,
                     @"NumberOfTemporalLayers": @(ntl),
@@ -1140,9 +1231,10 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                 OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720,
                                                          kCMVideoCodecType_HEVC,
                                                          (__bridge CFDictionaryRef)spec,
-                                                         NULL, NULL, NULL, NULL, &s);
+                                                         NULL, NULL, Stage6OutputCallback, res, &s);
                 if (st != noErr || !s) {
                     KPH9OutAppend(out, @"  60/15 NTL=%-5d create=%d\n", ntl, (int)st);
+                    free(res);
                     continue;
                 }
                 VTSessionSetProperty(s, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
@@ -1167,15 +1259,20 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                 OSStatus enc = -1;
                 if (pb) {
                     enc = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                    int w0 = 0;
+                    while (res->cbCount < 1 && w0 < 80) { usleep(2000); w0 += 2; }
                 }
-                KPH9OutAppend(out, @"  60/15 NTL=%-5d x0=0x%016llx prep=%d PRE=%d POST=%d enc=%d\n",
-                              ntl, x0, (int)prep, pre, post, (int)enc);
-                KPH9SafeTeardown(s);
+                @synchronized ([KPH9EncoderModule class]) {
+                    res->closed = 1;
+                    KPH9OutAppend(out, @"  60/15 NTL=%-5d x0=0x%016llx prep=%d PRE=%d POST=%d enc=%d | %s\n",
+                                  ntl, x0, (int)prep, pre, post, (int)enc, res->first);
+                }
+                KPH9SafeTeardownEx(s, NULL, res);
             }
 
-            KPH9OutAppend(out, @"  [2B: raw EncoderUsage=1 without BaseLayerFrameRate -> encode[0] VPS/SPS & POST_ENC audit]\n");
-            int rawVals[] = { 3, 8, 16, 16000, 16447, 16462 };
-            for (int i = 0; i < 6; i++) {
+            KPH9OutAppend(out, @"  [2B: raw EncoderUsage=1 without BaseLayerFrameRate (IOSurface-backed pb, RealTime=YES)]\n");
+            int rawVals[] = { 2, 3, 4, 7, 8, 16000, 16447, 16462 };
+            for (int i = 0; i < 8; i++) {
                 int ntl = rawVals[i];
                 uint64_t x0 = ((uint64_t)(uint32_t)(ntl - 16463) << 32) | 0x59ULL;
                 Stage6ProbeResult *res = Stage6AllocResult();
@@ -1191,7 +1288,8 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                     continue;
                 }
                 OSStatus uSt = VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
-                VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
+                VTSessionSetProperty(s, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
+                VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
                 OSStatus nSt = VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
                 int pre = -1, post = -1, postEnc = -1;
                 CFNumberRef rb = NULL;
@@ -1205,9 +1303,9 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                     CFNumberGetValue(rb, kCFNumberIntType, &post);
                     CFRelease(rb);
                 }
-                OSStatus enc = -1;
-                if (pb) {
-                    enc = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                NSString *encStr = @"deferred";
+                if (pb && ntl <= 8) {
+                    OSStatus enc = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
                     int w0 = 0;
                     while (res->cbCount < 1 && w0 < 80) { usleep(2000); w0 += 2; }
                     rb = NULL;
@@ -1215,18 +1313,19 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                         CFNumberGetValue(rb, kCFNumberIntType, &postEnc);
                         CFRelease(rb);
                     }
+                    encStr = [NSString stringWithFormat:@"%d(POST_ENC=%d)", (int)enc, postEnc];
                 }
                 @synchronized ([KPH9EncoderModule class]) {
                     res->closed = 1;
-                    KPH9OutAppend(out, @"  raw   NTL=%-5d x0=0x%016llx usage=%d set=%d PRE=%d prep=%d POST=%d enc=%d POST_ENC=%d | %s\n",
-                                  ntl, x0, (int)uSt, (int)nSt, pre, (int)prep, post, (int)enc, postEnc, res->first);
+                    KPH9OutAppend(out, @"  raw   NTL=%-5d x0=0x%016llx usage=%d set=%d PRE=%d prep=%d POST=%d enc=%@ | %s\n",
+                                  ntl, x0, (int)uSt, (int)nSt, pre, (int)prep, post, encStr, res->first);
                 }
                 KPH9SafeTeardownEx(s, NULL, res);
             }
 
-            KPH9OutAppend(out, @"  [2C: extcal VPS/SPS ladder (EncoderUsage=1 + ExpectedFPS=30/BaseFPS=15 + NTL set post-base)]\n");
-            int extNtls[] = { 2, 3, 4, 7, 8, 16, 16447 };
-            for (int ri = 0; ri < 7; ri++) {
+            KPH9OutAppend(out, @"  [2C: extcal VPS/SPS ladder (ExpectedFPS=30/BaseFPS=15, Usage=0 vs Usage=1, RealTime=NO)]\n");
+            int extNtls[] = { 1, 2, 3, 4, 7, 8 };
+            for (int ri = 0; ri < 6; ri++) {
                 int ntl = extNtls[ri];
                 Stage6ProbeResult *res = Stage6AllocResult();
                 if (!res) continue;
@@ -1235,15 +1334,13 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                                                kCMVideoCodecType_HEVC,
                                                NULL, NULL, NULL,
                                                Stage6OutputCallback, res, &s) == noErr && s) {
-                    OSStatus uSt = VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
                     VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
                     VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
                     VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
                     VTSessionSetProperty(s, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@30);
-                    VTSessionSetProperty(s, kVTCompressionPropertyKey_BaseLayerFrameRate, (__bridge CFNumberRef)@15);
+                    VTSessionSetProperty(s, kVTCompressionPropertyKey_BaseLayerFrameRate, (__bridge CFNumberRef)(@(30 / (ntl > 0 ? ntl : 1))));
                     OSStatus nSt = VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
                     OSStatus prep = VTCompressionSessionPrepareToEncodeFrames(s);
-                    OSStatus nPostSt = VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
                     int post = -1;
                     CFNumberRef rb = NULL;
                     if (VTSessionCopyProperty(s, CFSTR("NumberOfTemporalLayers"), NULL, &rb) == noErr && rb) {
@@ -1258,8 +1355,8 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                     }
                     @synchronized ([KPH9EncoderModule class]) {
                         res->closed = 1;
-                        KPH9OutAppend(out, @"  ext   NTL=%-5d usage=%d ntlSet=%d/%d prep=%d POST=%d enc=%d | %s\n",
-                                      ntl, (int)uSt, (int)nSt, (int)nPostSt, (int)prep, post, (int)enc, res->first);
+                        KPH9OutAppend(out, @"  ext   NTL=%-5d ntlSet=%d prep=%d POST=%d enc=%d | %s\n",
+                                      ntl, (int)nSt, (int)prep, post, (int)enc, res->first);
                     }
                     KPH9SafeTeardownEx(s, NULL, res);
                 } else {
