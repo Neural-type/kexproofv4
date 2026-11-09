@@ -279,11 +279,16 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
         if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, 2, &ppsPtr, &ppsSize, NULL, NULL) == noErr && ppsPtr) {
             ppsHex = [NSString stringWithFormat:@"%zu:%@", ppsSize, HexDumpSlice(ppsPtr, ppsSize, 16)];
             if (paramCount > 3) {
-                const uint8_t *ppsLast = NULL;
-                size_t ppsLastSz = 0;
-                if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, paramCount - 1, &ppsLast, &ppsLastSz, NULL, NULL) == noErr && ppsLast) {
-                    ppsHex = [NSString stringWithFormat:@"%@(psLast=%zu:%@)",
-                              ppsHex, ppsLastSz, HexDumpSlice(ppsLast, ppsLastSz, 12)];
+                NSMutableArray *extraPps = [NSMutableArray array];
+                for (size_t pi = 3; pi < paramCount && pi < 12; pi++) {
+                    const uint8_t *pExtra = NULL;
+                    size_t pExtraSz = 0;
+                    if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, pi, &pExtra, &pExtraSz, NULL, NULL) == noErr && pExtra) {
+                        [extraPps addObject:[NSString stringWithFormat:@"ps%zu=%zu:%@", pi, pExtraSz, HexDumpSlice(pExtra, pExtraSz, 10)]];
+                    }
+                }
+                if (extraPps.count > 0) {
+                    ppsHex = [NSString stringWithFormat:@"%@(%@)", ppsHex, [extraPps componentsJoinedByString:@","]];
                 }
             }
         }
@@ -1124,7 +1129,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             }
 
             // Value boundaries for MVHEVCVideoLayerIDs & RequiredMVHEVC* (active when MVHEVCVideoLayerIDs=[0,1])
-            int mvVals[] = { 0, 1, 2, 7, 12, 13, 15, 16, 31, 62, 63, 64, 255, 256, 65535, -1 };
+            int mvVals[] = { 0, 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 31, 62, 63, 64, 65, 127, 128, 255, 256, 65535, -1 };
             NSMutableArray *mvLayerParts = [NSMutableArray array];
             for (size_t mi = 0; mi < sizeof(mvVals) / sizeof(mvVals[0]); mi++) {
                 int v = mvVals[mi];
@@ -1201,7 +1206,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
 
     // 7F: VTDecompressionSession RequestedMVHEVCVideoLayerIDs validation & DecodeFrame audit
     // Tests both the 1-layer (24B VPS) and 2-layer (39B VPS with vps_max_layers_minus1=1, alpha=3) streams,
-    // including a c[none] baseline where RequestedMVHEVCVideoLayerIDs is NOT set.
+    // including a c[none] baseline where RequestedMVHEVCVideoLayerIDs is NOT set, plus non-zero 2-element arrays.
     KPH9OutAppend(log, @"  [7F: VTDecompressionSession RequestedMVHEVCVideoLayerIDs Validation & DecodeFrame Audit]\n");
     {
         CMFormatDescriptionRef fmt1 = NULL, fmt2 = NULL;
@@ -1224,9 +1229,12 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             @[ @"c[0]",       @[ @0 ] ],
             @[ @"c[0,1]",     @[ @0, @1 ] ],
             @[ @"c[0,3]",     @[ @0, @3 ] ],
+            @[ @"c[3,0]",     @[ @3, @0 ] ],
+            @[ @"c[1,3]",     @[ @1, @3 ] ],
             @[ @"c[3]",       @[ @3 ] ],
             @[ @"c[63]",      @[ @63 ] ],
             @[ @"c[64]",      @[ @64 ] ],
+            @[ @"c[63,64]",   @[ @63, @64 ] ],
             @[ @"c[0,64]",    @[ @0, @64 ] ],
             @[ @"c[0..63]",   seq64 ],
             @[ @"c[0..299]",  seq300 ],
@@ -1310,25 +1318,34 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
     }
 
     // 7G: Bounded per-session Bitstream Audit:
-    //   1) UserParameterSetsIds + ChromaQPIndexOffsetMultiPPS (CFArray<CFNumber>) with distinct PPS IDs (0..63)
-    //   2) RepFormat (RequiredHEVCSequenceParameterSetRepFormatIndex + BitDepths + ChromaFormatIdcs), log2_max_minus4 & MVHEVC
-    //   3) Single-variable bisection of the (sps, pps, alpha) stall between (31, 127, 16) and (255, 255, 63)
-    KPH9OutAppend(log, @"  [7G: MultiPPS ChromaQP, RepFormat, log2_max_minus4 & Single-Var Stall Bisection (Bounded 900ms per case)]\n");
-    int testPsLens[] = { 3, 4, 8, 10, 11 };
+    //   1) UserParameterSetsIds + ChromaQPIndexOffsetMultiPPS (CFArray<CFNumber> of 2*(plen-2) cb/cr pairs)
+    //      Strictly capped at plen <= 10 (iNumPPS <= 8 < 9) because AppleAVE2 #810 at 0xfffffff0085dc83c
+    //      checks [x21, #0x510] < 9 and returns -0x3e9 at plen >= 11, which wedges videocodecd!
+    //   2) RepFormat (RequiredHEVCSequenceParameterSetRepFormatIndex + BitDepths + ChromaFormatIdcs),
+    //      log2_max_minus4 (0,6,7,8,10,11), EncodesAuxiliaryWithAuxID (1,64), MVHEVCViewIDs & MVHEVCVideoLayerIDs
+    //   3) Single-variable bisection of the (sps, pps, alpha) stall at the very end
+    KPH9OutAppend(log, @"  [7G: MultiPPS ChromaQP (n<=10), RepFormat, log2_max_minus4, AuxID & Single-Var Stall Bisection]\n");
+    int testPsLens[] = { 3, 4, 6, 8, 10 };
     for (size_t ti = 0; ti < sizeof(testPsLens) / sizeof(testPsLens[0]); ti++) {
         int plen = testPsLens[ti];
+        int numPps = plen - 2;
         NSMutableArray *pArr = [NSMutableArray arrayWithCapacity:(NSUInteger)plen];
-        NSMutableArray *cqpArr = [NSMutableArray array];
+        NSMutableArray *cqpArr = [NSMutableArray arrayWithCapacity:(NSUInteger)(2 * numPps)];
         for (int k = 0; k < plen; k++) {
-            // slot0 (vps_id) & slot1 (sps_id) in 1..15; slot2..slot20 (pps_id) strictly distinct in 1..63!
+            // slot0 (vps_id) & slot1 (sps_id) in 1..15; slot2..slot9 (pps_id) strictly distinct in 1..63!
             int val = (k < 2) ? ((plen + k * 3) % 15 + 1) : (k - 1);
             [pArr addObject:@(val)];
             if (k >= 2) {
-                [cqpArr addObject:@((k - 2) % 7 - 3)];
+                int ppsIdx = k - 2;
+                int cbOff = (ppsIdx * 2) % 13 - 6;     // in -6..+6 (valid -12..+12)
+                int crOff = (ppsIdx * 2 + 1) % 13 - 6; // in -6..+6 (valid -12..+12)
+                [cqpArr addObject:@(cbOff)];
+                [cqpArr addObject:@(crOff)];
             }
         }
         dispatch_semaphore_t psSem = dispatch_semaphore_create(0);
         __block OSStatus stU = -999, stCqp = -999, prep = -999, enc = -999;
+        __block CFIndex rbPsCnt = -1, rbCqpCnt = -1;
         __block const char *phase = "init";
         __block NSString *cbFirst = @"(no cb)";
         Stage6ProbeResult *uRes = Stage6AllocResult();
@@ -1346,6 +1363,15 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 phase = "set";
                 stU   = VTSessionSetProperty(us, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr);
                 stCqp = VTSessionSetProperty(us, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpArr);
+                CFTypeRef rbPs = NULL, rbCqp = NULL;
+                if (VTSessionCopyProperty(us, CFSTR("UserParameterSetsIds"), kCFAllocatorDefault, &rbPs) == noErr && rbPs) {
+                    if (CFGetTypeID(rbPs) == CFArrayGetTypeID()) rbPsCnt = CFArrayGetCount((CFArrayRef)rbPs);
+                    CFRelease(rbPs);
+                }
+                if (VTSessionCopyProperty(us, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbCqp) == noErr && rbCqp) {
+                    if (CFGetTypeID(rbCqp) == CFArrayGetTypeID()) rbCqpCnt = CFArrayGetCount((CFArrayRef)rbCqp);
+                    CFRelease(rbCqp);
+                }
                 phase = "prep";
                 prep = VTCompressionSessionPrepareToEncodeFrames(us);
                 phase = "enc";
@@ -1373,13 +1399,14 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                           plen, [pArr componentsJoinedByString:@","], phase, (int)stU, (int)stCqp, (int)prep, (int)enc);
             break;
         } else {
-            KPH9OutAppend(log, @"  psIdsEncode[n=%-2d ids=%@]: set=%d cqp=%d prep=%d enc=%d | %@\n",
-                          plen, [pArr componentsJoinedByString:@","], (int)stU, (int)stCqp, (int)prep, (int)enc, cbFirst);
+            KPH9OutAppend(log, @"  psIdsEncode[n=%-2d ids=%@]: set=%d(rb=%ld) cqp=%d(rb=%ld) prep=%d enc=%d | %@\n",
+                          plen, [pArr componentsJoinedByString:@","],
+                          (int)stU, (long)rbPsCnt, (int)stCqp, (long)rbCqpCnt, (int)prep, (int)enc, cbFirst);
         }
     }
 
-    // Bounded RequiredHEVC* / RepFormat* / log2_max_minus4 / MVHEVC* + single-variable (alpha, sps, pps) stall bisection
-    // Safe RepFormat, log2_max_minus4 & MVHEVC cases run FIRST before the single-variable high-ID bisection!
+    // Bounded RequiredHEVC* / RepFormat* / log2_max_minus4 / AuxID / MVHEVCViewIDs + single-variable (alpha, sps, pps) stall bisection
+    // Safe RepFormat, log2_max_minus4, AuxID & MVHEVC cases run FIRST before the single-variable high-ID bisection!
     typedef struct {
         const char *label;
         int spsId;
@@ -1389,37 +1416,50 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         int bitDepth;
         int chromaIdc;
         int log2MaxM4;
+        int auxId;
+        int viewId1;
         int mvLayer1;
     } ReqHEVCCase;
     ReqHEVCCase reqCases[] = {
-        // 1) Safe RepFormat, log2_max_minus4 & MVHEVC probes first (guaranteed to run before any stall)
-        { "repIdx=0,bd=8,ch=1,a=3",       5,   9,   3,    0,   8,   1, -99, -99 },
-        { "repIdx=1,bd=10,ch=2,a=3",      5,   9,   3,    1,  10,   2, -99, -99 },
-        { "repIdx=15,bd=16,ch=3,a=3",     5,   9,   3,   15,  16,   3, -99, -99 },
-        { "repIdx=255,bd=255,ch=255",     5,   9,   3,  255, 255, 255, -99, -99 },
-        { "log2MaxM4=0,sps=5,pps=9",      5,   9,   3,  -99, -99, -99,   0, -99 },
-        { "log2MaxM4=12,sps=5,pps=9",     5,   9,   3,  -99, -99, -99,  12, -99 },
-        { "log2MaxM4=16,sps=5,pps=9",     5,   9,   3,  -99, -99, -99,  16, -99 },
-        { "mvLayer=[0,1],sps=5,pps=9",    5,   9,   3,  -99,   8,   1, -99,   1 },
-        { "mvLayer=[0,63],sps=5,pps=9",   5,   9,  63,  -99,   8,   1, -99,  63 },
-        // 2) Single-variable bisection between (sps=31,pps=127,alpha=16)=OK and (sps=255,pps=255,alpha=63)=STALL:
+        // 1) Safe 8-bit 4:2:0 RepFormatIndex probes (27.2 #810 added [x20,#0x2c10] <= 16)
+        { "repIdx=0,bd=8,ch=1,a=3",        5,   9,   3,    0,   8,   1, -99, -99, -99, -99 },
+        { "repIdx=1,bd=8,ch=1,a=3",        5,   9,   3,    1,   8,   1, -99, -99, -99, -99 },
+        { "repIdx=16,bd=8,ch=1,a=3",       5,   9,   3,   16,   8,   1, -99, -99, -99, -99 },
+        { "repIdx=255,bd=8,ch=1,a=3",      5,   9,   3,  255,   8,   1, -99, -99, -99, -99 },
+        // 2) log2_max_minus4 probes (27.2 #810 added [x20,#0x1888] <= 6; 27.0.1 VTSessionSetProperty accepted 0..7+)
+        { "log2MaxM4=0,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   0, -99, -99, -99 },
+        { "log2MaxM4=6,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   6, -99, -99, -99 },
+        { "log2MaxM4=7,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   7, -99, -99, -99 },
+        { "log2MaxM4=8,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   8, -99, -99, -99 },
+        { "log2MaxM4=10,sps=5,pps=9",      5,   9,   3,  -99, -99, -99,  10, -99, -99, -99 },
+        // 3) EncodesAuxiliaryWithAuxID (1..64 accepted in 7E) & MVHEVCViewIDs (unbounded int32 in 7E)
+        { "auxId=1,sps=5,pps=9,a=3",       5,   9,   3,  -99, -99, -99, -99,   1, -99, -99 },
+        { "auxId=64,sps=5,pps=9,a=3",      5,   9,   3,  -99, -99, -99, -99,  64, -99, -99 },
+        { "viewIds=[0,255],sps=5,pps=9",   5,   9,   3,  -99, -99, -99, -99, -99, 255, -99 },
+        // 4) 2-layer MV-HEVC PrepareToEncodeFrames probes (enc=-111, never blocks EncodeFrame)
+        { "mvLayer=[0,1],sps=5,pps=9",     5,   9,   3,  -99,   8,   1, -99, -99,   1,   1 },
+        { "mvLayer=[0,63],sps=5,pps=9",    5,   9,  63,  -99,   8,   1, -99, -99, 255,  63 },
+        // 5) Non-8-bit / non-4:2:0 RepFormat BitDepths & ChromaFormatIdcs (27.2 #809 checks bd==8, ch==1)
+        { "repIdx=1,bd=10,ch=2,a=3",       5,   9,   3,    1,  10,   2, -99, -99, -99, -99 },
+        { "repIdx=15,bd=16,ch=3,a=3",      5,   9,   3,   15,  16,   3, -99, -99, -99, -99 },
+        { "repIdx=255,bd=255,ch=255",      5,   9,   3,  255, 255, 255, -99, -99, -99, -99 },
+        // 6) Single-variable bisection between (sps=31,pps=127,alpha=16)=OK and (sps=255,pps=255,alpha=63)=STALL:
         //    First vary alpha alone (sps=5, pps=9):
-        { "bisect-alpha=31(sps=5,pps=9)", 5,   9,  31,  -99, -99, -99, -99, -99 },
-        { "bisect-alpha=62(sps=5,pps=9)", 5,   9,  62,  -99, -99, -99, -99, -99 },
-        { "bisect-alpha=63(sps=5,pps=9)", 5,   9,  63,  -99, -99, -99, -99, -99 },
-        { "bisect-alpha=64(sps=5,pps=9)", 5,   9,  64,  -99, -99, -99, -99, -99 },
+        { "bisect-alpha=31(sps=5,pps=9)",  5,   9,  31,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-alpha=62(sps=5,pps=9)",  5,   9,  62,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-alpha=63(sps=5,pps=9)",  5,   9,  63,  -99, -99, -99, -99, -99, -99, -99 },
         //    Next vary sps alone (pps=9, alpha=3):
-        { "bisect-sps=63(pps=9,a=3)",    63,   9,   3,  -99, -99, -99, -99, -99 },
-        { "bisect-sps=64(pps=9,a=3)",    64,   9,   3,  -99, -99, -99, -99, -99 },
-        { "bisect-sps=255(pps=9,a=3)",  255,   9,   3,  -99, -99, -99, -99, -99 },
+        { "bisect-sps=63(pps=9,a=3)",     63,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-sps=64(pps=9,a=3)",     64,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-sps=255(pps=9,a=3)",   255,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
         //    Next vary pps alone (sps=5, alpha=3):
-        { "bisect-pps=128(sps=5,a=3)",    5, 128,   3,  -99, -99, -99, -99, -99 },
-        { "bisect-pps=255(sps=5,a=3)",    5, 255,   3,  -99, -99, -99, -99, -99 },
+        { "bisect-pps=128(sps=5,a=3)",     5, 128,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-pps=255(sps=5,a=3)",     5, 255,   3,  -99, -99, -99, -99, -99, -99, -99 },
     };
     for (size_t rci = 0; rci < sizeof(reqCases) / sizeof(reqCases[0]); rci++) {
         ReqHEVCCase rc = reqCases[rci];
         dispatch_semaphore_t rcSem = dispatch_semaphore_create(0);
-        __block OSStatus stSps = -999, stPps = -999, stAlpha = -999, stRep = -999, stLog2 = -999, prepSt = -999, encSt = -999;
+        __block OSStatus stSps = -999, stPps = -999, stAlpha = -999, stRep = -999, stLog2 = -999, stAux = -999, prepSt = -999, encSt = -999;
         __block const char *phase = "init";
         __block NSString *cbFirst = @"(no cb)";
         Stage6ProbeResult *reqRes = Stage6AllocResult();
@@ -1456,6 +1496,13 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 if (rc.log2MaxM4 != -99) {
                     stLog2 = VTSessionSetProperty(reqS, CFSTR("log2_max_minus4"), (__bridge CFNumberRef)@(rc.log2MaxM4));
                 }
+                if (rc.auxId != -99) {
+                    stAux = VTSessionSetProperty(reqS, CFSTR("EncodesAuxiliaryWithAuxID"), (__bridge CFNumberRef)@(rc.auxId));
+                }
+                if (rc.viewId1 != -99) {
+                    VTSessionSetProperty(reqS, CFSTR("MVHEVCViewIDs"), (__bridge CFTypeRef)@[ @0, @(rc.viewId1) ]);
+                    VTSessionSetProperty(reqS, CFSTR("MVHEVCLeftAndRightViewIDs"), (__bridge CFTypeRef)@[ @0, @(rc.viewId1) ]);
+                }
                 phase = "prep";
                 prepSt = VTCompressionSessionPrepareToEncodeFrames(reqS);
                 phase = "enc";
@@ -1483,12 +1530,12 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             if (pxHold) CVPixelBufferRelease(pxHold);
         });
         if (dispatch_semaphore_wait(rcSem, dispatch_time(DISPATCH_TIME_NOW, 900 * (int64_t)NSEC_PER_MSEC)) != 0) {
-            KPH9OutAppend(log, @"  reqHEVC[%s]: STALLED at phase=%s (set=%d/%d/%d rep=%d log2=%d prep=%d enc=%d) — stopping reqHEVC ladder\n",
-                          rc.label, phase, (int)stSps, (int)stPps, (int)stAlpha, (int)stRep, (int)stLog2, (int)prepSt, (int)encSt);
+            KPH9OutAppend(log, @"  reqHEVC[%s]: STALLED at phase=%s (set=%d/%d/%d rep=%d log2=%d aux=%d prep=%d enc=%d) — stopping reqHEVC ladder\n",
+                          rc.label, phase, (int)stSps, (int)stPps, (int)stAlpha, (int)stRep, (int)stLog2, (int)stAux, (int)prepSt, (int)encSt);
             break;
         } else {
-            KPH9OutAppend(log, @"  reqHEVC[%s]: set=%d/%d/%d rep=%d log2=%d prep=%d enc=%d | %@\n",
-                          rc.label, (int)stSps, (int)stPps, (int)stAlpha, (int)stRep, (int)stLog2, (int)prepSt, (int)encSt, cbFirst);
+            KPH9OutAppend(log, @"  reqHEVC[%s]: set=%d/%d/%d rep=%d log2=%d aux=%d prep=%d enc=%d | %@\n",
+                          rc.label, (int)stSps, (int)stPps, (int)stAlpha, (int)stRep, (int)stLog2, (int)stAux, (int)prepSt, (int)encSt, cbFirst);
         }
     }
 
@@ -1686,7 +1733,8 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                       (int)stPre2x2Bool, (int)stPre2x2Num, (int)stPre2x0Empty, (int)stPreArr4);
 
         // 7A proved ChromaQPIndexOffsetMultiPPS is CFArray<CFNumber> (tid=19, PropertyType=Number), NOT NSString!
-        int cqpCounts[] = { 1, 2, 4, 8, 9, 10, 16, 17, 32, 64 };
+        // Accepts even counts 2, 4, 6, 8, 10, 12, 14, 16 (up to 8 (cb_qp_offset, cr_qp_offset) pairs in -12..+12).
+        int cqpCounts[] = { 1, 2, 4, 6, 8, 10, 12, 14, 16, 17, 18, 32 };
         NSMutableArray *cqpParts = [NSMutableArray array];
         for (size_t ci = 0; ci < sizeof(cqpCounts) / sizeof(cqpCounts[0]); ci++) {
             int cn = cqpCounts[ci];
@@ -1702,8 +1750,9 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             [cqpParts addObject:[NSString stringWithFormat:@"n%d=%d(rb=%ld)", cn, (int)cqpSt, (long)cqpRbCnt]];
         }
         KPH9OutAppend(out, @"  ChromaQPIndexOffsetMultiPPS(CFArray<CFNumber>) @pre: %@\n", [cqpParts componentsJoinedByString:@" "]);
-        // Reset ChromaQPIndexOffsetMultiPPS to empty array before Stage 1 encode
-        VTSessionSetProperty(s, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)@[]);
+        // Reset UserParameterSetsIds & ChromaQPIndexOffsetMultiPPS to clean 1-PPS state before Stage 1 encode
+        VTSessionSetProperty(s, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @0, @0, @0 ]);
+        VTSessionSetProperty(s, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)@[ @0, @0 ]);
 
         OSStatus prep = VTCompressionSessionPrepareToEncodeFrames(s);
         KPH9OutAppend(out, @"  prepare -> %d\n", (int)prep);
