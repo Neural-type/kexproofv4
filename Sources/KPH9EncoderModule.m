@@ -159,6 +159,8 @@ typedef struct {
     char target[512]; // pinned post-update frame callback (matched via sourceFrameRefCon)
 } Stage6ProbeResult;
 
+static CMFormatDescriptionRef gLastCapturedHEVCFmt = NULL;
+
 static Stage6ProbeResult *Stage6AllocResult(void) {
     Stage6ProbeResult *res = (Stage6ProbeResult *)calloc(1, sizeof(Stage6ProbeResult));
     if (res) {
@@ -271,6 +273,14 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
         }
         if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, 2, &ppsPtr, &ppsSize, NULL, NULL) == noErr && ppsPtr) {
             ppsHex = [NSString stringWithFormat:@"%zu:%@", ppsSize, HexDumpSlice(ppsPtr, ppsSize, 12)];
+            if (paramCount > 3) {
+                const uint8_t *ppsLast = NULL;
+                size_t ppsLastSz = 0;
+                if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, paramCount - 1, &ppsLast, &ppsLastSz, NULL, NULL) == noErr && ppsLast) {
+                    ppsHex = [NSString stringWithFormat:@"%@(psLast=%zu:%@)",
+                              ppsHex, ppsLastSz, HexDumpSlice(ppsLast, ppsLastSz, 8)];
+                }
+            }
         }
     }
     CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sampleBuffer);
@@ -284,6 +294,9 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
         }
     }
     @synchronized ([KPH9EncoderModule class]) {
+        if (fmt && !gLastCapturedHEVCFmt) {
+            gLastCapturedHEVCFmt = (CMFormatDescriptionRef)CFRetain(fmt);
+        }
         if (res->closed) return;
         res->cbCount++;
         res->lastStatus = status;
@@ -1074,65 +1087,150 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 [valParts addObject:[NSString stringWithFormat:@"v%d=%d", v, (int)st]];
             }
             KPH9OutAppend(log, @"  UserParameterSetsIds[val x4]: %@\n", [valParts componentsJoinedByString:@" "]);
+
+            // Value boundaries for MVHEVCVideoLayerIDs & RequiredMVHEVC* (active when MVHEVCVideoLayerIDs=[0,1])
+            int mvVals[] = { 0, 1, 2, 7, 15, 16, 31, 62, 63, 64, 255, -1 };
+            NSMutableArray *mvLayerParts = [NSMutableArray array];
+            for (size_t mi = 0; mi < sizeof(mvVals) / sizeof(mvVals[0]); mi++) {
+                int v = mvVals[mi];
+                OSStatus st = VTSessionSetProperty(ps, CFSTR("MVHEVCVideoLayerIDs"), (__bridge CFTypeRef)@[ @0, @(v) ]);
+                [mvLayerParts addObject:[NSString stringWithFormat:@"v%d=%d", v, (int)st]];
+            }
+            KPH9OutAppend(log, @"  MVHEVCVideoLayerIDs[0,v]: %@\n", [mvLayerParts componentsJoinedByString:@" "]);
+
+            VTSessionSetProperty(ps, CFSTR("MVHEVCVideoLayerIDs"), (__bridge CFTypeRef)@[ @0, @1 ]);
+            NSArray<NSString *> *mvReqProps = @[
+                @"RequiredMVHEVCSequenceParameterSetIDs",
+                @"RequiredMVHEVCPictureParameterSetIDs",
+                @"RequiredMVHEVCVideoParameterSetAlphaVideoLayerIDs",
+                @"RequiredHEVCVideoParameterSetRepFormatBitDepths",
+                @"RequiredHEVCVideoParameterSetRepFormatChromaFormatIdcs",
+            ];
+            for (NSString *mp in mvReqProps) {
+                NSMutableArray *mpParts = [NSMutableArray array];
+                for (size_t mi = 0; mi < sizeof(mvVals) / sizeof(mvVals[0]); mi++) {
+                    int v = mvVals[mi];
+                    OSStatus st = VTSessionSetProperty(ps, (__bridge CFStringRef)mp, (__bridge CFTypeRef)@[ @0, @(v) ]);
+                    [mpParts addObject:[NSString stringWithFormat:@"v%d=%d", v, (int)st]];
+                }
+                KPH9OutAppend(log, @"  %@[0,v]: %@\n", mp, [mpParts componentsJoinedByString:@" "]);
+            }
+
+            // Scalar RequiredHEVC* properties discovered in 7A
+            VTSessionSetProperty(ps, CFSTR("MVHEVCVideoLayerIDs"), (__bridge CFTypeRef)@[ @0 ]);
+            NSArray<NSString *> *scalarReqProps = @[
+                @"RequiredHEVCSequenceParameterSetID",
+                @"RequiredHEVCPictureParameterSetID",
+                @"RequiredHEVCSequenceParameterSetRepFormatIndex",
+                @"RequiredHEVCVideoParameterSetAlphaLayerID",
+            ];
+            for (NSString *spName in scalarReqProps) {
+                NSMutableArray *spParts = [NSMutableArray array];
+                for (size_t mi = 0; mi < sizeof(mvVals) / sizeof(mvVals[0]); mi++) {
+                    int v = mvVals[mi];
+                    OSStatus st = VTSessionSetProperty(ps, (__bridge CFStringRef)spName, (__bridge CFNumberRef)@(v));
+                    [spParts addObject:[NSString stringWithFormat:@"v%d=%d", v, (int)st]];
+                }
+                KPH9OutAppend(log, @"  scalarProp[%@]: %@\n", spName, [spParts componentsJoinedByString:@" "]);
+            }
             KPH9SafeTeardown(ps);
         }
     }
 
     // 7F: VTDecompressionSession RequestedMVHEVCVideoLayerIDs validation audit (Runner.swift stage21)
-    // Run BEFORE psIdsEncode so any per-session stall in MultiPPS never starves 7F.
+    // Uses the live hardware CMFormatDescriptionRef captured in Stage6OutputCallback (with fallback)
+    // so VTDecompressionSessionCreate always runs and logs.
     KPH9OutAppend(log, @"  [7F: VTDecompressionSession RequestedMVHEVCVideoLayerIDs Validation Audit]\n");
     {
         CMFormatDescriptionRef capturedFmt = NULL;
-        uint8_t vps0[] = { 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x5d, 0xac, 0x59, 0x00 };
-        uint8_t sps0[] = { 0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x5d, 0xa0, 0x0f, 0x08, 0x09, 0x16, 0x59, 0x59, 0xa4, 0x93, 0x20 };
-        uint8_t pps0[] = { 0x44, 0x01, 0xc0, 0x2c, 0xbc, 0x14, 0xc9 };
-        const uint8_t *psPtrs[] = { vps0, sps0, pps0 };
-        const size_t psSizes[] = { sizeof(vps0), sizeof(sps0), sizeof(pps0) };
-        if (CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault, 3, psPtrs, psSizes, 4, NULL, &capturedFmt) == noErr && capturedFmt) {
+        @synchronized ([KPH9EncoderModule class]) {
+            if (gLastCapturedHEVCFmt) {
+                capturedFmt = (CMFormatDescriptionRef)CFRetain(gLastCapturedHEVCFmt);
+            }
+        }
+        OSStatus fmtSt = noErr;
+        BOOL usedLiveFmt = (capturedFmt != NULL);
+        if (!capturedFmt) {
+            fmtSt = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_HEVC, 192, 144, NULL, &capturedFmt);
+        }
+        if (capturedFmt) {
             NSMutableArray *seq64 = [NSMutableArray arrayWithCapacity:64];
             NSMutableArray *seq300 = [NSMutableArray arrayWithCapacity:300];
             for (int i = 0; i < 64; i++) [seq64 addObject:@(i)];
             for (int i = 0; i < 300; i++) [seq300 addObject:@(i)];
             NSArray *decCases = @[
-                @[ @"c[0,1]",     @[ @0, @1 ] ],
                 @[ @"c[0]",       @[ @0 ] ],
+                @[ @"c[0,1]",     @[ @0, @1 ] ],
                 @[ @"c[63]",      @[ @63 ] ],
                 @[ @"c[64]",      @[ @64 ] ],
                 @[ @"c[0,64]",    @[ @0, @64 ] ],
                 @[ @"c[0..63]",   seq64 ],
                 @[ @"c[0..299]",  seq300 ],
                 @[ @"c[999999]",  @[ @999999 ] ],
+                @[ @"c[-1]",      @[ @(-1) ] ],
             ];
             NSMutableArray *decParts = [NSMutableArray array];
-            for (NSArray *dc in decCases) {
+            NSString *decSuppStr = @"none";
+            for (size_t dci = 0; dci < decCases.count; dci++) {
+                NSArray *dc = decCases[dci];
                 NSString *tag = dc[0];
                 NSArray *ids = dc[1];
                 VTDecompressionSessionRef ds = NULL;
-                if (VTDecompressionSessionCreate(kCFAllocatorDefault, capturedFmt, NULL, NULL, NULL, &ds) == noErr && ds) {
+                OSStatus dsSt = VTDecompressionSessionCreate(kCFAllocatorDefault, capturedFmt, NULL, NULL, NULL, &ds);
+                if (dsSt == noErr && ds) {
+                    if (dci == 0) {
+                        CFDictionaryRef dsupp = NULL;
+                        if (VTSessionCopySupportedPropertyDictionary(ds, &dsupp) == noErr && dsupp) {
+                            NSDictionary *nsDsupp = (__bridge NSDictionary *)dsupp;
+                            NSMutableArray *mKeys = [NSMutableArray array];
+                            for (NSString *dk in [[nsDsupp allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+                                NSString *dkl = [dk lowercaseString];
+                                if ([dkl containsString:@"mvhevc"] || [dkl containsString:@"layer"] ||
+                                    [dkl containsString:@"dpb"] || [dkl containsString:@"rps"]) {
+                                    [mKeys addObject:dk];
+                                }
+                            }
+                            decSuppStr = [NSString stringWithFormat:@"total=%lu match=[%@]",
+                                          (unsigned long)nsDsupp.count, [mKeys componentsJoinedByString:@","]];
+                            CFRelease(dsupp);
+                        }
+                    }
                     OSStatus dst = VTSessionSetProperty(ds, CFSTR("RequestedMVHEVCVideoLayerIDs"), (__bridge CFTypeRef)ids);
-                    [decParts addObject:[NSString stringWithFormat:@"%@=%d", tag, (int)dst]];
+                    CFTypeRef drb = NULL;
+                    CFIndex drbCnt = -1;
+                    if (VTSessionCopyProperty(ds, CFSTR("RequestedMVHEVCVideoLayerIDs"), kCFAllocatorDefault, &drb) == noErr && drb) {
+                        if (CFGetTypeID(drb) == CFArrayGetTypeID()) drbCnt = CFArrayGetCount((CFArrayRef)drb);
+                        CFRelease(drb);
+                    }
+                    [decParts addObject:[NSString stringWithFormat:@"%@=%d(rb=%ld)", tag, (int)dst, (long)drbCnt]];
                     VTDecompressionSessionInvalidate(ds);
                     CFRelease(ds);
                 } else {
-                    [decParts addObject:[NSString stringWithFormat:@"%@=noDec", tag]];
+                    [decParts addObject:[NSString stringWithFormat:@"%@=noDec(%d)", tag, (int)dsSt]];
                 }
             }
+            KPH9OutAppend(log, @"  decSession(liveFmt=%d) supp={%@}\n", usedLiveFmt ? 1 : 0, decSuppStr);
             KPH9OutAppend(log, @"  decProp[RequestedMVHEVCVideoLayerIDs]: %@\n", [decParts componentsJoinedByString:@" "]);
             CFRelease(capturedFmt);
+        } else {
+            KPH9OutAppend(log, @"  decProp[RequestedMVHEVCVideoLayerIDs]: fmtCreate err=%d\n", (int)fmtSt);
         }
     }
 
-    // 7G: Bounded per-session UserParameterSetsIds bitstream audit (n=2, 3, 4, 5, 11, 12, 16)
-    // In HEVC_PPS::GenerateAll (#2897), iNumPPS (w24) is checked against 10 (`cmp w24, #0xa; b.ge -> -0x3e9`).
-    // Each probe runs on its own detached dispatch block with a 1200 ms timeout; if any N stalls
-    // inside PrepareToEncodeFrames/EncodeFrame, we log the exact phase and stop the loop cleanly.
-    KPH9OutAppend(log, @"  [7G: UserParameterSetsIds Bitstream Audit (Bounded 1200ms per N, n=2..16)]\n");
-    int testPsLens[] = { 2, 3, 4, 5, 11, 12, 16 };
+    // 7G: Bounded per-session UserParameterSetsIds & RequiredHEVC* bitstream audit (n=1..10)
+    // Hardware run proved n=11 (iNumPPS=10 -> w24==0xa) hits `cmp w24, #0xa; b.ge -> -0x3e9` in
+    // HEVC_PPS::GenerateAll (#2897) and wedges VTCompressionSessionEncodeFrame at phase=enc.
+    // Here we test fine steps n=1..10 with distinct (vps_id, sps_id, pps_id) tuples per N and
+    // run KPH9SafeTeardownEx BEFORE signaling psSem so teardowns never overlap in videocodecd.
+    KPH9OutAppend(log, @"  [7G: UserParameterSetsIds & RequiredHEVC* Bitstream Audit (Bounded 1200ms per N, n=1..10)]\n");
+    int testPsLens[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
     for (size_t ti = 0; ti < sizeof(testPsLens) / sizeof(testPsLens[0]); ti++) {
         int plen = testPsLens[ti];
         NSMutableArray *pArr = [NSMutableArray arrayWithCapacity:(NSUInteger)plen];
         for (int k = 0; k < plen; k++) {
-            [pArr addObject:@((k + 1) % 16)];
+            int val = (plen + k * 3) % 16;
+            if (val == 0) val = 1;
+            [pArr addObject:@(val)];
         }
         dispatch_semaphore_t psSem = dispatch_semaphore_create(0);
         __block OSStatus stU = -999, prep = -999, enc = -999;
@@ -1163,23 +1261,49 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                     uRes->closed = 1;
                     cbFirst = [NSString stringWithUTF8String:uRes->first] ?: @"(no cb)";
                 }
+                phase = "teardown";
+                KPH9SafeTeardownEx(us, NULL, uRes);
                 phase = "done";
                 dispatch_semaphore_signal(psSem);
-                KPH9SafeTeardownEx(us, NULL, uRes);
             } else {
                 phase = "create-fail";
-                dispatch_semaphore_signal(psSem);
                 free(uRes);
+                dispatch_semaphore_signal(psSem);
             }
             if (pxHold) CVPixelBufferRelease(pxHold);
         });
         if (dispatch_semaphore_wait(psSem, dispatch_time(DISPATCH_TIME_NOW, 1200 * (int64_t)NSEC_PER_MSEC)) != 0) {
-            KPH9OutAppend(log, @"  psIdsEncode[n=%-2d]: STALLED at phase=%s (set=%d prep=%d enc=%d) — stopping 7G ladder\n",
-                          plen, phase, (int)stU, (int)prep, (int)enc);
+            KPH9OutAppend(log, @"  psIdsEncode[n=%-2d ids=%@]: STALLED at phase=%s (set=%d prep=%d enc=%d) — stopping 7G ladder\n",
+                          plen, [pArr componentsJoinedByString:@","], phase, (int)stU, (int)prep, (int)enc);
             break;
         } else {
-            KPH9OutAppend(log, @"  psIdsEncode[n=%-2d]: set=%d prep=%d enc=%d | %@\n",
-                          plen, (int)stU, (int)prep, (int)enc, cbFirst);
+            KPH9OutAppend(log, @"  psIdsEncode[n=%-2d ids=%@]: set=%d prep=%d enc=%d | %@\n",
+                          plen, [pArr componentsJoinedByString:@","], (int)stU, (int)prep, (int)enc, cbFirst);
+        }
+    }
+
+    // Also test non-FaceTime RequiredHEVCSequenceParameterSetID + RequiredHEVCPictureParameterSetID bitstream rewrite
+    {
+        Stage6ProbeResult *reqRes = Stage6AllocResult();
+        VTCompressionSessionRef reqS = NULL;
+        if (reqRes && VTCompressionSessionCreate(kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
+                                                 NULL, NULL, NULL, Stage6OutputCallback, reqRes, &reqS) == noErr && reqS) {
+            KPH9PrimeRealTime(reqS);
+            OSStatus stSpsId = VTSessionSetProperty(reqS, CFSTR("RequiredHEVCSequenceParameterSetID"), (__bridge CFNumberRef)@5);
+            OSStatus stPpsId = VTSessionSetProperty(reqS, CFSTR("RequiredHEVCPictureParameterSetID"), (__bridge CFNumberRef)@9);
+            OSStatus stAlpha = VTSessionSetProperty(reqS, CFSTR("RequiredHEVCVideoParameterSetAlphaLayerID"), (__bridge CFNumberRef)@3);
+            OSStatus prepSt  = VTCompressionSessionPrepareToEncodeFrames(reqS);
+            OSStatus encSt   = VTCompressionSessionEncodeFrame(reqS, px, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+            int w0 = 0;
+            while (reqRes->cbCount < 1 && w0 < 80) { usleep(2000); w0 += 2; }
+            @synchronized ([KPH9EncoderModule class]) {
+                reqRes->closed = 1;
+                KPH9OutAppend(log, @"  reqHEVCIds[sps=5,pps=9,alpha=3]: set=%d/%d/%d prep=%d enc=%d | %s\n",
+                              (int)stSpsId, (int)stPpsId, (int)stAlpha, (int)prepSt, (int)encSt, reqRes->first);
+            }
+            KPH9SafeTeardownEx(reqS, NULL, reqRes);
+        } else if (reqRes) {
+            free(reqRes);
         }
     }
 
@@ -1318,52 +1442,45 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
         KPH9PrimeRealTime(s);
 
         // Схема ветки InterRefPicSetPredictionFlag = false в AVE_HEVC_ST_RPS_Retrieve:
-        // проверяем массив NSNumber (@1/@0) для UsedByCurrPicS0/S1 и 16-элементное дополнение,
-        // а также предварительную установку UserParameterSetsIds и ChromaQPIndexOffsetMultiPPS.
+        // проверяем точное совпадение длины массивов DeltaPocS1Minus1 / UsedByCurrPicS1 с NumPositivePics
+        // (2+2, 2+0 с пустыми массивами, CFBoolean vs NSNumber vs битовая маска) и размер внешнего массива (1, 2, 4).
         NSMutableArray *s0s = [NSMutableArray array], *s1s = [NSMutableArray array];
         NSMutableArray *u0Num = [NSMutableArray array], *u1Num = [NSMutableArray array];
+        NSMutableArray *u0Bool = [NSMutableArray array], *u1Bool = [NSMutableArray array];
         for (int i = 0; i < 2; i++) {
             [s0s addObject:@(i)];
             [s1s addObject:@(i)];
             [u0Num addObject:@1];
             [u1Num addObject:@1];
+            [u0Bool addObject:(id)kCFBooleanTrue];
+            [u1Bool addObject:(id)kCFBooleanTrue];
         }
-        NSMutableArray *s0Pad16 = [NSMutableArray arrayWithCapacity:16];
-        NSMutableArray *s1Pad16 = [NSMutableArray arrayWithCapacity:16];
-        NSMutableArray *u0Pad16 = [NSMutableArray arrayWithCapacity:16];
-        NSMutableArray *u1Pad16 = [NSMutableArray arrayWithCapacity:16];
-        for (int i = 0; i < 16; i++) {
-            [s0Pad16 addObject:@(i < 2 ? i : 0)];
-            [s1Pad16 addObject:@(i < 1 ? i : 0)];
-            [u0Pad16 addObject:@(i < 2 ? 1 : 0)];
-            [u1Pad16 addObject:@(i < 1 ? 1 : 0)];
-        }
-        NSDictionary *rpsNumArr = @{
+        NSDictionary *rps2x2Bool = @{
             @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
             @"NumNegativePics": @2,
-            @"NumPositivePics": @1,
+            @"NumPositivePics": @2,
+            @"DeltaPocS0Minus1": s0s,
+            @"UsedByCurrPicS0": u0Bool,
+            @"DeltaPocS1Minus1": s1s,
+            @"UsedByCurrPicS1": u1Bool,
+        };
+        NSDictionary *rps2x2Num = @{
+            @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+            @"NumNegativePics": @2,
+            @"NumPositivePics": @2,
             @"DeltaPocS0Minus1": s0s,
             @"UsedByCurrPicS0": u0Num,
             @"DeltaPocS1Minus1": s1s,
             @"UsedByCurrPicS1": u1Num,
         };
-        NSDictionary *rpsNumArr0 = @{
-            @"InterRefPicSetPredictionFlag": @0,
-            @"NumNegativePics": @2,
-            @"NumPositivePics": @1,
-            @"DeltaPocS0Minus1": s0s,
-            @"UsedByCurrPicS0": u0Num,
-            @"DeltaPocS1Minus1": s1s,
-            @"UsedByCurrPicS1": u1Num,
-        };
-        NSDictionary *rpsPad16 = @{
+        NSDictionary *rps2x0Empty = @{
             @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
             @"NumNegativePics": @2,
-            @"NumPositivePics": @1,
-            @"DeltaPocS0Minus1": s0Pad16,
-            @"UsedByCurrPicS0": u0Pad16,
-            @"DeltaPocS1Minus1": s1Pad16,
-            @"UsedByCurrPicS1": u1Pad16,
+            @"NumPositivePics": @0,
+            @"DeltaPocS0Minus1": s0s,
+            @"UsedByCurrPicS0": u0Bool,
+            @"DeltaPocS1Minus1": @[],
+            @"UsedByCurrPicS1": @[],
         };
 
         OSStatus stPsIds2 = VTSessionSetProperty(s, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @0, @1 ]);
@@ -1374,11 +1491,14 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             if (CFGetTypeID(psIdsRb) == CFArrayGetTypeID()) psIdsRbCnt = CFArrayGetCount((CFArrayRef)psIdsRb);
             CFRelease(psIdsRb);
         }
-        OSStatus stPreNumArr  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsNumArr]);
-        OSStatus stPreNumArr0 = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsNumArr0]);
-        OSStatus stPrePad16   = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsPad16]);
-        KPH9OutAppend(out, @"  set UserRPS @pre (psIds2=%d psIds4=%d rbPs=%ld): numArr=%d numArr0=%d pad16=%d\n",
-                      (int)stPsIds2, (int)stPsIds4, (long)psIdsRbCnt, (int)stPreNumArr, (int)stPreNumArr0, (int)stPrePad16);
+        OSStatus stPre2x2Bool  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x2Bool]);
+        OSStatus stPre2x2Num   = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x2Num]);
+        OSStatus stPre2x0Empty = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x0Empty]);
+        OSStatus stPreArr4     = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"),
+                                                      (__bridge CFTypeRef)@[rps2x2Bool, rps2x2Bool, rps2x2Bool, rps2x2Bool]);
+        KPH9OutAppend(out, @"  set UserRPS @pre (psIds2=%d psIds4=%d rbPs=%ld): 2x2Bool=%d 2x2Num=%d 2x0Empty=%d arr4=%d\n",
+                      (int)stPsIds2, (int)stPsIds4, (long)psIdsRbCnt,
+                      (int)stPre2x2Bool, (int)stPre2x2Num, (int)stPre2x0Empty, (int)stPreArr4);
 
         int cqpCounts[] = { 4, 16, 17, 32 };
         NSMutableArray *cqpParts = [NSMutableArray array];
@@ -1405,16 +1525,16 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
         OSStatus prep = VTCompressionSessionPrepareToEncodeFrames(s);
         KPH9OutAppend(out, @"  prepare -> %d\n", (int)prep);
 
-        OSStatus stSane  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsNumArr]);
-        OSStatus stArr0  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsNumArr0]);
-        OSStatus stPad16 = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsPad16]);
+        OSStatus stSane   = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x2Bool]);
+        OSStatus stArr0   = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x2Num]);
+        OSStatus stEmpty0 = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x0Empty]);
         CFTypeRef rpsRb = NULL;
         OSStatus rpsCopySt = VTSessionCopyProperty(s, CFSTR("UserRPSForFaceTime"), kCFAllocatorDefault, &rpsRb);
         CFIndex rpsRbCount = (rpsCopySt == noErr && rpsRb && CFGetTypeID(rpsRb) == CFArrayGetTypeID())
                              ? CFArrayGetCount((CFArrayRef)rpsRb) : -1;
         if (rpsRb) CFRelease(rpsRb);
-        KPH9OutAppend(out, @"  session set UserRPS @post-prep: numArr=%d numArr0=%d pad16=%d rbCount=%ld\n",
-                      (int)stSane, (int)stArr0, (int)stPad16, (long)rpsRbCount);
+        KPH9OutAppend(out, @"  session set UserRPS @post-prep: 2x2Bool=%d 2x2Num=%d 2x0Empty=%d rbCount=%ld\n",
+                      (int)stSane, (int)stArr0, (int)stEmpty0, (long)rpsRbCount);
 
         CVPixelBufferRef pb = KPH9CreatePixelBuffer(1280, 720);
         if (pb) {
@@ -1423,13 +1543,13 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             if (e0 == noErr) KPH9Drain(cbSink, 1, 60);
             NSString *cb0 = nil;
             @synchronized (cbSink) { cb0 = cbSink.firstObject ?: @"(no cb)"; [cbSink removeAllObjects]; }
-            OSStatus stSanePost  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsNumArr]);
-            OSStatus stPad16Post = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsPad16]);
-            KPH9OutAppend(out, @"  encode[0] clean IDR -> %d (%@) | set UserRPS @post-idr numArr=%d pad16=%d\n",
-                          (int)e0, cb0, (int)stSanePost, (int)stPad16Post);
+            OSStatus stSanePost  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x2Bool]);
+            OSStatus stEmptyPost = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x0Empty]);
+            KPH9OutAppend(out, @"  encode[0] clean IDR -> %d (%@) | set UserRPS @post-idr 2x2Bool=%d 2x0Empty=%d\n",
+                          (int)e0, cb0, (int)stSanePost, (int)stEmptyPost);
 
             NSDictionary *fp = @{
-                @"UserRPSForFaceTime": @[rpsPad16],
+                @"UserRPSForFaceTime": @[rps2x2Bool],
                 @"ForceSliceRPS": (id)kCFBooleanTrue,
             };
             OSStatus e1 = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(1, 30), kCMTimeInvalid,
