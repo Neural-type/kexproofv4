@@ -27,22 +27,34 @@ extern kern_return_t IOConnectCallStructMethod(kp_io_connect_t conn, uint32_t se
 
 static void KPH9AttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags fl, CMSampleBufferRef sb) {
     (void)src;
-    (void)fl;
     NSMutableArray *sink = (__bridge NSMutableArray *)refCon;
     if (!sink) return;
     NSString *entry = nil;
-    if (!sb) {
-        entry = [NSString stringWithFormat:@"cb st=%d no-sample", (int)st];
+    if (st != noErr || !sb) {
+        entry = [NSString stringWithFormat:@"cb st=%d info=0x%x no-sample", (int)st, (unsigned)fl];
     } else {
-        CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, sb,
-                                                             kCMAttachmentMode_ShouldPropagate);
-        if (atts) {
-            NSDictionary *d = (__bridge NSDictionary *)atts;
-            entry = [NSString stringWithFormat:@"cb st=%d keys=%lu", (int)st, (unsigned long)d.count];
-            CFRelease(atts);
-        } else {
-            entry = [NSString stringWithFormat:@"cb st=%d atts=(none)", (int)st];
+        CFArrayRef saArray = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+        NSUInteger saKeys = 0;
+        NSString *saDump = @"none";
+        if (saArray && CFArrayGetCount(saArray) > 0) {
+            CFDictionaryRef dict = (CFDictionaryRef)CFArrayGetValueAtIndex(saArray, 0);
+            if (dict && CFGetTypeID(dict) == CFDictionaryGetTypeID()) {
+                saKeys = CFDictionaryGetCount(dict);
+                NSDictionary *nsDict = (__bridge NSDictionary *)dict;
+                NSMutableArray *kv = [NSMutableArray array];
+                for (id k in nsDict) {
+                    [kv addObject:[NSString stringWithFormat:@"%@=%@", k, nsDict[k]]];
+                }
+                saDump = [kv componentsJoinedByString:@","];
+            }
         }
+        CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sb);
+        size_t totalLen = 0;
+        if (block) {
+            totalLen = CMBlockBufferGetDataLength(block);
+        }
+        entry = [NSString stringWithFormat:@"cb st=%d saKeys=%lu{%@} len=%zu",
+                 (int)st, (unsigned long)saKeys, saDump, totalLen];
     }
     @synchronized (sink) {
         [sink addObject:entry];
@@ -403,6 +415,7 @@ static void Stage7RunCustomDPBArrayEx(NSMutableString *log,
     NSMutableDictionary *spec = [NSMutableDictionary dictionaryWithObject:@YES forKey:@"EnableUserRefForFacetime"];
     if (dpbNumFrames > 0) {
         spec[@"EncoderUsage"] = @1;
+        spec[@"DPBNumberOfFrames"] = @(dpbNumFrames);
     }
     OSStatus st = VTCompressionSessionCreate(
         kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
@@ -924,6 +937,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                 return;
             }
             VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+            KPH9PrimeRealTime(s);
             VTCompressionSessionPrepareToEncodeFrames(s);
 
             CVPixelBufferRef pb = KPH9CreatePixelBuffer(1280, 720);

