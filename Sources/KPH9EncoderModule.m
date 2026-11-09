@@ -570,6 +570,7 @@ static void Stage7DumpSupportedProperties(NSMutableString *log) {
         return;
     }
     VTSessionSetProperty(session, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+    VTSessionSetProperty(session, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
     CFDictionaryRef supp = NULL;
     OSStatus st = VTSessionCopySupportedPropertyDictionary(session, &supp);
     if (st == noErr && supp) {
@@ -582,7 +583,11 @@ static void Stage7DumpSupportedProperties(NSMutableString *log) {
                 [kl containsString:@"dpb"] || [kl containsString:@"ref"] ||
                 [kl containsString:@"temporal"] || [kl containsString:@"layer"] ||
                 [kl containsString:@"usage"] || [kl containsString:@"ltr"] ||
-                [kl containsString:@"ack"] || [kl containsString:@"base"]) {
+                [kl containsString:@"ack"] || [kl containsString:@"base"] ||
+                [kl containsString:@"force"] || [kl containsString:@"slice"] ||
+                [kl containsString:@"ichat"] || [kl containsString:@"param"] ||
+                [kl containsString:@"str"] || [kl containsString:@"gop"] ||
+                [kl containsString:@"frame"]) {
                 id meta = nsSupp[k];
                 NSString *metaStr = [[meta description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
                 while ([metaStr containsString:@"  "]) {
@@ -610,7 +615,7 @@ static void Stage7DumpSupportedProperties(NSMutableString *log) {
 }
 
 static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
-    KPH9OutAppend(log, @"\n--- Stage 7: Supported Props Schema, @pre/@post-prep Pair Matrix & UserRPS -12912 Unlock ---\n");
+    KPH9OutAppend(log, @"\n--- Stage 7: Supported Props Schema, Post-IDR DPB Updates & UserRPS Session Schema ---\n");
     CVPixelBufferRef px = CreateDummyNV12Buffer(192, 144);
     if (!px) {
         KPH9OutAppend(log, @"  [!] Failed to allocate CVPixelBuffer\n");
@@ -619,86 +624,76 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
 
     long long tagBase = 0x4141414141410000LL;
 
-    // 7A: Dump exact supported property schema from H9 over XPC
+    // 7A: Dump supported property schema from H9 over XPC
     Stage7DumpSupportedProperties(log);
 
-    // 7B: Clean-spec (NO EncoderUsage=1) @pre / @post-prep pair truth table & @post-idr re-sync triggers
-    KPH9OutAppend(log, @"  [7B: Clean-Spec @pre/@post-prep Pair Acceptance & @post-idr Re-Sync Triggers]\n");
-    Stage7RunCustomDPBArrayEx(log, px, @"x2 (0,0)@pre",           @[ @0, @0 ],   0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x2 (0,1)@pre",           @[ @0, @1 ],   0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x2 (0,1)@post-prep",     @[ @0, @1 ],   2, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x2 (1,1)@pre",           @[ @1, @1 ],   0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x2 (1,1)@post-prep",     @[ @1, @1 ],   2, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x2 (-1,-1)@pre",         @[ @(-1), @(-1) ], 0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x2 (-1,-1)@post-prep",   @[ @(-1), @(-1) ], 2, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x2 (-1,0)@pre",          @[ @(-1), @0 ], 0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x2 (0,-1)@pre",          @[ @0, @(-1) ], 0, NO);
+    // 7B: Post-IDR / Post-4P DPB updates & 35-element boundary checks
+    KPH9OutAppend(log, @"  [7B: Post-IDR / Post-4P DPB Updates & Boundary Checks]\n");
+    Stage7RunCustomDPBArrayEx(log, px, @"x1 (tag0)@pre",             @[ @(tagBase) ], 0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x2 (0,0)@pre",              @[ @0, @0 ],     0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x2 (1,0)@post-idr(sess)",   @[ @1, @0 ],     3, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x2 (0,1)@post-idr(sess)",   @[ @0, @1 ],     3, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x2 (1,1)@post-idr(sess)",   @[ @1, @1 ],     3, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x2 (2,0)@post-4p(sess)",    @[ @2, @0 ],     4, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x2 (3,1)@post-4p(sess)",    @[ @3, @1 ],     4, NO);
 
-    NSMutableArray *x34Ramp      = [NSMutableArray arrayWithCapacity:34];
-    NSMutableArray *x34AllNegOne = [NSMutableArray arrayWithCapacity:34];
-    NSMutableArray *x34Tagged    = [NSMutableArray arrayWithCapacity:34];
+    NSMutableArray *x34Ramp   = [NSMutableArray arrayWithCapacity:34];
+    NSMutableArray *x34Tagged = [NSMutableArray arrayWithCapacity:34];
+    NSMutableArray *x35Zero34PlusTag = [NSMutableArray arrayWithCapacity:35];
+    NSMutableArray *x35RampPlusTag   = [NSMutableArray arrayWithCapacity:35];
     for (int k = 0; k < 34; k++) {
         [x34Ramp addObject:@(k)];
-        [x34AllNegOne addObject:@(-1)];
         [x34Tagged addObject:@(tagBase | (uint64_t)k)];
+        [x35Zero34PlusTag addObject:@0];
+        [x35RampPlusTag addObject:@(k)];
     }
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 all=-1@pre",              x34AllNegOne, 0, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 all=-1@post-prep",        x34AllNegOne, 2, NO);
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 ramp@post-4p(drained)",   x34Ramp,      4, YES);
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 ramp@post-idr+reprep",    x34Ramp,      5, YES);
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 ramp@post-idr+forceKF",   x34Ramp,      6, YES);
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 tagged@post-4p(drained)", x34Tagged,    4, YES);
-    Stage7RunCustomDPBArrayEx(log, px, @"x34 tagged@post-idr+forceKF", x34Tagged,    6, YES);
+    [x35Zero34PlusTag addObject:@(tagBase | 0x22ULL)];
+    [x35RampPlusTag addObject:@(tagBase | 0x22ULL)];
 
-    // 7C: Crash-Safe UserRPSForFaceTime FrameProps & Post-IDR DPB Readback Audit
-    // NOTE: Passing flat CFNumber arrays (or bare NSDictionary) to VTSessionSetProperty("UserRPSForFaceTime")
-    // crashes videocodecd (-12912 kVTVideoEncoderMalfunctionErr = XPC peer died), and 5 consecutive crashes
-    // trigger launchd's 320s respawn throttle (VIDEOCODECD_XPC_TIMEOUT).
-    // Always pass UserRPSForFaceTime as NSArray<NSDictionary *> via EncodeFrame frameProps.
-    KPH9OutAppend(log, @"  [7C: Crash-Safe UserRPSForFaceTime FrameProps & Post-Update Readback Matrix]\n");
-    NSDictionary *rpsSaneDict = @{
+    Stage7RunCustomDPBArrayEx(log, px, @"x35 zero34+slot34@pre",        x35Zero34PlusTag, 0, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x35 ramp34+slot34@post-idr",   x35RampPlusTag,   3, NO);
+    Stage7RunCustomDPBArrayEx(log, px, @"x35 ramp34+slot34@post-4p",    x35RampPlusTag,   4, YES);
+    Stage7RunCustomDPBArrayEx(log, px, @"x34 ramp@post-4p(drained)",    x34Ramp,          4, YES);
+    Stage7RunCustomDPBArrayEx(log, px, @"x34 tagged@post-4p(drained)",  x34Tagged,        4, YES);
+    Stage7RunCustomDPBArrayEx(log, px, @"x34 tagged@post-idr+forceKF",  x34Tagged,        6, YES);
+
+    // 7C: Session-Level VTSessionSetProperty("UserRPSForFaceTime") with NSArray<NSDictionary *>
+    // Passing NSArray<NSDictionary *> to VTSessionSetProperty is validated in-process without
+    // terminating videocodecd. Test candidate dictionary schemas before and after IDR.
+    KPH9OutAppend(log, @"  [7C: Session-Level UserRPSForFaceTime Dictionary Schema Matrix]\n");
+    NSDictionary *rpsSchemaUnsigned = @{
         @"NumNegativePics": @1, @"NumPositivePics": @0,
-        @"AbsDeltaRPSMinus1": @[ @0 ], @"DeltaRPSSign": @[ @1 ],
+        @"AbsDeltaRPSMinus1": @[ @0 ], @"DeltaRPSSign": @[ @0 ],
         @"UsedByCurrPicS0": @1U, @"UsedByCurrPicS1": @0U
     };
-    NSDictionary *rpsBiDirDict = @{
+    NSDictionary *rpsSchemaArrUsed = @{
+        @"NumNegativePics": @1, @"NumPositivePics": @0,
+        @"AbsDeltaRPSMinus1": @[ @0 ], @"DeltaRPSSign": @[ @0 ],
+        @"UsedByCurrPicS0": @[ @1 ], @"UsedByCurrPicS1": @[]
+    };
+    NSDictionary *rpsSchemaDeltaPOC = @{
+        @"NumNegativePics": @1, @"NumPositivePics": @0,
+        @"DeltaPOCS0": @[ @(-1) ], @"DeltaPOCS1": @[],
+        @"UsedByCurrPicS0": @[ @1 ], @"UsedByCurrPicS1": @[]
+    };
+    NSDictionary *rpsSchemaBiDir2 = @{
         @"NumNegativePics": @2, @"NumPositivePics": @2,
-        @"AbsDeltaRPSMinus1": @[ @0, @1 ], @"DeltaRPSSign": @[ @1, @1 ],
+        @"AbsDeltaRPSMinus1": @[ @0, @1 ], @"DeltaRPSSign": @[ @0, @0 ],
         @"UsedByCurrPicS0": @3U, @"UsedByCurrPicS1": @3U
-    };
-    NSMutableArray *oob16Neg = [NSMutableArray arrayWithCapacity:16];
-    NSMutableArray *oob16Pos = [NSMutableArray arrayWithCapacity:16];
-    for (int i = 0; i < 16; i++) {
-        [oob16Neg addObject:@(i)];
-        [oob16Pos addObject:@1];
-    }
-    NSDictionary *rps16Dict = @{
-        @"NumNegativePics": @16, @"NumPositivePics": @16,
-        @"AbsDeltaRPSMinus1": oob16Neg, @"DeltaRPSSign": oob16Pos,
-        @"UsedByCurrPicS0": @0xFFFFU, @"UsedByCurrPicS1": @0xFFFFU
-    };
-    NSMutableArray *oob32Neg = [NSMutableArray arrayWithCapacity:32];
-    NSMutableArray *oob32Pos = [NSMutableArray arrayWithCapacity:32];
-    for (int i = 0; i < 32; i++) {
-        [oob32Neg addObject:@(i)];
-        [oob32Pos addObject:@1];
-    }
-    NSDictionary *rps32Dict = @{
-        @"NumNegativePics": @32, @"NumPositivePics": @32,
-        @"AbsDeltaRPSMinus1": oob32Neg, @"DeltaRPSSign": oob32Pos,
-        @"UsedByCurrPicS0": @0xFFFFFFFFU, @"UsedByCurrPicS1": @0xFFFFFFFFU
     };
 
     NSArray *rpsContainers = @[
-        @{ @"name": @"arrDictSane(1+0)",  @"val": @[ rpsSaneDict ] },
-        @{ @"name": @"arrDictBiDir(2+2)", @"val": @[ rpsBiDirDict ] },
-        @{ @"name": @"arrDict16(16+16)",  @"val": @[ rps16Dict ] },
-        @{ @"name": @"arrDict32(32+32)",  @"val": @[ rps32Dict ] },
+        @{ @"name": @"unsigned(1+0)@pre",     @"val": @[ rpsSchemaUnsigned ], @"postIDR": @NO },
+        @{ @"name": @"unsigned(1+0)@postIDR", @"val": @[ rpsSchemaUnsigned ], @"postIDR": @YES },
+        @{ @"name": @"arrUsed(1+0)@postIDR",  @"val": @[ rpsSchemaArrUsed ],  @"postIDR": @YES },
+        @{ @"name": @"deltaPOC(1+0)@postIDR", @"val": @[ rpsSchemaDeltaPOC ], @"postIDR": @YES },
+        @{ @"name": @"biDir(2+2)@postIDR",    @"val": @[ rpsSchemaBiDir2 ],   @"postIDR": @YES },
     ];
 
     for (NSDictionary *entry in rpsContainers) {
         NSString *cname = entry[@"name"];
         NSArray *cval = entry[@"val"];
+        BOOL postIDR = [entry[@"postIDR"] boolValue];
         Stage6ProbeResult *res = Stage6AllocResult();
         if (!res) continue;
         res->targetIdx = -1;
@@ -711,24 +706,20 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             continue;
         }
         VTSessionSetProperty(session, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        VTSessionSetProperty(session, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
         KPH9PrimeRealTime(session);
+
+        OSStatus setSt = -999;
+        if (!postIDR) {
+            setSt = VTSessionSetProperty(session, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)cval);
+        }
         OSStatus prepSt = VTCompressionSessionPrepareToEncodeFrames(session);
         OSStatus e0 = VTCompressionSessionEncodeFrame(session, px, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
         int w0 = 0;
         while (res->cbCount < 1 && w0 < 80) { usleep(2000); w0 += 2; }
 
-        NSDictionary *fp = @{
-            @"UserRPSForFaceTime": cval,
-            @"UserDPBFramesForFaceTime": @[ @0, @0 ],
-        };
-        OSStatus e1 = VTCompressionSessionEncodeFrame(session, px, CMTimeMake(1, 30), kCMTimeInvalid,
-                                                      (__bridge CFDictionaryRef)fp, (void *)(uintptr_t)0xCAFE, NULL);
-        int w1 = 0;
-        while (!res->targetHit && w1 < 80) { usleep(2000); w1 += 2; }
-        for (int pts = 2; pts <= 5 && !res->targetHit; pts++) {
-            VTCompressionSessionEncodeFrame(session, px, CMTimeMake(pts, 30), kCMTimeInvalid, NULL, NULL, NULL);
-            int sw = 0;
-            while (!res->targetHit && sw < 30) { usleep(2000); sw += 2; }
+        if (postIDR) {
+            setSt = VTSessionSetProperty(session, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)cval);
         }
 
         CFTypeRef rbRef = NULL;
@@ -742,11 +733,22 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             rbDesc = [NSString stringWithFormat:@"err=%d", (int)rbSt];
         }
 
+        NSDictionary *fp = @{ @"UserRPSForFaceTime": cval };
+        OSStatus e1 = VTCompressionSessionEncodeFrame(session, px, CMTimeMake(1, 30), kCMTimeInvalid,
+                                                      (__bridge CFDictionaryRef)fp, (void *)(uintptr_t)0xCAFE, NULL);
+        int w1 = 0;
+        while (!res->targetHit && w1 < 80) { usleep(2000); w1 += 2; }
+        for (int pts = 2; pts <= 5 && !res->targetHit; pts++) {
+            VTCompressionSessionEncodeFrame(session, px, CMTimeMake(pts, 30), kCMTimeInvalid, NULL, NULL, NULL);
+            int sw = 0;
+            while (!res->targetHit && sw < 30) { usleep(2000); sw += 2; }
+        }
+
         @synchronized ([KPH9EncoderModule class]) {
             res->closed = 1;
             const char *postCb = res->targetHit ? res->target : res->second;
-            KPH9OutAppend(log, @"  rps[%@] prep=%d rb=%@ enc=%d/%d cbs=%d | cb1: %s | cbPost(#%d): %s\n",
-                          cname, (int)prepSt, rbDesc,
+            KPH9OutAppend(log, @"  rps[%@] set=%d prep=%d rb=%@ enc=%d/%d cbs=%d | cb1: %s | cbPost(#%d): %s\n",
+                          cname, (int)setSt, (int)prepSt, rbDesc,
                           (int)e0, (int)e1, res->cbCount, res->first, res->targetIdx, postCb);
         }
         KPH9SafeTeardownEx(session, NULL, res);
@@ -880,20 +882,21 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
         }
 
         VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        VTSessionSetProperty(s, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
         KPH9PrimeRealTime(s);
         OSStatus prep = VTCompressionSessionPrepareToEncodeFrames(s);
         KPH9OutAppend(out, @"  prepare -> %d\n", (int)prep);
 
         NSMutableArray *s0s = [NSMutableArray array], *s1s = [NSMutableArray array];
-        for (int i = 0; i < 2; i++) { [s0s addObject:@(-(i + 1))]; [s1s addObject:@(i + 1)]; }
+        for (int i = 0; i < 2; i++) { [s0s addObject:@(i)]; [s1s addObject:@0]; }
         NSDictionary *rpsSane = @{
             @"AbsDeltaRPSMinus1": s0s, @"DeltaRPSSign": s1s,
-            @"NumNegativePics": @2, @"NumPositivePics": @2,
-            @"UsedByCurrPicS0": @3U, @"UsedByCurrPicS1": @3U,
+            @"NumNegativePics": @2, @"NumPositivePics": @0,
+            @"UsedByCurrPicS0": @3U, @"UsedByCurrPicS1": @0U,
         };
 
         NSMutableArray *s0oob = [NSMutableArray array], *s1oob = [NSMutableArray array];
-        for (int i = 0; i < 32; i++) { [s0oob addObject:@(-(i + 1))]; [s1oob addObject:@(i + 1)]; }
+        for (int i = 0; i < 32; i++) { [s0oob addObject:@(i)]; [s1oob addObject:@0]; }
         NSDictionary *rpsOOB = @{
             @"AbsDeltaRPSMinus1": s0oob, @"DeltaRPSSign": s1oob,
             @"NumNegativePics": @32, @"NumPositivePics": @32,
@@ -902,7 +905,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
 
         OSStatus stSane = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsSane]);
         OSStatus stOOB  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsOOB]);
-        KPH9OutAppend(out, @"  session set UserRPS sane(2+2)=%d oob(32+32)=%d\n", (int)stSane, (int)stOOB);
+        KPH9OutAppend(out, @"  session set UserRPS @pre sane(2+0)=%d ext(32+32)=%d\n", (int)stSane, (int)stOOB);
 
         CVPixelBufferRef pb = KPH9CreatePixelBuffer(1280, 720);
         if (pb) {
@@ -911,7 +914,9 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             if (e0 == noErr) KPH9Drain(cbSink, 1, 60);
             NSString *cb0 = nil;
             @synchronized (cbSink) { cb0 = cbSink.firstObject ?: @"(no cb)"; [cbSink removeAllObjects]; }
-            KPH9OutAppend(out, @"  encode[0] clean IDR -> %d (%@)\n", (int)e0, cb0);
+            OSStatus stSanePost = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsSane]);
+            KPH9OutAppend(out, @"  encode[0] clean IDR -> %d (%@) | set UserRPS @post-idr=%d\n",
+                          (int)e0, cb0, (int)stSanePost);
 
             NSDictionary *fp = @{
                 @"UserRPSForFaceTime": @[rpsOOB],
