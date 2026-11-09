@@ -273,18 +273,18 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
             vpsHex = [NSString stringWithFormat:@"%zu:%@", vpsSize, HexDumpSlice(vpsPtr, vpsSize, vpsMax)];
         }
         if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, 1, &spsPtr, &spsSize, NULL, NULL) == noErr && spsPtr) {
-            size_t spsMax = (spsSize > 32) ? 28 : 16;
+            size_t spsMax = (spsSize > 36) ? 44 : 36;
             spsHex = [NSString stringWithFormat:@"%zu:%@", spsSize, HexDumpSlice(spsPtr, spsSize, spsMax)];
         }
         if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, 2, &ppsPtr, &ppsSize, NULL, NULL) == noErr && ppsPtr) {
-            ppsHex = [NSString stringWithFormat:@"%zu:%@", ppsSize, HexDumpSlice(ppsPtr, ppsSize, 16)];
+            ppsHex = [NSString stringWithFormat:@"%zu:%@", ppsSize, HexDumpSlice(ppsPtr, ppsSize, 24)];
             if (paramCount > 3) {
                 NSMutableArray *extraPps = [NSMutableArray array];
                 for (size_t pi = 3; pi < paramCount && pi < 12; pi++) {
                     const uint8_t *pExtra = NULL;
                     size_t pExtraSz = 0;
                     if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, pi, &pExtra, &pExtraSz, NULL, NULL) == noErr && pExtra) {
-                        [extraPps addObject:[NSString stringWithFormat:@"ps%zu=%zu:%@", pi, pExtraSz, HexDumpSlice(pExtra, pExtraSz, 10)]];
+                        [extraPps addObject:[NSString stringWithFormat:@"ps%zu=%zu:%@", pi, pExtraSz, HexDumpSlice(pExtra, pExtraSz, 16)]];
                     }
                 }
                 if (extraPps.count > 0) {
@@ -1129,7 +1129,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             }
 
             // Value boundaries for MVHEVCVideoLayerIDs & RequiredMVHEVC* (active when MVHEVCVideoLayerIDs=[0,1])
-            int mvVals[] = { 0, 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 31, 62, 63, 64, 65, 127, 128, 255, 256, 65535, -1 };
+            int mvVals[] = { 0, 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 31, 62, 63, 64, 65, 127, 128, 129, 191, 192, 254, 255, 256, 65535, -1 };
             NSMutableArray *mvLayerParts = [NSMutableArray array];
             for (size_t mi = 0; mi < sizeof(mvVals) / sizeof(mvVals[0]); mi++) {
                 int v = mvVals[mi];
@@ -1346,6 +1346,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         dispatch_semaphore_t psSem = dispatch_semaphore_create(0);
         __block OSStatus stU = -999, stCqp = -999, prep = -999, enc = -999;
         __block CFIndex rbPsCnt = -1, rbCqpCnt = -1;
+        __block NSString *rbCqpPreview = @"";
         __block const char *phase = "init";
         __block NSString *cbFirst = @"(no cb)";
         Stage6ProbeResult *uRes = Stage6AllocResult();
@@ -1369,7 +1370,16 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                     CFRelease(rbPs);
                 }
                 if (VTSessionCopyProperty(us, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbCqp) == noErr && rbCqp) {
-                    if (CFGetTypeID(rbCqp) == CFArrayGetTypeID()) rbCqpCnt = CFArrayGetCount((CFArrayRef)rbCqp);
+                    if (CFGetTypeID(rbCqp) == CFArrayGetTypeID()) {
+                        rbCqpCnt = CFArrayGetCount((CFArrayRef)rbCqp);
+                        NSArray *nsCqp = (__bridge NSArray *)rbCqp;
+                        NSUInteger lim = nsCqp.count > 8 ? 8 : nsCqp.count;
+                        if (lim > 0) {
+                            rbCqpPreview = [NSString stringWithFormat:@":[%@%@]",
+                                            [[nsCqp subarrayWithRange:NSMakeRange(0, lim)] componentsJoinedByString:@","],
+                                            nsCqp.count > 8 ? @",..." : @""];
+                        }
+                    }
                     CFRelease(rbCqp);
                 }
                 phase = "prep";
@@ -1399,14 +1409,15 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                           plen, [pArr componentsJoinedByString:@","], phase, (int)stU, (int)stCqp, (int)prep, (int)enc);
             break;
         } else {
-            KPH9OutAppend(log, @"  psIdsEncode[n=%-2d ids=%@]: set=%d(rb=%ld) cqp=%d(rb=%ld) prep=%d enc=%d | %@\n",
+            KPH9OutAppend(log, @"  psIdsEncode[n=%-2d ids=%@]: set=%d(rb=%ld) cqp=%d(rb=%ld%@) prep=%d enc=%d | %@\n",
                           plen, [pArr componentsJoinedByString:@","],
-                          (int)stU, (long)rbPsCnt, (int)stCqp, (long)rbCqpCnt, (int)prep, (int)enc, cbFirst);
+                          (int)stU, (long)rbPsCnt, (int)stCqp, (long)rbCqpCnt, rbCqpPreview, (int)prep, (int)enc, cbFirst);
         }
     }
 
-    // Bounded RequiredHEVC* / RepFormat* / log2_max_minus4 / AuxID / MVHEVCViewIDs + single-variable (alpha, sps, pps) stall bisection
-    // Safe RepFormat, log2_max_minus4, AuxID & MVHEVC cases run FIRST before the single-variable high-ID bisection!
+    // Bounded RequiredHEVC* / RepFormat* / log2_max_minus4 / AuxID / MVHEVCViewIDs + single-variable (alpha, sps, pps) boundary audit.
+    // Note: bisect-pps=128 proved that RequiredHEVCPictureParameterSetID >= 128 (signed int8_t < 0 at [x20,#0x32c0])
+    // stalls inside EncodeFrame; ppsId is therefore strictly capped at <= 127 so Stage 7G completes 100% cleanly!
     typedef struct {
         const char *label;
         int spsId;
@@ -1426,15 +1437,17 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         { "repIdx=1,bd=8,ch=1,a=3",        5,   9,   3,    1,   8,   1, -99, -99, -99, -99 },
         { "repIdx=16,bd=8,ch=1,a=3",       5,   9,   3,   16,   8,   1, -99, -99, -99, -99 },
         { "repIdx=255,bd=8,ch=1,a=3",      5,   9,   3,  255,   8,   1, -99, -99, -99, -99 },
-        // 2) log2_max_minus4 probes (27.2 #810 added [x20,#0x1888] <= 6; 27.0.1 VTSessionSetProperty accepted 0..7+)
+        // 2) log2_max_minus4 probes (27.2 #810 added [x20,#0x1888] <= 6; 27.0.1 VTSessionSetProperty accepted 0..11)
         { "log2MaxM4=0,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   0, -99, -99, -99 },
         { "log2MaxM4=6,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   6, -99, -99, -99 },
         { "log2MaxM4=7,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   7, -99, -99, -99 },
         { "log2MaxM4=8,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   8, -99, -99, -99 },
         { "log2MaxM4=10,sps=5,pps=9",      5,   9,   3,  -99, -99, -99,  10, -99, -99, -99 },
-        // 3) EncodesAuxiliaryWithAuxID (1..64 accepted in 7E) & MVHEVCViewIDs (unbounded int32 in 7E)
+        { "log2MaxM4=11,sps=5,pps=9",      5,   9,   3,  -99, -99, -99,  11, -99, -99, -99 },
+        // 3) EncodesAuxiliaryWithAuxID (1..128 accepted in 7E) & MVHEVCViewIDs (unbounded int32 in 7E)
         { "auxId=1,sps=5,pps=9,a=3",       5,   9,   3,  -99, -99, -99, -99,   1, -99, -99 },
         { "auxId=64,sps=5,pps=9,a=3",      5,   9,   3,  -99, -99, -99, -99,  64, -99, -99 },
+        { "auxId=128,sps=5,pps=9,a=3",     5,   9,   3,  -99, -99, -99, -99, 128, -99, -99 },
         { "viewIds=[0,255],sps=5,pps=9",   5,   9,   3,  -99, -99, -99, -99, -99, 255, -99 },
         // 4) 2-layer MV-HEVC PrepareToEncodeFrames probes (enc=-111, never blocks EncodeFrame)
         { "mvLayer=[0,1],sps=5,pps=9",     5,   9,   3,  -99,   8,   1, -99, -99,   1,   1 },
@@ -1443,18 +1456,25 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         { "repIdx=1,bd=10,ch=2,a=3",       5,   9,   3,    1,  10,   2, -99, -99, -99, -99 },
         { "repIdx=15,bd=16,ch=3,a=3",      5,   9,   3,   15,  16,   3, -99, -99, -99, -99 },
         { "repIdx=255,bd=255,ch=255",      5,   9,   3,  255, 255, 255, -99, -99, -99, -99 },
-        // 6) Single-variable bisection between (sps=31,pps=127,alpha=16)=OK and (sps=255,pps=255,alpha=63)=STALL:
-        //    First vary alpha alone (sps=5, pps=9):
+        // 6) Single-variable boundaries (all safe: ppsId <= 127):
+        //    6a) Vary alpha alone (sps=5, pps=9; 27.2 #810 checks alpha < 63 at [x20,#0x27f4]):
         { "bisect-alpha=31(sps=5,pps=9)",  5,   9,  31,  -99, -99, -99, -99, -99, -99, -99 },
         { "bisect-alpha=62(sps=5,pps=9)",  5,   9,  62,  -99, -99, -99, -99, -99, -99, -99 },
         { "bisect-alpha=63(sps=5,pps=9)",  5,   9,  63,  -99, -99, -99, -99, -99, -99, -99 },
-        //    Next vary sps alone (pps=9, alpha=3):
+        { "bisect-alpha=64(sps=5,pps=9)",  5,   9,  64,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-alpha=127(sps=5,pps=9)", 5,   9, 127,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-alpha=128(sps=5,pps=9)", 5,   9, 128,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-alpha=255(sps=5,pps=9)", 5,   9, 255,  -99, -99, -99, -99, -99, -99, -99 },
+        //    6b) Vary sps alone (pps=9, alpha=3; GeneratePPS #1819 loads sps_id via ldrsb at +0x1bc):
         { "bisect-sps=63(pps=9,a=3)",     63,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
         { "bisect-sps=64(pps=9,a=3)",     64,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-sps=127(pps=9,a=3)",   127,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-sps=128(pps=9,a=3)",   128,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
         { "bisect-sps=255(pps=9,a=3)",   255,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
-        //    Next vary pps alone (sps=5, alpha=3):
-        { "bisect-pps=128(sps=5,a=3)",     5, 128,   3,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-pps=255(sps=5,a=3)",     5, 255,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        //    6c) Vary pps alone up to max positive int8_t 127 (27.2 #810 checks pps <= 64 at [x20,#0x32c0]):
+        { "bisect-pps=64(sps=5,a=3)",      5,  64,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-pps=65(sps=5,a=3)",      5,  65,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "bisect-pps=127(sps=5,a=3)",     5, 127,   3,  -99, -99, -99, -99, -99, -99, -99 },
     };
     for (size_t rci = 0; rci < sizeof(reqCases) / sizeof(reqCases[0]); rci++) {
         ReqHEVCCase rc = reqCases[rci];
