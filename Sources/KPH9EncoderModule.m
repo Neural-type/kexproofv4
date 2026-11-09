@@ -102,7 +102,10 @@ static void KPH9SafeTeardownEx(VTCompressionSessionRef s, CFTypeRef retainedRefC
     static dispatch_queue_t tdQueue;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        tdQueue = dispatch_queue_create("com.stealth.kexproofv4.h9.teardown", DISPATCH_QUEUE_SERIAL);
+        // Must be CONCURRENT: waiting on `done` below already serializes healthy
+        // teardowns (<5 ms), whereas a serial queue permanently head-of-line blocks
+        // all subsequent teardowns if any single session wedges in Invalidate().
+        tdQueue = dispatch_queue_create("com.stealth.kexproofv4.h9.teardown", DISPATCH_QUEUE_CONCURRENT);
     });
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     dispatch_async(tdQueue, ^{
@@ -146,17 +149,19 @@ typedef struct {
     volatile int cbCount;
     volatile int closed;
     volatile int targetIdx;
+    volatile int targetHit;
     OSStatus lastStatus;
     char summary[512];
     char first[512];  // cb#1 (IDR at pts=0)
     char second[512]; // cb#2 (P-frame at pts=1, never overwritten by cb#3..4)
-    char target[512]; // cb#(targetIdx) (pinned post-update frame callback)
+    char target[512]; // pinned post-update frame callback (matched via sourceFrameRefCon)
 } Stage6ProbeResult;
 
 static Stage6ProbeResult *Stage6AllocResult(void) {
     Stage6ProbeResult *res = (Stage6ProbeResult *)calloc(1, sizeof(Stage6ProbeResult));
     if (res) {
         res->targetIdx = 2;
+        res->targetHit = 0;
         snprintf(res->summary, sizeof(res->summary), "(no cb)");
         snprintf(res->first, sizeof(res->first), "(no cb)");
         snprintf(res->second, sizeof(res->second), "(no cb)");
@@ -211,7 +216,7 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
                                  OSStatus status,
                                  VTEncodeInfoFlags infoFlags,
                                  CMSampleBufferRef sampleBuffer) {
-    (void)sourceFrameRefCon;
+    BOOL isTaggedTarget = (sourceFrameRefCon == (void *)(uintptr_t)0xCAFE);
     Stage6ProbeResult *res = (Stage6ProbeResult *)outputCallbackRefCon;
     if (!res || res->closed) return;
     if (status != noErr || !sampleBuffer) {
@@ -224,7 +229,11 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
                      res->cbCount, (int)status, (unsigned)infoFlags);
             if (res->cbCount == 1) snprintf(res->first, sizeof(res->first), "%s", res->summary);
             if (res->cbCount == 2) snprintf(res->second, sizeof(res->second), "%s", res->summary);
-            if (res->cbCount == res->targetIdx) snprintf(res->target, sizeof(res->target), "%s", res->summary);
+            if (isTaggedTarget || (!res->targetHit && res->cbCount == res->targetIdx)) {
+                res->targetIdx = res->cbCount;
+                res->targetHit = 1;
+                snprintf(res->target, sizeof(res->target), "%s", res->summary);
+            }
         }
         return;
     }
@@ -275,7 +284,11 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
                  [spsHex UTF8String], totalLen, [vclSummary UTF8String]);
         if (res->cbCount == 1) snprintf(res->first, sizeof(res->first), "%s", res->summary);
         if (res->cbCount == 2) snprintf(res->second, sizeof(res->second), "%s", res->summary);
-        if (res->cbCount == res->targetIdx) snprintf(res->target, sizeof(res->target), "%s", res->summary);
+        if (isTaggedTarget || (!res->targetHit && res->cbCount == res->targetIdx)) {
+            res->targetIdx = res->cbCount;
+            res->targetHit = 1;
+            snprintf(res->target, sizeof(res->target), "%s", res->summary);
+        }
     }
 }
 
@@ -292,8 +305,10 @@ static CVPixelBufferRef CreateDummyNV12Buffer(int width, int height) {
 
 static void KPH9PrimeRealTime(VTCompressionSessionRef session) {
     if (!session) return;
+    // NOTE: Never set kVTCompressionPropertyKey_AllowFrameReordering = kCFBooleanFalse
+    // on an EnableUserRefForFacetime session — that combination wedges H9's session
+    // pipeline in videocodecd on encode[1] and hangs VTCompressionSessionInvalidate.
     VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-    VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
 }
 
 static void KPH9EncodeAndFlushTwoCallbacks(VTCompressionSessionRef session,
@@ -443,33 +458,32 @@ static void Stage7RunCustomDPBArrayEx(NSMutableString *log,
     OSStatus e0 = -1, e1 = -1;
     if (px) {
         if (timingMode >= 2) {
-            // timingMode == 2 -> 1 warmup frame (IDR, pts=0); timingMode == 5 -> 4 warmup frames (pts=0..3)
+            // timingMode == 2 -> 1 warmup frame (IDR, pts=0); timingMode == 5 -> 4 warmup frames
             int warmupFrames = timingMode - 1;
             int pts = 0;
             for (; pts < warmupFrames; pts++) {
                 OSStatus ew = VTCompressionSessionEncodeFrame(session, px, CMTimeMake(pts, 30), kCMTimeInvalid, NULL, NULL, NULL);
                 if (pts == 0) e0 = ew;
-                int w = 0;
-                while (res->cbCount < (pts + 1) && w < 80) { usleep(2000); w += 2; }
             }
-            // Ensure warmup frames actually emitted callbacks before mutating UserDPBFramesForFaceTime
-            for (int flushPts = 0; flushPts < 4 && res->cbCount < warmupFrames; flushPts++, pts++) {
+            // Flush lookahead so `warmupFrames` callbacks have actually completed in DPB
+            for (int flushPts = 0; flushPts < 3 && res->cbCount < warmupFrames; flushPts++, pts++) {
                 VTCompressionSessionEncodeFrame(session, px, CMTimeMake(pts, 30), kCMTimeInvalid, NULL, NULL, NULL);
-                int fw = 0;
-                while (res->cbCount < warmupFrames && fw < 40) { usleep(2000); fw += 2; }
             }
-            int targetCb = res->cbCount + 1;
-            res->targetIdx = targetCb;
+            int fw = 0;
+            while (res->cbCount < warmupFrames && fw < 100) { usleep(2000); fw += 2; }
+
+            res->targetHit = 0;
+            res->targetIdx = res->cbCount + 1;
             setSt = VTSessionSetProperty(session, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)arr);
             NSDictionary *fp = @{ @"UserDPBFramesForFaceTime": arr };
             e1 = VTCompressionSessionEncodeFrame(session, px, CMTimeMake(pts++, 30), kCMTimeInvalid,
-                                                 (__bridge CFDictionaryRef)fp, NULL, NULL);
+                                                 (__bridge CFDictionaryRef)fp, (void *)(uintptr_t)0xCAFE, NULL);
             int w1 = 0;
-            while (res->cbCount < targetCb && w1 < 120) { usleep(2000); w1 += 2; }
-            for (int extra = 0; extra < 4 && res->cbCount < targetCb; extra++, pts++) {
+            while (!res->targetHit && w1 < 80) { usleep(2000); w1 += 2; }
+            for (int extra = 0; extra < 4 && !res->targetHit; extra++, pts++) {
                 VTCompressionSessionEncodeFrame(session, px, CMTimeMake(pts, 30), kCMTimeInvalid, NULL, NULL, NULL);
                 int sw = 0;
-                while (res->cbCount < targetCb && sw < 40) { usleep(2000); sw += 2; }
+                while (!res->targetHit && sw < 40) { usleep(2000); sw += 2; }
             }
         } else {
             res->targetIdx = 2;
