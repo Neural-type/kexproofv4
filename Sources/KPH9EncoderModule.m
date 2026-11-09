@@ -1317,15 +1317,18 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         if (sbuf2) CFRelease(sbuf2);
     }
 
-    // 7G: Bounded per-session Bitstream Audit:
+    // 7G: Bounded per-session Bitstream & Boundary Verification Audit:
     //   1) UserParameterSetsIds + ChromaQPIndexOffsetMultiPPS (CFArray<CFNumber> of 2*(plen-2) cb/cr pairs)
-    //      Strictly capped at plen <= 10 (iNumPPS <= 8 < 9) because AppleAVE2 #810 at 0xfffffff0085dc83c
-    //      checks [x21, #0x510] < 9 and returns -0x3e9 at plen >= 11, which wedges videocodecd!
-    //   2) RepFormat (RequiredHEVCSequenceParameterSetRepFormatIndex + BitDepths + ChromaFormatIdcs),
-    //      log2_max_minus4 (0,6,7,8,10,11), EncodesAuxiliaryWithAuxID (1,64), MVHEVCViewIDs & MVHEVCVideoLayerIDs
-    //   3) Single-variable bisection of the (sps, pps, alpha) stall at the very end
-    KPH9OutAppend(log, @"  [7G: MultiPPS ChromaQP (n<=10), RepFormat, log2_max_minus4, AuxID & Single-Var Stall Bisection]\n");
-    int testPsLens[] = { 3, 4, 6, 8, 10 };
+    //      Strictly capped at plen <= 9 (iNumPPS in 1..7, matching iOS 27.2 #810 [x20,#0x510] check)
+    //      and <= 10 (iOS 27.0.1 [x21,#0x510] < 9 limit).
+    //   2) Verified boundary matrix comparing iOS 27.0.1 behavior against iOS 27.2 AppleAVE2 checks:
+    //      - RepFormatIndex ([x20,#0x2c10] <= 16 in 27.2)
+    //      - log2_max_minus4 ([x20,#0x1888] <= 6 in 27.2; 0..11 accepted by VTSessionSetProperty)
+    //      - AlphaLayerID ([x20,#0x27f4] < 63: 0..62 emit 39B VPS, >= 63 drops frame with info=0x3)
+    //      - SPS ID (ldrsb at pcaHEVC_SPS+0x1bc: 0..127 positive int8_t, 128 sign-extends to 0xffffff80 in WriteUE)
+    //      - PPS ID ([x20,#0x32c0] <= 64 in 27.2; 0..127 positive int8_t, >= 128 stalls EncodeFrame)
+    KPH9OutAppend(log, @"  [7G: MultiPPS ChromaQP (n<=10) & Verified 27.0.1 vs 27.2 Boundary Matrix]\n");
+    int testPsLens[] = { 3, 4, 6, 8, 9, 10 };
     for (size_t ti = 0; ti < sizeof(testPsLens) / sizeof(testPsLens[0]); ti++) {
         int plen = testPsLens[ti];
         int numPps = plen - 2;
@@ -1362,8 +1365,9 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 VTSessionSetProperty(us, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
                 KPH9PrimeRealTime(us);
                 phase = "set";
-                stU   = VTSessionSetProperty(us, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr);
+                // Set ChromaQPIndexOffsetMultiPPS first, then UserParameterSetsIds so both readbacks reflect the active table
                 stCqp = VTSessionSetProperty(us, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpArr);
+                stU   = VTSessionSetProperty(us, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr);
                 CFTypeRef rbPs = NULL, rbCqp = NULL;
                 if (VTSessionCopyProperty(us, CFSTR("UserParameterSetsIds"), kCFAllocatorDefault, &rbPs) == noErr && rbPs) {
                     if (CFGetTypeID(rbPs) == CFArrayGetTypeID()) rbPsCnt = CFArrayGetCount((CFArrayRef)rbPs);
@@ -1415,9 +1419,9 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         }
     }
 
-    // Bounded RequiredHEVC* / RepFormat* / log2_max_minus4 / AuxID / MVHEVCViewIDs + single-variable (alpha, sps, pps) boundary audit.
+    // Bounded RequiredHEVC* / RepFormat* / log2_max_minus4 / AuxID / MVHEVCViewIDs boundary verification.
     // Note: bisect-pps=128 proved that RequiredHEVCPictureParameterSetID >= 128 (signed int8_t < 0 at [x20,#0x32c0])
-    // stalls inside EncodeFrame; ppsId is therefore strictly capped at <= 127 so Stage 7G completes 100% cleanly!
+    // stalls inside EncodeFrame; ppsId is therefore strictly capped at <= 127 so Stage 7G completes 100% cleanly.
     typedef struct {
         const char *label;
         int spsId;
@@ -1432,49 +1436,40 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         int mvLayer1;
     } ReqHEVCCase;
     ReqHEVCCase reqCases[] = {
-        // 1) Safe 8-bit 4:2:0 RepFormatIndex probes (27.2 #810 added [x20,#0x2c10] <= 16)
+        // 1) RepFormatIndex boundary (iOS 27.2 #810 added [x20,#0x2c10] <= 16)
         { "repIdx=0,bd=8,ch=1,a=3",        5,   9,   3,    0,   8,   1, -99, -99, -99, -99 },
-        { "repIdx=1,bd=8,ch=1,a=3",        5,   9,   3,    1,   8,   1, -99, -99, -99, -99 },
         { "repIdx=16,bd=8,ch=1,a=3",       5,   9,   3,   16,   8,   1, -99, -99, -99, -99 },
-        { "repIdx=255,bd=8,ch=1,a=3",      5,   9,   3,  255,   8,   1, -99, -99, -99, -99 },
-        // 2) log2_max_minus4 probes (27.2 #810 added [x20,#0x1888] <= 6; 27.0.1 VTSessionSetProperty accepted 0..11)
+        { "repIdx=17,bd=8,ch=1,a=3",       5,   9,   3,   17,   8,   1, -99, -99, -99, -99 },
+        // 2) log2_max_minus4 boundary (iOS 27.2 #810 added [x20,#0x1888] <= 6; 27.0.1 accepts 0..11)
         { "log2MaxM4=0,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   0, -99, -99, -99 },
         { "log2MaxM4=6,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   6, -99, -99, -99 },
         { "log2MaxM4=7,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   7, -99, -99, -99 },
-        { "log2MaxM4=8,sps=5,pps=9",       5,   9,   3,  -99, -99, -99,   8, -99, -99, -99 },
-        { "log2MaxM4=10,sps=5,pps=9",      5,   9,   3,  -99, -99, -99,  10, -99, -99, -99 },
         { "log2MaxM4=11,sps=5,pps=9",      5,   9,   3,  -99, -99, -99,  11, -99, -99, -99 },
-        // 3) EncodesAuxiliaryWithAuxID (1..128 accepted in 7E) & MVHEVCViewIDs (unbounded int32 in 7E)
+        // 3) EncodesAuxiliaryWithAuxID (1..128) & MVHEVCViewIDs
         { "auxId=1,sps=5,pps=9,a=3",       5,   9,   3,  -99, -99, -99, -99,   1, -99, -99 },
         { "auxId=64,sps=5,pps=9,a=3",      5,   9,   3,  -99, -99, -99, -99,  64, -99, -99 },
-        { "auxId=128,sps=5,pps=9,a=3",     5,   9,   3,  -99, -99, -99, -99, 128, -99, -99 },
         { "viewIds=[0,255],sps=5,pps=9",   5,   9,   3,  -99, -99, -99, -99, -99, 255, -99 },
-        // 4) 2-layer MV-HEVC PrepareToEncodeFrames probes (enc=-111, never blocks EncodeFrame)
+        // 4) 2-layer MV-HEVC PrepareToEncodeFrames check (enc=-111, never blocks EncodeFrame)
         { "mvLayer=[0,1],sps=5,pps=9",     5,   9,   3,  -99,   8,   1, -99, -99,   1,   1 },
-        { "mvLayer=[0,63],sps=5,pps=9",    5,   9,  63,  -99,   8,   1, -99, -99, 255,  63 },
-        // 5) Non-8-bit / non-4:2:0 RepFormat BitDepths & ChromaFormatIdcs (27.2 #809 checks bd==8, ch==1)
+        // 5) RepFormat BitDepths & ChromaFormatIdcs (iOS 27.2 #809 checks bd==8, ch==1)
         { "repIdx=1,bd=10,ch=2,a=3",       5,   9,   3,    1,  10,   2, -99, -99, -99, -99 },
         { "repIdx=15,bd=16,ch=3,a=3",      5,   9,   3,   15,  16,   3, -99, -99, -99, -99 },
-        { "repIdx=255,bd=255,ch=255",      5,   9,   3,  255, 255, 255, -99, -99, -99, -99 },
-        // 6) Single-variable boundaries (all safe: ppsId <= 127):
-        //    6a) Vary alpha alone (sps=5, pps=9; 27.2 #810 checks alpha < 63 at [x20,#0x27f4]):
-        { "bisect-alpha=31(sps=5,pps=9)",  5,   9,  31,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-alpha=62(sps=5,pps=9)",  5,   9,  62,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-alpha=63(sps=5,pps=9)",  5,   9,  63,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-alpha=64(sps=5,pps=9)",  5,   9,  64,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-alpha=127(sps=5,pps=9)", 5,   9, 127,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-alpha=128(sps=5,pps=9)", 5,   9, 128,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-alpha=255(sps=5,pps=9)", 5,   9, 255,  -99, -99, -99, -99, -99, -99, -99 },
-        //    6b) Vary sps alone (pps=9, alpha=3; GeneratePPS #1819 loads sps_id via ldrsb at +0x1bc):
-        { "bisect-sps=63(pps=9,a=3)",     63,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-sps=64(pps=9,a=3)",     64,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-sps=127(pps=9,a=3)",   127,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-sps=128(pps=9,a=3)",   128,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-sps=255(pps=9,a=3)",   255,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
-        //    6c) Vary pps alone up to max positive int8_t 127 (27.2 #810 checks pps <= 64 at [x20,#0x32c0]):
-        { "bisect-pps=64(sps=5,a=3)",      5,  64,   3,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-pps=65(sps=5,a=3)",      5,  65,   3,  -99, -99, -99, -99, -99, -99, -99 },
-        { "bisect-pps=127(sps=5,a=3)",     5, 127,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        // 6) Exact single-variable cutoffs:
+        //    6a) AlphaLayerID cutoff (0..62 emit 39B VPS, 63 drops frame with info=0x3; 27.2 #810 checks < 63):
+        { "alpha=31(sps=5,pps=9)",         5,   9,  31,  -99, -99, -99, -99, -99, -99, -99 },
+        { "alpha=62(sps=5,pps=9)",         5,   9,  62,  -99, -99, -99, -99, -99, -99, -99 },
+        { "alpha=63(sps=5,pps=9)",         5,   9,  63,  -99, -99, -99, -99, -99, -99, -99 },
+        //    6b) SPS ID cutoff (15=spec max, 63..127=pos int8_t, 128=ldrsb sign-extension to 0xffffff80):
+        { "sps=15(pps=9,a=3)",            15,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "sps=63(pps=9,a=3)",            63,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "sps=64(pps=9,a=3)",            64,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "sps=127(pps=9,a=3)",          127,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "sps=128(pps=9,a=3)",          128,   9,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        //    6c) PPS ID cutoff (63=spec max, 64=27.2 #810 max, 65..127=unclamped pos int8_t on 27.0.1):
+        { "pps=63(sps=5,a=3)",             5,  63,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "pps=64(sps=5,a=3)",             5,  64,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "pps=65(sps=5,a=3)",             5,  65,   3,  -99, -99, -99, -99, -99, -99, -99 },
+        { "pps=127(sps=5,a=3)",            5, 127,   3,  -99, -99, -99, -99, -99, -99, -99 },
     };
     for (size_t rci = 0; rci < sizeof(reqCases) / sizeof(reqCases[0]); rci++) {
         ReqHEVCCase rc = reqCases[rci];
