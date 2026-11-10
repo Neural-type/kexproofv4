@@ -207,13 +207,19 @@ static inline BOOL KPIsContextFalsePositive(const uint64_t *words, size_t wordCo
     // (e.g. ctx[-1] = 0x101010101042ffff, ctx[+1] = 0x38d8d8d8d8d8deff).
     if (index > 0) {
         uint64_t prev = words[index - 1];
-        if ((prev & 0xffffffffULL) == 0xffffffffULL || (prev >> 32) == 0xffffffffULL) return YES;
-        if ((prev & 0xffffULL) == 0xffffULL || KPIsRepeatedByteWord(prev)) return YES;
+        if (prev != UINT64_MAX &&
+            (((prev & 0xffffffffULL) == 0xffffffffULL) || ((prev >> 32) == 0xffffffffULL))) {
+            return YES;
+        }
+        if (KPIsRepeatedByteWord(prev)) return YES;
     }
     if (index + 1 < wordCount) {
         uint64_t next = words[index + 1];
-        if ((next & 0xffffffffULL) == 0xffffffffULL || (next >> 32) == 0xffffffffULL) return YES;
-        if ((next & 0xffffULL) == 0xffffULL || KPIsRepeatedByteWord(next)) return YES;
+        if (next != UINT64_MAX &&
+            (((next & 0xffffffffULL) == 0xffffffffULL) || ((next >> 32) == 0xffffffffULL))) {
+            return YES;
+        }
+        if (KPIsRepeatedByteWord(next)) return YES;
     }
     return NO;
 }

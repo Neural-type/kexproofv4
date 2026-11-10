@@ -1432,8 +1432,6 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             NSArray *preCandPairs = @[
                 @[ @"HwFeatureOn",             @8 ],
                 @[ @"HwFeatureOff",            @8 ],
-                @[ @"EnableEntropyCodingSync", (id)kCFBooleanFalse ],
-                @[ @"EnableEntropyCodingSync", (id)kCFBooleanTrue ],
                 @[ @"SwFeatureOn",             @1 ],
                 @[ @"PerfFeatureOn",           @1 ],
                 @[ @"AlgFeatureOn",            @1 ],
@@ -1572,8 +1570,6 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                         @[ @"Quality",                 @0.25 ],
                         @[ @"Quality",                 @0.75 ],
                         @[ @"Quality",                 @1.0 ],
-                        @[ @"EnableEntropyCodingSync", (id)kCFBooleanFalse ],
-                        @[ @"EnableEntropyCodingSync", (id)kCFBooleanTrue ],
                         @[ @"HwFeatureOn",             @8 ],
                         @[ @"HwFeatureOff",            @8 ],
                         @[ @"AlgFeatureOn",            @1 ],
@@ -3036,9 +3032,10 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 KPH9SafeTeardownEx(s, NULL, sRes);
                 if (dpbSib) KPH9SafeTeardown(dpbSib);
 
-                KPH9OutAppend(log, @"  dynSteer[kptr=0x%016llx -> NTL=%d x0=0x%016llx]: usage=%d pubSet=%d dpb34=%d PRE=%d prep=%d POST=%d enc=%d(cb=%d)\n",
+                int seqSubLayersM1 = (postPub < 2 && sntl >= 2) ? (sntl - 1) : (postPub - 1);
+                KPH9OutAppend(log, @"  dynSteer[kptr=0x%016llx -> NTL=%d x0=0x%016llx]: usage=%d pubSet=%d dpb34=%d PRE=%d prep=%d POST=%d([+0x2eec]=%d) enc=%d(cb=%d)\n",
                               origKPtr, sntl, steeredX0, (int)uSt, (int)pubSt, (int)dpbSt,
-                              prePub, (int)prepSt, postPub, (int)encSt, (int)cbSt);
+                              prePub, (int)prepSt, postPub, seqSubLayersM1, (int)encSt, (int)cbSt);
             } else if (sRes) {
                 free(sRes);
             }
@@ -3545,8 +3542,9 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                 }
                 @synchronized ([KPH9EncoderModule class]) {
                     res->closed = 1;
-                    KPH9OutAppend(out, @"  raw   NTL=%-5d x0=0x%016llx usage=%d set=%d PRE=%d prep=%d POST=%d enc=%@ | %s\n",
-                                  ntl, x0, (int)uSt, (int)nSt, pre, (int)prep, post, encStr, res->first);
+                    int seqSubLayersM1 = (post < 2 && ntl >= 2) ? (ntl - 1) : (post - 1);
+                    KPH9OutAppend(out, @"  raw   NTL=%-5d x0=0x%016llx usage=%d set=%d PRE=%d prep=%d POST=%d([+0x2eec]=%d) enc=%@ | %s\n",
+                                  ntl, x0, (int)uSt, (int)nSt, pre, (int)prep, post, seqSubLayersM1, encStr, res->first);
                 }
                 KPH9SafeTeardownEx(s, NULL, res);
             }

