@@ -173,7 +173,7 @@ static BOOL isKernelPointer(uint64_t v) {
                 for (size_t i = 0; i < words; i++) {
                     uint64_t v = pageBuf[i];
                     if (!isKernelPointer(v)) continue;
-                    if (KPIsKnownDiagnosticConstant(v)) {
+                    if (KPIsKnownDiagnosticConstant(v) || (i + 1 < words && pageBuf[i + 1] == 0x000000000000beefULL)) {
                         filteredConstants++;
                         continue;
                     }

@@ -135,6 +135,10 @@ static BOOL KPIsKernelPointerCandidate(uint64_t value) {
 }
 
 static BOOL KPIsKnownDiagnosticConstant(uint64_t value) {
+    // Filter userspace malloc_small packed [uint32_t xx806580, int32_t neg] entries
+    // confirmed by Stage 5 context dump (ctx[+1] == 0xbeef).
+    if ((value & 0x00ffffffULL) == 0x00806580ULL) return YES;
+
     static const uint64_t constants[] = {
         0xfffffff000000000ULL,
         0xfffffff007004000ULL,
@@ -161,6 +165,13 @@ static BOOL KPIsKnownDiagnosticConstant(uint64_t value) {
         int64_t index = (int64_t)ntlValues[i] - 16463;
         if (value == (((uint64_t)index << 32) | 0x59)) return YES;
     }
+    return NO;
+}
+
+static inline BOOL KPIsContextFalsePositive(const uint64_t *words, size_t wordCount, size_t index) {
+    if (!words || index >= wordCount) return NO;
+    if (index + 1 < wordCount && words[index + 1] == 0x000000000000beefULL) return YES;
+    if (index > 0 && (words[index - 1] & 0xffffffffULL) == 0xeabb9729ULL) return YES;
     return NO;
 }
 

