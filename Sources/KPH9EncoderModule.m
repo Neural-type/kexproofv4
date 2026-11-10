@@ -1381,10 +1381,28 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 KPH9OutAppend(log, @"  scalarProp[%@]: %@\n", spName, [spParts componentsJoinedByString:@" "]);
             }
 
-            // Pre-prepare OOB sweep on `ps` (which never calls PrepareToEncodeFrames or EncodeFrame):
-            // Check status codes of internal H9 properties and whether any pre-prepare SetProperty mutates pINS + 0x9c14..0x9c83.
+            // Pre-prepare OOB & internal AVE_PROPERTY_KEY_* sweep on `ps` (which never calls PrepareToEncodeFrames or EncodeFrame):
+            // 1) Setting "PropertyMode" = @1 (AVE_Prop_HEVC_SetPropertyMode at 0x5594148, entry [0] of the 191-entry HEVC table)
+            //    writes 1 to [x19 + 0x122a0], causing AVE_Prop_SetProperty (0x54c32e4) and AVE_Prop_CopyProperty (0x54af33c)
+            //    to keep w9 = 1 (0x101 pre-prepare / 0x201 post-prepare) and unlock all 62 internal AVE_PROPERTY_KEY_* properties!
+            // 2) Seed ChromaQPIndexOffsetMultiPPS with cqpSeed16 (so cr[7] at pps[0]+0x60..0x63 = 4) and expand UserParameterSetsIds
+            //    to plen=21 to monitor both cr[7] (pps[0]+0x60..0x63, byte 3 +0x63 = transquant_bypass_enabled_flag) and
+            //    oob[0..27] (pps[0]+0x64..0xd3, byte 1 of oob[0] at +0x65 = entropy_coding_sync_enabled_flag).
+            OSStatus stHwBeforePm = VTSessionSetProperty(ps, CFSTR("HwFeatureOn"), (__bridge CFNumberRef)@8);
+            OSStatus stMergeBeforePm = VTSessionSetProperty(ps, CFSTR("NumOfMergeCandidates"), (__bridge CFNumberRef)@3);
+            OSStatus stPm1 = VTSessionSetProperty(ps, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+            int rbPmVal = -1;
+            CFNumberRef rbPm = NULL;
+            if (VTSessionCopyProperty(ps, CFSTR("PropertyMode"), kCFAllocatorDefault, &rbPm) == noErr && rbPm) {
+                CFNumberGetValue(rbPm, kCFNumberIntType, &rbPmVal);
+                CFRelease(rbPm);
+            }
+            NSArray *cqpSeed16Pre = @[ @(-12), @(-11), @(-10), @(-9), @(-8), @(-7), @(-6), @(-5),
+                                       @(-4),  @(-3),  @(-2),  @(-1), @(1),  @(2),  @(3),  @(4) ];
+            VTSessionSetProperty(ps, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpSeed16Pre);
             NSMutableArray *pArr21Pre = [NSMutableArray arrayWithCapacity:21];
             for (int k = 0; k < 21; k++) [pArr21Pre addObject:@((k < 2) ? (k + 1) : (k - 1))];
+            int preCr7 = 4;
             int preOob[28];
             for (int wi = 0; wi < 28; wi++) preOob[wi] = (wi == 0) ? 256 : 0;
             VTSessionSetProperty(ps, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr21Pre);
@@ -1393,6 +1411,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 if (CFGetTypeID(rbPreInit) == CFArrayGetTypeID()) {
                     NSArray *nsPreInit = (__bridge NSArray *)rbPreInit;
                     if (nsPreInit.count >= 72) {
+                        preCr7 = [nsPreInit[15] intValue];
                         for (int wi = 0; wi < 28; wi++) {
                             preOob[wi] = [nsPreInit[(NSUInteger)(2 * (wi + 8) + 1)] intValue];
                         }
@@ -1401,15 +1420,31 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 CFRelease(rbPreInit);
             }
             NSArray *preCandPairs = @[
-                @[ @"EnableEntropyCodingSync", (id)kCFBooleanTrue ],
-                @[ @"EnableEntropyCodingSync", (id)kCFBooleanFalse ],
+                @[ @"HwFeatureOn",             @8 ],
+                @[ @"HwFeatureOff",            @8 ],
+                @[ @"SwFeatureOn",             @1 ],
+                @[ @"PerfFeatureOn",           @1 ],
+                @[ @"AlgFeatureOn",            @1 ],
+                @[ @"RCFeatureOn",             @1 ],
+                @[ @"GOPFeatureOn",            @1 ],
+                @[ @"RefFeatureOn",            @1 ],
+                @[ @"QPModFeatureOn",          @1 ],
+                @[ @"LambdaModFeatureOn",      @1 ],
+                @[ @"ModeDecFeatureOn",        @1 ],
+                @[ @"SEIFeatureOn",            @1 ],
+                @[ @"VUIFeatureOn",            @1 ],
+                @[ @"NumOfMergeCandidates",    @3 ],
+                @[ @"ForceSliceRPS",           (id)kCFBooleanTrue ],
+                @[ @"UseReferenceCompressedBuffers", (id)kCFBooleanTrue ],
+                @[ @"InitialQPI",              @22 ],
+                @[ @"NumOfPFrame",             @4 ],
+                @[ @"NumOfBFrame",             @2 ],
+                @[ @"NumOfTemporalLayer",      @2 ],
                 @[ @"Quality",                 @0.5 ],
-                @[ @"NumMergeCandidates",      @3 ],
+                @[ @"Quality",                 @1.0 ],
                 @[ @"SpatialAdaptiveQPLevel",  @2 ],
                 @[ @"QuantizationScalingMatrixPreset", @1 ],
                 @[ @"EnableWeightedPrediction",(id)kCFBooleanTrue ],
-                @[ @"EnableMCTF",              (id)kCFBooleanTrue ],
-                @[ @"MCTFLatencyMode",         @1 ],
             ];
             NSMutableArray *preStParts = [NSMutableArray array];
             NSMutableArray *preDiffHits = [NSMutableArray array];
@@ -1423,11 +1458,18 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                     if (CFGetTypeID(rbCand) == CFArrayGetTypeID()) {
                         NSArray *nsCand = (__bridge NSArray *)rbCand;
                         if (nsCand.count >= 72) {
+                            int curCr7 = [nsCand[15] intValue];
+                            int curAlias30 = [nsCand[30] intValue];
+                            if (curCr7 != preCr7) {
+                                [preDiffHits addObject:[NSString stringWithFormat:@"%@=%@(st=%d):cr[7]/ns[30](pps+0x60..0x63):%d->%d(0x%08x,alias30=0x%08x)",
+                                                        kName, kVal, (int)stSet, preCr7, curCr7, (unsigned)curCr7, (unsigned)curAlias30]];
+                                preCr7 = curCr7;
+                            }
                             for (int wi = 0; wi < 28; wi++) {
                                 int v = [nsCand[(NSUInteger)(2 * (wi + 8) + 1)] intValue];
                                 if (v != preOob[wi]) {
-                                    [preDiffHits addObject:[NSString stringWithFormat:@"%@=%@(st=%d):oob[%d](+0x%02x):%d->%d(0x%08x)",
-                                                            kName, kVal, (int)stSet, wi, 0x40 + wi * 4, preOob[wi], v, (unsigned)v]];
+                                    [preDiffHits addObject:[NSString stringWithFormat:@"%@=%@(st=%d):oob[%d](pps+0x%02x):%d->%d(0x%08x)",
+                                                            kName, kVal, (int)stSet, wi, 0x64 + wi * 4, preOob[wi], v, (unsigned)v]];
                                     preOob[wi] = v;
                                 }
                             }
@@ -1436,7 +1478,8 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                     CFRelease(rbCand);
                 }
             }
-            KPH9OutAppend(log, @"  cqpOobSweepPre[props=%lu]: st=[%@] hits=%lu [%@]\n",
+            KPH9OutAppend(log, @"  cqpOobSweepPre[pm1=%d(rb=%d,before=%d/%d) props=%lu]: st=[%@] hits=%lu [%@]\n",
+                          (int)stPm1, rbPmVal, (int)stHwBeforePm, (int)stMergeBeforePm,
                           (unsigned long)preCandPairs.count,
                           [preStParts componentsJoinedByString:@" "],
                           (unsigned long)preDiffHits.count,
@@ -1462,6 +1505,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 if (mapRes && VTCompressionSessionCreate(kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
                                                          NULL, NULL, NULL, Stage6OutputCallback, mapRes, &mapS) == noErr && mapS) {
                     KPH9PrimeRealTime(mapS);
+                    VTSessionSetProperty(mapS, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
                     VTSessionSetProperty(mapS, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpSeed16);
 
                     OSStatus prepMapSt = VTCompressionSessionPrepareToEncodeFrames(mapS);
@@ -1469,6 +1513,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                     int w0 = 0;
                     while (mapRes->cbCount < 1 && w0 < 80) { usleep(2000); w0 += 2; }
 
+                    int prevCr7 = 4;
                     int prevOob[28];
                     for (int wi = 0; wi < 28; wi++) prevOob[wi] = (wi == 0) ? 256 : 0;
 
@@ -1482,6 +1527,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                                           (int)prepMapSt, (int)encMapSt, mapRes->cbCount, (int)postPs21St,
                                           (unsigned long)nsPost.count, [nsPost componentsJoinedByString:@","]);
                             if (nsPost.count >= 72) {
+                                prevCr7 = [nsPost[15] intValue];
                                 NSMutableArray *cb8 = [NSMutableArray arrayWithCapacity:8];
                                 NSMutableArray *cr8 = [NSMutableArray arrayWithCapacity:8];
                                 NSMutableArray *oob28 = [NSMutableArray arrayWithCapacity:28];
@@ -1498,7 +1544,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                                     prevOob[wi - 8] = oddVal;
                                     [oob28 addObject:nsPost[(NSUInteger)(2 * wi + 1)]];
                                 }
-                                KPH9OutAppend(log, @"  cqpStructLayout[alias=%d/28]: cb[+0x00..+0x1f]=[%@] cr[+0x20..+0x3f]=[%@] oob[+0x40..+0xaf]=[%@]\n",
+                                KPH9OutAppend(log, @"  cqpStructLayout[alias=%d/28]: cb[+0x24..+0x40]=[%@] cr[+0x44..+0x60]=[%@] oob[+0x64..+0xd3]=[%@]\n",
                                               aliasMatches,
                                               [cb8 componentsJoinedByString:@","],
                                               [cr8 componentsJoinedByString:@","],
@@ -1507,10 +1553,20 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                         }
                         CFRelease(rbPost);
                     }
-                    // Check whether setting any writable HEVC session property post-EncodeFrame modifies oob[0..27] (pINS + 0x9c14..0x9c83)
+                    // Check whether setting writable HEVC session properties post-EncodeFrame modifies cr[7] (pps[0]+0x60..0x63)
+                    // or oob[0..27] (pps[0]+0x64..0xd3):
+                    // Note: AVE_HEVC_SetQuality (0x54d9798) only sets pps[0]+0x63 = 1 when w22 == 100 (Quality == 1.0)!
                     NSArray *candPairs = @[
                         @[ @"Quality",                 @0.25 ],
                         @[ @"Quality",                 @0.75 ],
+                        @[ @"Quality",                 @1.0 ],
+                        @[ @"HwFeatureOn",             @8 ],
+                        @[ @"HwFeatureOff",            @8 ],
+                        @[ @"AlgFeatureOn",            @1 ],
+                        @[ @"GOPFeatureOn",            @1 ],
+                        @[ @"RCFeatureOn",             @1 ],
+                        @[ @"SEIFeatureOn",            @1 ],
+                        @[ @"VUIFeatureOn",            @1 ],
                         @[ @"AllowFrameReordering",    (id)kCFBooleanFalse ],
                         @[ @"AllowOpenGOP",            (id)kCFBooleanFalse ],
                         @[ @"AllowTemporalCompression",(id)kCFBooleanFalse ],
@@ -1564,11 +1620,18 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                             if (CFGetTypeID(rbCand) == CFArrayGetTypeID()) {
                                 NSArray *nsCand = (__bridge NSArray *)rbCand;
                                 if (nsCand.count >= 72) {
+                                    int curCr7 = [nsCand[15] intValue];
+                                    int curAlias30 = [nsCand[30] intValue];
+                                    if (curCr7 != prevCr7) {
+                                        [diffHits addObject:[NSString stringWithFormat:@"%@=%@(st=%d):cr[7]/ns[30](pps+0x60..0x63):%d->%d(0x%08x,alias30=0x%08x)",
+                                                             kName, kVal, (int)stSet, prevCr7, curCr7, (unsigned)curCr7, (unsigned)curAlias30]];
+                                        prevCr7 = curCr7;
+                                    }
                                     for (int wi = 0; wi < 28; wi++) {
                                         int v = [nsCand[(NSUInteger)(2 * (wi + 8) + 1)] intValue];
                                         if (v != prevOob[wi]) {
-                                            [diffHits addObject:[NSString stringWithFormat:@"%@=%@(st=%d):oob[%d](+0x%02x):%d->%d(0x%08x)",
-                                                                 kName, kVal, (int)stSet, wi, 0x40 + wi * 4, prevOob[wi], v, (unsigned)v]];
+                                            [diffHits addObject:[NSString stringWithFormat:@"%@=%@(st=%d):oob[%d](pps+0x%02x):%d->%d(0x%08x)",
+                                                                 kName, kVal, (int)stSet, wi, 0x64 + wi * 4, prevOob[wi], v, (unsigned)v]];
                                             prevOob[wi] = v;
                                         }
                                     }
@@ -1593,9 +1656,11 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             }
         }
 
-        // Also test a clean session where Quality=0.5 is set BEFORE PrepareToEncodeFrames + EncodeFrame
-        // (and UserParameterSetsIds is NOT touched until AFTER EncodeFrame) to check if AVE_HEVC_SetQuality
-        // (0x983dc4) sets pINS + 0x9c17 (byte 3 of oob[0] -> 0x01000100) during Prepare/EncodeFrame!
+        // Verify AVE_HEVC_SetQuality (0x54d9798) with Quality=1.0 (w22 == 100 == 0x64 -> strb w9, [x19 + 0x7063] = 1,
+        // transquant_bypass_enabled_flag) set AFTER cqpSeed16 and BEFORE PrepareToEncodeFrames + EncodeFrame:
+        //   - cqpSeed16[15] (w14=8 odd) writes 4 (0x00000004) to x19 + 0x7060..0x7063 (cr[7] = nsQ[15] and alias nsQ[30]).
+        //   - Quality=1.0 sets byte +0x7063 = 1, mutating cr[7] (nsQ[15]) and nsQ[30] to 0x01000004 (16777220) and emitting
+        //     transquant_bypass_enabled_flag=1 in the encoded PPS NALU!
         {
             NSMutableArray *pArr21 = [NSMutableArray arrayWithCapacity:21];
             for (int k = 0; k < 21; k++) [pArr21 addObject:@((k < 2) ? (k + 1) : (k - 1))];
@@ -1609,8 +1674,8 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 if (qRes && VTCompressionSessionCreate(kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
                                                        NULL, NULL, NULL, Stage6OutputCallback, qRes, &qS) == noErr && qS) {
                     KPH9PrimeRealTime(qS);
-                    OSStatus stQ = VTSessionSetProperty(qS, kVTCompressionPropertyKey_Quality, (__bridge CFTypeRef)@0.5);
                     VTSessionSetProperty(qS, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpSeed16);
+                    OSStatus stQ = VTSessionSetProperty(qS, kVTCompressionPropertyKey_Quality, (__bridge CFTypeRef)@1.0);
                     OSStatus prepQ = VTCompressionSessionPrepareToEncodeFrames(qS);
                     OSStatus encQ = VTCompressionSessionEncodeFrame(qS, pxHold, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
                     int w0 = 0;
@@ -1621,13 +1686,20 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                         if (CFGetTypeID(rbQ) == CFArrayGetTypeID()) {
                             NSArray *nsQ = (__bridge NSArray *)rbQ;
                             if (nsQ.count >= 72) {
+                                int cr7Val = [nsQ[15] intValue];
+                                int alias30Val = [nsQ[30] intValue];
                                 NSMutableArray *oob28 = [NSMutableArray arrayWithCapacity:28];
                                 for (int wi = 8; wi < 36; wi++) {
                                     [oob28 addObject:nsQ[(NSUInteger)(2 * wi + 1)]];
                                 }
-                                KPH9OutAppend(log, @"  cqpOobQualityMap[q=%d,prep=%d,enc=%d,cb=%d,ps21=%d]: oob[+0x40..+0xaf]=[%@]\n",
+                                NSString *cbStr = nil;
+                                @synchronized ([KPH9EncoderModule class]) {
+                                    cbStr = [NSString stringWithUTF8String:qRes->first] ?: @"(no cb)";
+                                }
+                                KPH9OutAppend(log, @"  cqpOobQualityMap[q1.0=%d,prep=%d,enc=%d,cb=%d,ps21=%d]: cr[7]=%d(0x%08x,ns[30]=0x%08x) oob[+0x64..+0xd3]=[%@] | %@\n",
                                               (int)stQ, (int)prepQ, (int)encQ, qRes->cbCount, (int)post21Q,
-                                              [oob28 componentsJoinedByString:@","]);
+                                              cr7Val, (unsigned)cr7Val, (unsigned)alias30Val,
+                                              [oob28 componentsJoinedByString:@","], cbStr);
                             }
                         }
                         CFRelease(rbQ);
@@ -1646,9 +1718,10 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             }
         }
 
-        // Also compare cqpOobMap on an EnableUserRefForFacetime session encoded with plen=10 (7 extra PPSs)
-        // BEFORE expanding UserParameterSetsIds to plen=21 after EncodeFrame, to see if multi-PPS EncodeFrame
-        // populates any fields in +0x40..+0xaf!
+        // Verify PPS setup at 0x54fcdf8..0x54fce04 (ldr x9, [x19, #0x2b8]; tst x9, #8; cset w9, eq; strb w9, [x8, #0x65]):
+        // Setting PropertyMode=@1 + HwFeatureOn=@8 sets bit 3 (0x8) in [x19 + 0x2b8] (via 0x55ca27c and 0x55274b8),
+        // so during EncodeFrame 0x54fce04 writes 0 to x19 + 0x7065 (pps[0].entropy_coding_sync_enabled_flag),
+        // flipping oob[0] (ns[17] and alias ns[32], at x19 + 0x7064..0x7067) from 256 (0x00000100) to 0 (0x00000000)!
         {
             NSMutableArray *pArr10 = [NSMutableArray arrayWithCapacity:10];
             for (int k = 0; k < 10; k++) [pArr10 addObject:@((k < 2) ? (k + 1) : (k - 1))];
@@ -1667,6 +1740,14 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                                                          Stage6OutputCallback, m10Res, &m10S) == noErr && m10S) {
                     VTSessionSetProperty(m10S, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
                     KPH9PrimeRealTime(m10S);
+                    OSStatus stPm = VTSessionSetProperty(m10S, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+                    OSStatus stHw8 = VTSessionSetProperty(m10S, CFSTR("HwFeatureOn"), (__bridge CFNumberRef)@8);
+                    long long rbHwVal = -1;
+                    CFNumberRef rbHw = NULL;
+                    if (VTSessionCopyProperty(m10S, CFSTR("HwFeatureOn"), kCFAllocatorDefault, &rbHw) == noErr && rbHw) {
+                        CFNumberGetValue(rbHw, kCFNumberSInt64Type, &rbHwVal);
+                        CFRelease(rbHw);
+                    }
                     VTSessionSetProperty(m10S, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpSeed16);
                     VTSessionSetProperty(m10S, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr10);
                     VTSessionSetProperty(m10S, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpSeed16);
@@ -1680,13 +1761,19 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                         if (CFGetTypeID(rb10) == CFArrayGetTypeID()) {
                             NSArray *ns10 = (__bridge NSArray *)rb10;
                             if (ns10.count >= 72) {
+                                int oob0Val = [ns10[17] intValue];
+                                int alias32Val = [ns10[32] intValue];
                                 NSMutableArray *oob28 = [NSMutableArray arrayWithCapacity:28];
                                 for (int wi = 8; wi < 36; wi++) {
                                     [oob28 addObject:ns10[(NSUInteger)(2 * wi + 1)]];
                                 }
-                                KPH9OutAppend(log, @"  cqpOobMapPlen10[prep=%d,enc=%d,cb=%d,ps21=%d]: oob[+0x40..+0xaf]=[%@]\n",
-                                              (int)prep10St, (int)enc10St, m10Res->cbCount, (int)post21St,
-                                              [oob28 componentsJoinedByString:@","]);
+                                NSString *cbStr = nil;
+                                @synchronized ([KPH9EncoderModule class]) {
+                                    cbStr = [NSString stringWithUTF8String:m10Res->first] ?: @"(no cb)";
+                                }
+                                KPH9OutAppend(log, @"  cqpOobMapPlen10[pm=%d,hw8=%d(rb=0x%llx),prep=%d,enc=%d,cb=%d,ps21=%d]: oob[0]=%d(ns[32]=%d) oob[+0x64..+0xd3]=[%@] | %@\n",
+                                              (int)stPm, (int)stHw8, rbHwVal, (int)prep10St, (int)enc10St, m10Res->cbCount, (int)post21St,
+                                              oob0Val, alias32Val, [oob28 componentsJoinedByString:@","], cbStr);
                             }
                         }
                         CFRelease(rb10);
@@ -2614,6 +2701,8 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             VTSessionSetProperty(rpsProbeS, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
             KPH9PrimeRealTime(rpsProbeS);
 
+            OSStatus stPmRps = VTSessionSetProperty(rpsProbeS, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+            OSStatus stForceRps = VTSessionSetProperty(rpsProbeS, CFSTR("ForceSliceRPS"), kCFBooleanTrue);
             OSStatus stPsIds2 = VTSessionSetProperty(rpsProbeS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @0, @1 ]);
             OSStatus stPsIds4 = VTSessionSetProperty(rpsProbeS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @0, @1, @2, @3 ]);
             CFTypeRef psIdsRb = NULL;
@@ -2632,8 +2721,8 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                                                           (__bridge CFTypeRef)@[rpsExact2x2, rpsExact2x2, rpsExact2x2, rpsExact2x2]);
             OSStatus stPreArr5     = VTSessionSetProperty(rpsProbeS, CFSTR("UserRPSForFaceTime"),
                                                           (__bridge CFTypeRef)@[rpsExact2x2, rpsExact2x2, rpsExact2x2, rpsExact2x2, rpsExact2x2]);
-            KPH9OutAppend(out, @"  set UserRPS @pre (psIds2=%d psIds4=%d rbPs=%ld): 0x0=%d 1x0=%d 2x2=%d 2x0=%d pred1=%d inOob24=%d arr4=%d arr5=%d\n",
-                          (int)stPsIds2, (int)stPsIds4, (long)psIdsRbCnt,
+            KPH9OutAppend(out, @"  set UserRPS @pre (pm1=%d forceRps=%d psIds2=%d psIds4=%d rbPs=%ld): 0x0=%d 1x0=%d 2x2=%d 2x0=%d pred1=%d inOob24=%d arr4=%d arr5=%d\n",
+                          (int)stPmRps, (int)stForceRps, (int)stPsIds2, (int)stPsIds4, (long)psIdsRbCnt,
                           (int)stPre0x0, (int)stPre1x0, (int)stPre2x2, (int)stPre2x0, (int)stPrePred1, (int)stPreInner24, (int)stPreArr4, (int)stPreArr5);
 
             int cqpCounts[] = { 1, 2, 4, 6, 8, 10, 12, 14, 16, 17, 18, 32 };
