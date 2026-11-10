@@ -172,6 +172,8 @@ static CMFormatDescriptionRef gLastCapturedPps127HEVCFmt = NULL;
 static CMSampleBufferRef gLastCapturedPps127HEVCSbuf = NULL;
 static CMFormatDescriptionRef gLastCapturedSps128HEVCFmt = NULL;
 static CMSampleBufferRef gLastCapturedSps128HEVCSbuf = NULL;
+static CMFormatDescriptionRef gLastCapturedSps63P63HEVCFmt = NULL;
+static CMSampleBufferRef gLastCapturedSps63P63HEVCSbuf = NULL;
 
 static Stage6ProbeResult *Stage6AllocResult(void) {
     Stage6ProbeResult *res = (Stage6ProbeResult *)calloc(1, sizeof(Stage6ProbeResult));
@@ -334,6 +336,9 @@ static void Stage6OutputCallback(void *outputCallbackRefCon,
         } else if (res->captureSlot == 5 || (res->captureSlot == 0 && spsSize >= 36)) {
             if (fmt && !gLastCapturedSps128HEVCFmt) gLastCapturedSps128HEVCFmt = (CMFormatDescriptionRef)CFRetain(fmt);
             if (sampleBuffer && !gLastCapturedSps128HEVCSbuf) gLastCapturedSps128HEVCSbuf = (CMSampleBufferRef)CFRetain(sampleBuffer);
+        } else if (res->captureSlot == 6) {
+            if (fmt && !gLastCapturedSps63P63HEVCFmt) gLastCapturedSps63P63HEVCFmt = (CMFormatDescriptionRef)CFRetain(fmt);
+            if (sampleBuffer && !gLastCapturedSps63P63HEVCSbuf) gLastCapturedSps63P63HEVCSbuf = (CMSampleBufferRef)CFRetain(sampleBuffer);
         }
         if (res->closed) return;
         res->cbCount++;
@@ -1442,7 +1447,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 @[ @"NumOfTemporalLayer",      @2 ],
                 @[ @"Quality",                 @0.5 ],
                 @[ @"Quality",                 @1.0 ],
-                @[ @"SpatialAdaptiveQPLevel",  @2 ],
+                @[ @"SpatialAdaptiveQPLevel",  @0 ],
                 @[ @"QuantizationScalingMatrixPreset", @1 ],
                 @[ @"EnableWeightedPrediction",(id)kCFBooleanTrue ],
             ];
@@ -1577,7 +1582,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                         @[ @"MaxAllowedFrameQP",         @45 ],
                         @[ @"MinAllowedFrameQP",         @15 ],
                         @[ @"QuantizationScalingMatrixPreset", @1 ],
-                        @[ @"SpatialAdaptiveQPLevel",    @2 ],
+                        @[ @"SpatialAdaptiveQPLevel",    @0 ],
                         @[ @"EnableUserQPMap",           (id)kCFBooleanTrue ],
                         @[ @"EnableWeightedPrediction",  (id)kCFBooleanTrue ],
                         @[ @"TemporalIDNestingFlag",     (id)kCFBooleanTrue ],
@@ -1751,6 +1756,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                     VTSessionSetProperty(m10S, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpSeed16);
                     VTSessionSetProperty(m10S, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr10);
                     VTSessionSetProperty(m10S, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpSeed16);
+                    OSStatus stQ10 = VTSessionSetProperty(m10S, kVTCompressionPropertyKey_Quality, (__bridge CFTypeRef)@1.0);
                     OSStatus prep10St = VTCompressionSessionPrepareToEncodeFrames(m10S);
                     OSStatus enc10St = VTCompressionSessionEncodeFrame(m10S, pxHold, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
                     int w0 = 0;
@@ -1761,6 +1767,8 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                         if (CFGetTypeID(rb10) == CFArrayGetTypeID()) {
                             NSArray *ns10 = (__bridge NSArray *)rb10;
                             if (ns10.count >= 72) {
+                                int cr7Val = [ns10[15] intValue];
+                                int alias30Val = [ns10[30] intValue];
                                 int oob0Val = [ns10[17] intValue];
                                 int alias32Val = [ns10[32] intValue];
                                 NSMutableArray *oob28 = [NSMutableArray arrayWithCapacity:28];
@@ -1771,9 +1779,9 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                                 @synchronized ([KPH9EncoderModule class]) {
                                     cbStr = [NSString stringWithUTF8String:m10Res->first] ?: @"(no cb)";
                                 }
-                                KPH9OutAppend(log, @"  cqpOobMapPlen10[pm=%d,hw8=%d(rb=0x%llx),prep=%d,enc=%d,cb=%d,ps21=%d]: oob[0]=%d(ns[32]=%d) oob[+0x64..+0xd3]=[%@] | %@\n",
-                                              (int)stPm, (int)stHw8, rbHwVal, (int)prep10St, (int)enc10St, m10Res->cbCount, (int)post21St,
-                                              oob0Val, alias32Val, [oob28 componentsJoinedByString:@","], cbStr);
+                                KPH9OutAppend(log, @"  cqpOobMapPlen10[pm=%d,hw8=%d(rb=0x%llx),q1.0=%d,prep=%d,enc=%d,cb=%d,ps21=%d]: cr[7]=0x%08x(ns[30]=0x%08x) oob[0]=%d(ns[32]=%d) oob[+0x64..+0xd3]=[%@] | %@\n",
+                                              (int)stPm, (int)stHw8, rbHwVal, (int)stQ10, (int)prep10St, (int)enc10St, m10Res->cbCount, (int)post21St,
+                                              (unsigned)cr7Val, (unsigned)alias30Val, oob0Val, alias32Val, [oob28 componentsJoinedByString:@","], cbStr);
                             }
                         }
                         CFRelease(rb10);
@@ -1799,16 +1807,18 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
     //   3) Valid sps=5 with out-of-spec pps=64 (sps=5, pps=64 > 63, alpha=3 -> captureSlot=3, 29B SPS / 9B PPS)
     //   4) Valid sps=5 with out-of-spec pps=127 (sps=5, pps=127, alpha=3 -> captureSlot=4, 29B SPS / 10B PPS)
     //   5) Sign-extended 37-byte SPS / 17-byte PPS (sps=128 -> 0xffffff80 in WriteUE, pps=9 -> captureSlot=5)
-    // BEFORE 7F so VTDecompressionSession can audit all 6 bitstreams independently.
+    //   6) Out-of-spec sps=63 (>15 H.265 limit, yet accepted by VTDecompressionSessionCreate!) + pps=63 (captureSlot=6)
+    // BEFORE 7F so VTDecompressionSession can audit all 7 bitstreams independently.
     {
-        int primeCfg[5][4] = {
+        int primeCfg[6][4] = {
             { 5,   9,   3, 1 },
             { 64,  9,   3, 2 },
             { 5,   64,  3, 3 },
             { 5,   127, 3, 4 },
             { 128, 9,   3, 5 },
+            { 63,  63,  3, 6 },
         };
-        for (int pi = 0; pi < 5; pi++) {
+        for (int pi = 0; pi < 6; pi++) {
             Stage6ProbeResult *preRes = Stage6AllocResult();
             VTCompressionSessionRef preS = NULL;
             if (preRes) preRes->captureSlot = primeCfg[pi][3];
@@ -1831,19 +1841,21 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
     }
 
     // 7F: VTDecompressionSession RequestedMVHEVCVideoLayerIDs validation & DecodeFrame audit
-    // Tests 1-layer (26B VPS), 2-layer (39B VPS, alpha=3), Sps64 (sps_id=64, pps_id=9),
-    // Pps64 (sps_id=5, pps_id=64), Pps127 (sps_id=5, pps_id=127), and sign-extended sps=128 (37B SPS / 17B PPS),
+    // Tests 1-layer (26B VPS), 2-layer (39B VPS, alpha=3), Sps63P63 (out-of-spec sps_id=63 > 15, pps_id=63),
+    // Sps64 (sps_id=64, pps_id=9), Pps64 (sps_id=5, pps_id=64), Pps127 (sps_id=5, pps_id=127), and sign-extended sps=128 (37B SPS / 17B PPS),
     // including MultiImageCapableOutputHandler (resolving -17699 when layer 0 is requested) and cross-format / hybrid
     // parameter-set & VCL slice rewrite when VTDecompressionSessionCreate rejects the format description.
     KPH9OutAppend(log, @"  [7F: VTDecompressionSession RequestedMVHEVCVideoLayerIDs Validation & DecodeFrame Audit]\n");
     {
-        CMFormatDescriptionRef fmt1 = NULL, fmt2 = NULL, fmtS64 = NULL, fmtP64 = NULL, fmtP127 = NULL, fmt3 = NULL;
-        CMSampleBufferRef sbuf1 = NULL, sbuf2 = NULL, sbufS64 = NULL, sbufP64 = NULL, sbufP127 = NULL, sbuf3 = NULL;
+        CMFormatDescriptionRef fmt1 = NULL, fmt2 = NULL, fmtS63P63 = NULL, fmtS64 = NULL, fmtP64 = NULL, fmtP127 = NULL, fmt3 = NULL;
+        CMSampleBufferRef sbuf1 = NULL, sbuf2 = NULL, sbufS63P63 = NULL, sbufS64 = NULL, sbufP64 = NULL, sbufP127 = NULL, sbuf3 = NULL;
         @synchronized ([KPH9EncoderModule class]) {
             if (gLastCapturedHEVCFmt) fmt1 = (CMFormatDescriptionRef)CFRetain(gLastCapturedHEVCFmt);
             if (gLastCapturedHEVCSampleBuffer) sbuf1 = (CMSampleBufferRef)CFRetain(gLastCapturedHEVCSampleBuffer);
             if (gLastCapturedAlphaHEVCFmt) fmt2 = (CMFormatDescriptionRef)CFRetain(gLastCapturedAlphaHEVCFmt);
             if (gLastCapturedAlphaHEVCSbuf) sbuf2 = (CMSampleBufferRef)CFRetain(gLastCapturedAlphaHEVCSbuf);
+            if (gLastCapturedSps63P63HEVCFmt) fmtS63P63 = (CMFormatDescriptionRef)CFRetain(gLastCapturedSps63P63HEVCFmt);
+            if (gLastCapturedSps63P63HEVCSbuf) sbufS63P63 = (CMSampleBufferRef)CFRetain(gLastCapturedSps63P63HEVCSbuf);
             if (gLastCapturedSps64HEVCFmt) fmtS64 = (CMFormatDescriptionRef)CFRetain(gLastCapturedSps64HEVCFmt);
             if (gLastCapturedSps64HEVCSbuf) sbufS64 = (CMSampleBufferRef)CFRetain(gLastCapturedSps64HEVCSbuf);
             if (gLastCapturedPps64HEVCFmt) fmtP64 = (CMFormatDescriptionRef)CFRetain(gLastCapturedPps64HEVCFmt);
@@ -1878,9 +1890,9 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         for (int i = 0; i < 300; i++) [seq300 addObject:@(i)];
 
         if (fnMultiDec) {
-            CMFormatDescriptionRef miFmts[2] = { fmt1, fmt2 };
-            CMSampleBufferRef miSbufs[2] = { sbuf1, sbuf2 };
-            const char *miNames[2] = { "1Layer(vps=26)", "2Layer(vps=39,alpha=3)" };
+            CMFormatDescriptionRef miFmts[3] = { fmt1, fmt2, fmtS63P63 };
+            CMSampleBufferRef miSbufs[3] = { sbuf1, sbuf2, sbufS63P63 };
+            const char *miNames[3] = { "1Layer(vps=26)", "2Layer(vps=39,alpha=3)", "Sps63P63(sps=30,pps=10,id=63/63)" };
             NSArray *miCases = @[
                 @[ @"mi[0]",      @[ @0 ] ],
                 @[ @"mi[0,3]",    @[ @0, @3 ] ],
@@ -1889,7 +1901,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 @[ @"mi[0..63]",  seq64 ],
                 @[ @"mi[0..299]", seq300 ],
             ];
-            for (int mfi = 0; mfi < 2; mfi++) {
+            for (int mfi = 0; mfi < 3; mfi++) {
                 if (!miFmts[mfi] || !miSbufs[mfi]) continue;
                 NSMutableArray *miParts = [NSMutableArray array];
                 for (NSArray *mc in miCases) {
@@ -1944,17 +1956,18 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             @[ @"c[0..299]",  seq300 ],
             @[ @"c[-1]",      @[ @(-1) ] ],
         ];
-        CMFormatDescriptionRef fmts[6] = { fmt1, fmt2, fmtS64, fmtP64, fmtP127, fmt3 };
-        CMSampleBufferRef sbufs[6] = { sbuf1, sbuf2, sbufS64, sbufP64, sbufP127, sbuf3 };
-        const char *streamTags[6] = {
+        CMFormatDescriptionRef fmts[7] = { fmt1, fmt2, fmtS63P63, fmtS64, fmtP64, fmtP127, fmt3 };
+        CMSampleBufferRef sbufs[7] = { sbuf1, sbuf2, sbufS63P63, sbufS64, sbufP64, sbufP127, sbuf3 };
+        const char *streamTags[7] = {
             "1Layer(vps=26)",
             "2Layer(vps=39,alpha=3)",
+            "Sps63P63(sps=30,pps=10,id=63/63)",
             "Sps64(sps=30,pps=10,id=64/9)",
             "Pps64(sps=29,pps=9,id=5/64)",
             "Pps127(sps=29,pps=10,id=5/127)",
             "Sps128(sps=37,pps=17,id=128/9)"
         };
-        for (int si = 0; si < 6; si++) {
+        for (int si = 0; si < 7; si++) {
             if (!fmts[si]) continue;
             NSMutableArray *decParts = [NSMutableArray array];
             NSString *decSuppStr = @"none";
@@ -2106,16 +2119,19 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                                         bitIdx++;
                                     }
                                     size_t oldUeBits = 2 * (size_t)lz + 1;
-                                    if (bitIdx < totalBits && 2 + oldUeBits <= totalBits && lz <= 16) {
+                                    size_t srcHdrEndBit = 2 + oldUeBits + 40; // 2 IDR flags + ue(pps_id) + 40-bit slice_segment_header tail
+                                    size_t srcCabacByteOff = (srcHdrEndBit >> 3) + 1; // byte-aligned CABAC slice_segment_data() after byte_alignment()
+                                    if (bitIdx < totalBits && srcCabacByteOff <= payBytes && lz <= 16) {
                                         unsigned codeNum = 1;
                                         for (unsigned bi = 0; bi < lz; bi++) {
                                             size_t bpos = 2 + lz + 1 + bi;
                                             codeNum = (codeNum << 1) | ((pay[bpos >> 3] >> (7 - (bpos & 7))) & 1);
                                         }
                                         oldUePps = (int)codeNum - 1;
-                                        // Build patched buffer with ue(9) = 0001010 (7 bits) at bit offset 2
-                                        size_t newTotalBits = totalBits - oldUeBits + 7;
-                                        size_t newPayBytes = (newTotalBits + 7) / 8;
+                                        // Build patched buffer with ue(9) = 0001010 (7 bits) at bit offset 2 + 40-bit slice header tail
+                                        // + 7-bit byte_alignment() (1000000 at bits 49..55 -> byte 7) + byte-aligned CABAC slice_segment_data()!
+                                        size_t cabacBytes = payBytes - srcCabacByteOff;
+                                        size_t newPayBytes = 7 + cabacBytes;
                                         uint32_t newNalLen = 2 + (uint32_t)newPayBytes;
                                         size_t newBufLen = vclPayOff + newPayBytes;
                                         uint8_t *patched = (uint8_t *)calloc(1, newBufLen);
@@ -2137,11 +2153,17 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                                                 size_t db = 2 + b;
                                                 dstPay[db >> 3] |= (uint8_t)(ue9Bits[b] << (7 - (db & 7)));
                                             }
-                                            // Copy remaining bits from src (2 + oldUeBits .. totalBits - 1) to dst (9 ..)
+                                            // Copy the 40-bit slice_segment_header tail from src (2 + oldUeBits .. 2 + oldUeBits + 39) to dst (9 .. 48)
                                             size_t dstBit = 9;
-                                            for (size_t sb = 2 + oldUeBits; sb < totalBits; sb++, dstBit++) {
+                                            for (size_t sb = 2 + oldUeBits; sb < srcHdrEndBit; sb++, dstBit++) {
                                                 uint8_t bitVal = (pay[sb >> 3] >> (7 - (sb & 7))) & 1;
                                                 dstPay[dstBit >> 3] |= (uint8_t)(bitVal << (7 - (dstBit & 7)));
+                                            }
+                                            // Write byte_alignment() rbsp_slice_trailing_bits: alignment_bit_equal_to_one=1 at bit 49, padded with 0s to bit 55 (byte 7)
+                                            dstPay[49 >> 3] |= (uint8_t)(1u << (7 - (49 & 7)));
+                                            // Copy byte-aligned CABAC slice_segment_data() from pay + srcCabacByteOff into dstPay + 7
+                                            if (cabacBytes > 0) {
+                                                memcpy(dstPay + 7, pay + srcCabacByteOff, cabacBytes);
                                             }
                                             CMBlockBufferRef copyBlk = NULL;
                                             if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, newBufLen, kCFAllocatorDefault,
@@ -2194,12 +2216,14 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         }
         if (fmt1) CFRelease(fmt1);
         if (fmt2) CFRelease(fmt2);
+        if (fmtS63P63) CFRelease(fmtS63P63);
         if (fmtS64) CFRelease(fmtS64);
         if (fmtP64) CFRelease(fmtP64);
         if (fmtP127) CFRelease(fmtP127);
         if (fmt3) CFRelease(fmt3);
         if (sbuf1) CFRelease(sbuf1);
         if (sbuf2) CFRelease(sbuf2);
+        if (sbufS63P63) CFRelease(sbufS63P63);
         if (sbufS64) CFRelease(sbufS64);
         if (sbufP64) CFRelease(sbufP64);
         if (sbufP127) CFRelease(sbufP127);
