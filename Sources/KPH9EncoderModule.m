@@ -731,7 +731,14 @@ static NSString *Stage7ReadbackDPB(VTCompressionSessionRef session) {
             CFIndex c = CFArrayGetCount((CFArrayRef)rbProp);
             id firstObj = (c > 0) ? [(__bridge NSArray *)rbProp firstObject] : @"empty";
             id lastObj  = (c > 0) ? [(__bridge NSArray *)rbProp lastObject]  : @"empty";
-            rbStr = [NSString stringWithFormat:@"arr(%ld,first=%@,last=%@)", (long)c, firstObj, lastObj];
+            // Verify DSC .68 0x92f13c bug: AVE_Prop_HEVC_GetUserRPSForFaceTime reads [pINS + 0x2e2c..0x2e74] (DPB snapshot)!
+            CFTypeRef rpsAlias = NULL;
+            CFIndex rpsAliasCnt = -1;
+            if (VTSessionCopyProperty(session, CFSTR("UserRPSForFaceTime"), kCFAllocatorDefault, &rpsAlias) == noErr && rpsAlias) {
+                if (CFGetTypeID(rpsAlias) == CFArrayGetTypeID()) rpsAliasCnt = CFArrayGetCount((CFArrayRef)rpsAlias);
+                CFRelease(rpsAlias);
+            }
+            rbStr = [NSString stringWithFormat:@"arr(%ld,rpsAlias=%ld,first=%@,last=%@)", (long)c, (long)rpsAliasCnt, firstObj, lastObj];
         } else {
             rbStr = [NSString stringWithFormat:@"type=%lu", (unsigned long)CFGetTypeID(rbProp)];
         }
@@ -1349,7 +1356,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 KPH9OutAppend(log, @"  %@[0,v]: %@\n", mp, [mpParts componentsJoinedByString:@" "]);
             }
 
-            // Scalar RequiredHEVC* + log2_max_minus4 + EncodesAuxiliaryWithAuxID + NumberOfSlices + MultiReferencePSpacing
+            // Scalar RequiredHEVC* + log2_max_minus4 + EncodesAuxiliaryWithAuxID + NumberOfSlices + MultiReferencePSpacing + LookAheadFrames
             VTSessionSetProperty(ps, CFSTR("MVHEVCVideoLayerIDs"), (__bridge CFTypeRef)@[ @0 ]);
             NSArray<NSString *> *scalarReqProps = @[
                 @"RequiredHEVCSequenceParameterSetID",
@@ -1360,6 +1367,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                 @"EncodesAuxiliaryWithAuxID",
                 @"NumberOfSlices",
                 @"MultiReferencePSpacing",
+                @"LookAheadFrames",
                 @"MaxAllowedFrameQP",
                 @"MinAllowedFrameQP",
             ];
@@ -1378,6 +1386,13 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         // Audit 72-int (288B) cqpOobRead[plen=21] window on a clean session (with Stage6OutputCallback):
         // IMPORTANT: EncodeFrame MUST run BEFORE UserParameterSetsIds is set to pArr21 (setting plen=21
         // before EncodeFrame wedges the encoder inside EncodeFrame because PPS slots 8..18 read OOB +0x40=256).
+        // From DSC .68 disassembly of AVE_Prop_HEVC_GetChromaQPIndexOffsetMultiPPS (0x934d9c):
+        //   cb_qp_offset[0..7] is at pINS + 0x9bd4 (+0x00..+0x1f)
+        //   cr_qp_offset[0..7] is at pINS + 0x9bf4 (+0x20..+0x3f)
+        //   oob[0..27]         is at pINS + 0x9c14..0x9c83 (+0x40..+0xaf):
+        //     - pINS + 0x9c15 (+0x41, byte 1 of oob[0]): initialized to 1 (oob[0] = 0x00000100 = 256)
+        //     - pINS + 0x9c17 (+0x43, byte 3 of oob[0]): written to 1 by AVE_HEVC_SetQuality (0x983dc4 -> oob[0] |= 0x01000000)
+        //     - pINS + 0x9c19 (+0x45, byte 1 of oob[1]): written by AVE_Prop_HEVC_SetEnableEntropyCodingSync (0x96be84 -> oob[1] = 256)
         {
             NSMutableArray *pArr21 = [NSMutableArray arrayWithCapacity:21];
             for (int k = 0; k < 21; k++) [pArr21 addObject:@((k < 2) ? (k + 1) : (k - 1))];
@@ -1389,6 +1404,61 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                                                      NULL, NULL, NULL, Stage6OutputCallback, mapRes, &mapS) == noErr && mapS) {
                 KPH9PrimeRealTime(mapS);
                 VTSessionSetProperty(mapS, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpSeed16);
+
+                // First test pre-Prepare OOB sweep on pINS + 0x9c14..0x9c83 (before PrepareToEncodeFrames locks pre-prepare props,
+                // then restore UserParameterSetsIds to 3 elements before Prepare/EncodeFrame!)
+                int prevOob[28];
+                for (int wi = 0; wi < 28; wi++) prevOob[wi] = (wi == 0) ? 256 : 0;
+                VTSessionSetProperty(mapS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr21);
+                CFTypeRef rbInit = NULL;
+                if (VTSessionCopyProperty(mapS, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbInit) == noErr && rbInit) {
+                    if (CFGetTypeID(rbInit) == CFArrayGetTypeID()) {
+                        NSArray *nsInit = (__bridge NSArray *)rbInit;
+                        if (nsInit.count >= 72) {
+                            for (int wi = 0; wi < 28; wi++) {
+                                prevOob[wi] = [nsInit[(NSUInteger)(2 * (wi + 8) + 1)] intValue];
+                            }
+                        }
+                    }
+                    CFRelease(rbInit);
+                }
+                NSArray *preCandPairs = @[
+                    @[ @"EnableEntropyCodingSync", (id)kCFBooleanTrue ],
+                    @[ @"EnableEntropyCodingSync", (id)kCFBooleanFalse ],
+                    @[ @"Quality",                 @0.5 ],
+                    @[ @"NumMergeCandidates",      @3 ],
+                ];
+                NSMutableArray *preDiffHits = [NSMutableArray array];
+                for (NSArray *cp in preCandPairs) {
+                    NSString *kName = cp[0];
+                    id kVal = cp[1];
+                    OSStatus stSet = VTSessionSetProperty(mapS, (__bridge CFStringRef)kName, (__bridge CFTypeRef)kVal);
+                    CFTypeRef rbCand = NULL;
+                    if (VTSessionCopyProperty(mapS, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbCand) == noErr && rbCand) {
+                        if (CFGetTypeID(rbCand) == CFArrayGetTypeID()) {
+                            NSArray *nsCand = (__bridge NSArray *)rbCand;
+                            if (nsCand.count >= 72) {
+                                for (int wi = 0; wi < 28; wi++) {
+                                    int v = [nsCand[(NSUInteger)(2 * (wi + 8) + 1)] intValue];
+                                    if (v != prevOob[wi]) {
+                                        [preDiffHits addObject:[NSString stringWithFormat:@"%@=%@(st=%d):oob[%d](+0x%02x):%d->%d(0x%08x)",
+                                                                kName, kVal, (int)stSet, wi, 0x40 + wi * 4, prevOob[wi], v, (unsigned)v]];
+                                        prevOob[wi] = v;
+                                    }
+                                }
+                            }
+                        }
+                        CFRelease(rbCand);
+                    }
+                }
+                KPH9OutAppend(log, @"  cqpOobSweepPre[props=%lu]: hits=%lu [%@]\n",
+                              (unsigned long)preCandPairs.count, (unsigned long)preDiffHits.count,
+                              [preDiffHits componentsJoinedByString:@", "]);
+
+                // Restore UserParameterSetsIds to 3 valid elements BEFORE Prepare/EncodeFrame so EncodeFrame cannot stall!
+                VTSessionSetProperty(mapS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @1, @2, @1 ]);
+                VTSessionSetProperty(mapS, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpSeed16);
+
                 OSStatus prepMapSt = VTCompressionSessionPrepareToEncodeFrames(mapS);
                 OSStatus encMapSt = VTCompressionSessionEncodeFrame(mapS, px, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
                 int w0 = 0;
@@ -1421,6 +1491,8 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                                 int evenVal = [nsPost[(NSUInteger)(2 * wi)] intValue];
                                 int prevOddVal = [nsPost[(NSUInteger)(2 * (wi - 8) + 1)] intValue];
                                 if (evenVal == prevOddVal) aliasMatches++;
+                                int oddVal = [nsPost[(NSUInteger)(2 * wi + 1)] intValue];
+                                prevOob[wi - 8] = oddVal;
                                 [oob28 addObject:nsPost[(NSUInteger)(2 * wi + 1)]];
                             }
                             KPH9OutAppend(log, @"  cqpStructLayout[alias=%d/28]: cb[+0x00..+0x1f]=[%@] cr[+0x20..+0x3f]=[%@] oob[+0x40..+0xaf]=[%@]\n",
@@ -1432,8 +1504,17 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                     }
                     CFRelease(rbPost);
                 }
-                // Check whether setting any writable HEVC session property modifies cb[0..7], cr[0..7], or oob[0..27] (+0x40..+0xaf)
+                // Check whether setting any writable HEVC session property modifies oob[0..27] (pINS + 0x9c14..0x9c83)
                 NSArray *candPairs = @[
+                    @[ @"EnableEntropyCodingSync", (id)kCFBooleanTrue ],
+                    @[ @"EnableEntropyCodingSync", (id)kCFBooleanFalse ],
+                    @[ @"Quality",                 @0.25 ],
+                    @[ @"Quality",                 @0.75 ],
+                    @[ @"NumMergeCandidates",      @2 ],
+                    @[ @"AllowFrameReordering",    (id)kCFBooleanFalse ],
+                    @[ @"AllowOpenGOP",            (id)kCFBooleanFalse ],
+                    @[ @"AllowTemporalCompression",(id)kCFBooleanFalse ],
+                    @[ @"RealTime",                (id)kCFBooleanFalse ],
                     @[ @"OutputBitDepth",            @10 ],
                     @[ @"SoftMaxQuantizationParameter", @42 ],
                     @[ @"SoftMinQuantizationParameter", @18 ],
@@ -1483,11 +1564,12 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                         if (CFGetTypeID(rbCand) == CFArrayGetTypeID()) {
                             NSArray *nsCand = (__bridge NSArray *)rbCand;
                             if (nsCand.count >= 72) {
-                                for (int wi = 8; wi < 36; wi++) {
-                                    int v = [nsCand[(NSUInteger)(2 * wi + 1)] intValue];
-                                    int expected = (wi == 8) ? 256 : 0;
-                                    if (v != expected) {
-                                        [diffHits addObject:[NSString stringWithFormat:@"%@(st=%d)->oob[%d]=%d", kName, (int)stSet, wi - 8, v]];
+                                for (int wi = 0; wi < 28; wi++) {
+                                    int v = [nsCand[(NSUInteger)(2 * (wi + 8) + 1)] intValue];
+                                    if (v != prevOob[wi]) {
+                                        [diffHits addObject:[NSString stringWithFormat:@"%@=%@(st=%d):oob[%d](+0x%02x):%d->%d(0x%08x)",
+                                                             kName, kVal, (int)stSet, wi, 0x40 + wi * 4, prevOob[wi], v, (unsigned)v]];
+                                        prevOob[wi] = v;
                                     }
                                 }
                             }
@@ -1621,51 +1703,76 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         }
 
         // Probe VTDecompressionSessionDecodeFrameWithMultiImageCapableOutputHandler via dlsym to verify that -17699
-        // on RequestedMVHEVCVideoLayerIDs c[0] / c[0,3] is kVTMultiImageCallbackNotSetErr and decodes to a TaggedBufferGroup!
+        // on RequestedMVHEVCVideoLayerIDs c[0] / c[0,3] is kVTMultiImageCallbackNotSetErr and decodes to a CMTaggedBufferGroup!
         typedef void (^KPMultiImageCapableHandler)(OSStatus status, VTDecodeInfoFlags infoFlags,
                                                    CVImageBufferRef imageBuffer, CFTypeRef taggedBufferGroup,
                                                    CMTime pts, CMTime dur);
         typedef OSStatus (*KPDecodeMultiImageFn)(VTDecompressionSessionRef session, CMSampleBufferRef sbuf,
                                                  VTDecodeFrameFlags decodeFlags, VTDecodeInfoFlags *infoFlagsOut,
                                                  KPMultiImageCapableHandler handler);
+        typedef CFIndex (*KPTBGGetCountFn)(CFTypeRef group);
+        typedef CVPixelBufferRef (*KPTBGGetPixBufFn)(CFTypeRef group, CFIndex idx);
         KPDecodeMultiImageFn fnMultiDec = (KPDecodeMultiImageFn)dlsym(RTLD_DEFAULT,
             "VTDecompressionSessionDecodeFrameWithMultiImageCapableOutputHandler");
-        if (fnMultiDec && fmt2 && sbuf2) {
-            NSArray *miCases = @[ @[ @"mi[0]", @[ @0 ] ], @[ @"mi[0,3]", @[ @0, @3 ] ], @[ @"mi[3]", @[ @3 ] ], @[ @"mi[0,64]", @[ @0, @64 ] ] ];
-            NSMutableArray *miParts = [NSMutableArray array];
-            for (NSArray *mc in miCases) {
-                NSString *mTag = mc[0];
-                NSArray *mIds = mc[1];
-                VTDecompressionSessionRef mds = NULL;
-                if (VTDecompressionSessionCreate(kCFAllocatorDefault, fmt2, NULL, NULL, NULL, &mds) == noErr && mds) {
-                    OSStatus mSet = VTSessionSetProperty(mds, CFSTR("RequestedMVHEVCVideoLayerIDs"), (__bridge CFTypeRef)mIds);
-                    VTDecodeInfoFlags mInfo = 0;
-                    __block OSStatus mCbSt = -998;
-                    __block int mImg = 0, mTbg = 0;
-                    dispatch_semaphore_t mSem = dispatch_semaphore_create(0);
-                    OSStatus mCallSt = fnMultiDec(mds, sbuf2, 0, &mInfo,
-                        ^(OSStatus status, VTDecodeInfoFlags infoFlags, CVImageBufferRef imageBuffer,
-                          CFTypeRef taggedBufferGroup, CMTime pts, CMTime dur) {
-                            (void)infoFlags; (void)pts; (void)dur;
-                            mCbSt = status;
-                            mImg = (imageBuffer != NULL) ? 1 : 0;
-                            mTbg = (taggedBufferGroup != NULL) ? 1 : 0;
-                            dispatch_semaphore_signal(mSem);
-                        });
-                    dispatch_semaphore_wait(mSem, dispatch_time(DISPATCH_TIME_NOW, 250 * (int64_t)NSEC_PER_MSEC));
-                    [miParts addObject:[NSString stringWithFormat:@"%@=%d(dec=%d/%d,img=%d,tbg=%d)",
-                                        mTag, (int)mSet, (int)mCallSt, (int)mCbSt, mImg, mTbg]];
-                    VTDecompressionSessionInvalidate(mds);
-                    CFRelease(mds);
-                }
-            }
-            KPH9OutAppend(log, @"  decMultiImage[2Layer(vps=39,alpha=3)]: %@\n", [miParts componentsJoinedByString:@" "]);
-        }
+        KPTBGGetCountFn fnTbgCount = (KPTBGGetCountFn)dlsym(RTLD_DEFAULT, "CMTaggedBufferGroupGetCount");
+        KPTBGGetPixBufFn fnTbgPix = (KPTBGGetPixBufFn)dlsym(RTLD_DEFAULT, "CMTaggedBufferGroupGetCVPixelBufferAtIndex");
 
         NSMutableArray *seq64 = [NSMutableArray arrayWithCapacity:64];
         NSMutableArray *seq300 = [NSMutableArray arrayWithCapacity:300];
         for (int i = 0; i < 64; i++) [seq64 addObject:@(i)];
         for (int i = 0; i < 300; i++) [seq300 addObject:@(i)];
+
+        if (fnMultiDec) {
+            CMFormatDescriptionRef miFmts[2] = { fmt1, fmt2 };
+            CMSampleBufferRef miSbufs[2] = { sbuf1, sbuf2 };
+            const char *miNames[2] = { "1Layer(vps=26)", "2Layer(vps=39,alpha=3)" };
+            NSArray *miCases = @[
+                @[ @"mi[0]",      @[ @0 ] ],
+                @[ @"mi[0,3]",    @[ @0, @3 ] ],
+                @[ @"mi[3]",      @[ @3 ] ],
+                @[ @"mi[0,64]",   @[ @0, @64 ] ],
+                @[ @"mi[0..63]",  seq64 ],
+                @[ @"mi[0..299]", seq300 ],
+            ];
+            for (int mfi = 0; mfi < 2; mfi++) {
+                if (!miFmts[mfi] || !miSbufs[mfi]) continue;
+                NSMutableArray *miParts = [NSMutableArray array];
+                for (NSArray *mc in miCases) {
+                    NSString *mTag = mc[0];
+                    NSArray *mIds = mc[1];
+                    VTDecompressionSessionRef mds = NULL;
+                    if (VTDecompressionSessionCreate(kCFAllocatorDefault, miFmts[mfi], NULL, NULL, NULL, &mds) == noErr && mds) {
+                        OSStatus mSet = VTSessionSetProperty(mds, CFSTR("RequestedMVHEVCVideoLayerIDs"), (__bridge CFTypeRef)mIds);
+                        VTDecodeInfoFlags mInfo = 0;
+                        __block OSStatus mCbSt = -998;
+                        __block int mImg = 0, mTbgCnt = 0, mTbgPx = 0;
+                        dispatch_semaphore_t mSem = dispatch_semaphore_create(0);
+                        OSStatus mCallSt = fnMultiDec(mds, miSbufs[mfi], 0, &mInfo,
+                            ^(OSStatus status, VTDecodeInfoFlags infoFlags, CVImageBufferRef imageBuffer,
+                              CFTypeRef taggedBufferGroup, CMTime pts, CMTime dur) {
+                                (void)infoFlags; (void)pts; (void)dur;
+                                mCbSt = status;
+                                mImg = (imageBuffer != NULL) ? 1 : 0;
+                                if (taggedBufferGroup != NULL) {
+                                    mTbgCnt = fnTbgCount ? (int)fnTbgCount(taggedBufferGroup) : 1;
+                                    if (fnTbgPix && mTbgCnt > 0) {
+                                        for (int ti = 0; ti < mTbgCnt; ti++) {
+                                            if (fnTbgPix(taggedBufferGroup, ti) != NULL) mTbgPx++;
+                                        }
+                                    }
+                                }
+                                dispatch_semaphore_signal(mSem);
+                            });
+                        dispatch_semaphore_wait(mSem, dispatch_time(DISPATCH_TIME_NOW, 250 * (int64_t)NSEC_PER_MSEC));
+                        [miParts addObject:[NSString stringWithFormat:@"%@=%d(dec=%d/%d,img=%d,tbg=%d/%d)",
+                                            mTag, (int)mSet, (int)mCallSt, (int)mCbSt, mImg, mTbgCnt, mTbgPx]];
+                        VTDecompressionSessionInvalidate(mds);
+                        CFRelease(mds);
+                    }
+                }
+                KPH9OutAppend(log, @"  decMultiImage[%s]: %@\n", miNames[mfi], [miParts componentsJoinedByString:@" "]);
+            }
+        }
         NSArray *decCases = @[
             @[ @"c[none]",    [NSNull null] ],
             @[ @"c[0]",       @[ @0 ] ],
@@ -1756,12 +1863,14 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                     VTDecompressionSessionInvalidate(ds);
                     CFRelease(ds);
                 } else {
-                    // When VTDecompressionSessionCreate rejects fmts[si] (e.g. dsSt=305 on Sps128/Sps64/Pps64),
+                    // When VTDecompressionSessionCreate rejects fmts[si] (dsSt=-12911 on Sps64/Pps64/Pps127/Sps128),
                     // test cross-format VCL slice decode on dci==0 by creating the decompression session with fmt2
-                    // (valid 2-layer sps=5,pps=9,alpha=3) and re-wrapping sbufs[si]'s CMBlockBuffer with fmt2!
-                    // Also test xRewrite: rewrite the VCL slice's first_slice_segment_in_pic_flag + slice_pic_parameter_set_id
-                    // byte in a copy of the VCL sample buffer to match fmt1 (pps_id=0 -> byte 0xaf in IDR slice header)
-                    // to prove whether Pps64/Pps127 VCL slices decode to an image when slice_pic_parameter_set_id matches!
+                    // (valid 2-layer sps=5,pps=9,alpha=3) and:
+                    //   1) xRaw:  pass sbufs[si] directly to xds
+                    //   2) xWrap: re-wrap sbufs[si]'s unpatched CMBlockBuffer with fmt2
+                    //   3) xSlicePps9: bit-rewrite ONLY slice_pic_parameter_set_id at bit offset 2 of sbufs[si]'s
+                    //      own VCL IDR slice header (from ue(64) or ue(127) to ue(9) = 0b0001010, shifting the
+                    //      remaining bits of sbufs[si]'s VCL NALU) and decode against fmt2 (xds)!
                     if (dci == 0 && fmt2 && sbufs[si]) {
                         VTDecompressionSessionRef xds = NULL;
                         OSStatus xdsSt = VTDecompressionSessionCreate(kCFAllocatorDefault, fmt2, NULL, NULL, NULL, &xds);
@@ -1773,6 +1882,7 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                             OSStatus wrapSt = CMSampleBufferCreateReady(kCFAllocatorDefault, blk, fmt2, 1, 1, &timing, 1, &sampleSize, &reSbuf);
                             OSStatus xDecRaw = -999, xCbRaw = -999, xDecWrap = -999, xCbWrap = -999, xCbPatch = -999;
                             int xImgRaw = 0, xImgWrap = 0, xImgPatch = 0;
+                            int oldUePps = -1;
                             {
                                 VTDecodeInfoFlags infoOut = 0;
                                 __block OSStatus bSt = -998;
@@ -1808,52 +1918,110 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                                 xImgWrap = bImg;
                                 CFRelease(reSbuf);
                             }
-                            // If xWrap failed with -12909 (because Pps64/Pps127 VCL slice encodes slice_pic_parameter_set_id=64/127),
-                            // test decoding fmt2's VCL slice or patching the VCL NALU header/slice_pps_id against fmt1:
-                            if (xImgWrap == 0 && fmt1 && sbuf1 && blk) {
-                                VTDecompressionSessionRef pds = NULL;
-                                if (VTDecompressionSessionCreate(kCFAllocatorDefault, fmt1, NULL, NULL, NULL, &pds) == noErr && pds) {
-                                    // Replace the IDR slice header bytes (first 6 bytes of VCL NALU payload) with sbuf1's pps_id=0 slice header
-                                    CMBlockBufferRef blk1 = CMSampleBufferGetDataBuffer(sbuf1);
-                                    char *ptrSi = NULL, *ptr1 = NULL;
-                                    size_t lenSi = 0, len1 = 0;
-                                    if (blk1 &&
-                                        CMBlockBufferGetDataPointer(blk, 0, &lenSi, NULL, &ptrSi) == noErr && ptrSi && lenSi >= 32 &&
-                                        CMBlockBufferGetDataPointer(blk1, 0, &len1, NULL, &ptr1) == noErr && ptr1 && len1 >= 32) {
-                                        CMBlockBufferRef copyBlk = NULL;
-                                        if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, len1, kCFAllocatorDefault,
-                                                                               NULL, 0, len1, kCMBlockBufferAssureMemoryNowFlag, &copyBlk) == noErr && copyBlk) {
-                                            CMBlockBufferReplaceDataBytes(ptr1, copyBlk, 0, len1);
-                                            CMSampleBufferRef patchSbuf = NULL;
-                                            size_t pSz = len1;
-                                            if (CMSampleBufferCreateReady(kCFAllocatorDefault, copyBlk, fmt1, 1, 1, &timing, 1, &pSz, &patchSbuf) == noErr && patchSbuf) {
-                                                VTDecodeInfoFlags infoOut = 0;
-                                                __block OSStatus bSt = -998;
-                                                __block int bImg = 0;
-                                                dispatch_semaphore_t pSem = dispatch_semaphore_create(0);
-                                                VTDecompressionSessionDecodeFrameWithOutputHandler(
-                                                    pds, patchSbuf, 0, &infoOut,
-                                                    ^(OSStatus status, VTDecodeInfoFlags infoFlags, CVImageBufferRef imageBuffer, CMTime pts, CMTime dur) {
-                                                        (void)infoFlags; (void)pts; (void)dur;
-                                                        bSt = status;
-                                                        bImg = (imageBuffer != NULL) ? 1 : 0;
-                                                        dispatch_semaphore_signal(pSem);
-                                                    });
-                                                dispatch_semaphore_wait(pSem, dispatch_time(DISPATCH_TIME_NOW, 250 * (int64_t)NSEC_PER_MSEC));
-                                                xCbPatch = bSt;
-                                                xImgPatch = bImg;
-                                                CFRelease(patchSbuf);
+                            // Bit-rewrite slice_pic_parameter_set_id in sbufs[si]'s own VCL NALU to ue(9) (0b0001010, 7 bits)
+                            // and decode against xds (fmt2, which has sps_id=5, pps_id=9)!
+                            char *ptrSi = NULL;
+                            size_t lenSi = 0;
+                            if (blk && CMBlockBufferGetDataPointer(blk, 0, &lenSi, NULL, &ptrSi) == noErr && ptrSi && lenSi >= 16) {
+                                const uint8_t *srcBytes = (const uint8_t *)ptrSi;
+                                size_t off = 0, vclLenOff = 0, vclPayOff = 0;
+                                uint32_t vclNalLen = 0;
+                                while (off + 4 <= lenSi) {
+                                    uint32_t nl = ((uint32_t)srcBytes[off] << 24) | ((uint32_t)srcBytes[off + 1] << 16) |
+                                                  ((uint32_t)srcBytes[off + 2] << 8) | (uint32_t)srcBytes[off + 3];
+                                    if (nl < 3 || off + 4 + nl > lenSi) break;
+                                    unsigned nalType = (srcBytes[off + 4] >> 1) & 0x3f;
+                                    if (nalType <= 21) {
+                                        vclLenOff = off;
+                                        vclPayOff = off + 6; // after 4B length + 2B NALU header
+                                        vclNalLen = nl;
+                                        break;
+                                    }
+                                    off += 4 + nl;
+                                }
+                                if (vclNalLen >= 6 && vclPayOff < lenSi) {
+                                    const uint8_t *pay = srcBytes + vclPayOff;
+                                    size_t payBytes = vclNalLen - 2;
+                                    size_t totalBits = payBytes * 8;
+                                    // Bit 0: first_slice_segment_in_pic_flag, Bit 1: no_output_of_prior_pics_flag (for IDR 19/20)
+                                    size_t bitIdx = 2;
+                                    unsigned lz = 0;
+                                    while (bitIdx < totalBits && ((pay[bitIdx >> 3] >> (7 - (bitIdx & 7))) & 1) == 0) {
+                                        lz++;
+                                        bitIdx++;
+                                    }
+                                    size_t oldUeBits = 2 * (size_t)lz + 1;
+                                    if (bitIdx < totalBits && 2 + oldUeBits <= totalBits && lz <= 16) {
+                                        unsigned codeNum = 1;
+                                        for (unsigned bi = 0; bi < lz; bi++) {
+                                            size_t bpos = 2 + lz + 1 + bi;
+                                            codeNum = (codeNum << 1) | ((pay[bpos >> 3] >> (7 - (bpos & 7))) & 1);
+                                        }
+                                        oldUePps = (int)codeNum - 1;
+                                        // Build patched buffer with ue(9) = 0001010 (7 bits) at bit offset 2
+                                        size_t newTotalBits = totalBits - oldUeBits + 7;
+                                        size_t newPayBytes = (newTotalBits + 7) / 8;
+                                        uint32_t newNalLen = 2 + (uint32_t)newPayBytes;
+                                        size_t newBufLen = vclPayOff + newPayBytes;
+                                        uint8_t *patched = (uint8_t *)calloc(1, newBufLen);
+                                        if (patched) {
+                                            memcpy(patched, srcBytes, vclPayOff);
+                                            patched[vclLenOff + 0] = (uint8_t)((newNalLen >> 24) & 0xff);
+                                            patched[vclLenOff + 1] = (uint8_t)((newNalLen >> 16) & 0xff);
+                                            patched[vclLenOff + 2] = (uint8_t)((newNalLen >> 8) & 0xff);
+                                            patched[vclLenOff + 3] = (uint8_t)(newNalLen & 0xff);
+                                            uint8_t *dstPay = patched + vclPayOff;
+                                            // Copy bits 0..1 from pay
+                                            for (size_t b = 0; b < 2; b++) {
+                                                uint8_t bitVal = (pay[b >> 3] >> (7 - (b & 7))) & 1;
+                                                dstPay[b >> 3] |= (uint8_t)(bitVal << (7 - (b & 7)));
                                             }
-                                            CFRelease(copyBlk);
+                                            // Write ue(9) = 0b0001010 (7 bits) at dst bits 2..8
+                                            const uint8_t ue9Bits[7] = { 0, 0, 0, 1, 0, 1, 0 };
+                                            for (size_t b = 0; b < 7; b++) {
+                                                size_t db = 2 + b;
+                                                dstPay[db >> 3] |= (uint8_t)(ue9Bits[b] << (7 - (db & 7)));
+                                            }
+                                            // Copy remaining bits from src (2 + oldUeBits .. totalBits - 1) to dst (9 ..)
+                                            size_t dstBit = 9;
+                                            for (size_t sb = 2 + oldUeBits; sb < totalBits; sb++, dstBit++) {
+                                                uint8_t bitVal = (pay[sb >> 3] >> (7 - (sb & 7))) & 1;
+                                                dstPay[dstBit >> 3] |= (uint8_t)(bitVal << (7 - (dstBit & 7)));
+                                            }
+                                            CMBlockBufferRef copyBlk = NULL;
+                                            if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, newBufLen, kCFAllocatorDefault,
+                                                                                   NULL, 0, newBufLen, kCMBlockBufferAssureMemoryNowFlag, &copyBlk) == noErr && copyBlk) {
+                                                CMBlockBufferReplaceDataBytes(patched, copyBlk, 0, newBufLen);
+                                                CMSampleBufferRef patchSbuf = NULL;
+                                                size_t pSz = newBufLen;
+                                                if (CMSampleBufferCreateReady(kCFAllocatorDefault, copyBlk, fmt2, 1, 1, &timing, 1, &pSz, &patchSbuf) == noErr && patchSbuf) {
+                                                    VTDecodeInfoFlags infoOut = 0;
+                                                    __block OSStatus bSt = -998;
+                                                    __block int bImg = 0;
+                                                    dispatch_semaphore_t pSem = dispatch_semaphore_create(0);
+                                                    VTDecompressionSessionDecodeFrameWithOutputHandler(
+                                                        xds, patchSbuf, 0, &infoOut,
+                                                        ^(OSStatus status, VTDecodeInfoFlags infoFlags, CVImageBufferRef imageBuffer, CMTime pts, CMTime dur) {
+                                                            (void)infoFlags; (void)pts; (void)dur;
+                                                            bSt = status;
+                                                            bImg = (imageBuffer != NULL) ? 1 : 0;
+                                                            dispatch_semaphore_signal(pSem);
+                                                        });
+                                                    dispatch_semaphore_wait(pSem, dispatch_time(DISPATCH_TIME_NOW, 250 * (int64_t)NSEC_PER_MSEC));
+                                                    xCbPatch = bSt;
+                                                    xImgPatch = bImg;
+                                                    CFRelease(patchSbuf);
+                                                }
+                                                CFRelease(copyBlk);
+                                            }
+                                            free(patched);
                                         }
                                     }
-                                    VTDecompressionSessionInvalidate(pds);
-                                    CFRelease(pds);
                                 }
                             }
-                            [decParts addObject:[NSString stringWithFormat:@"%@=noDec(%d,xRaw=%d/%d:%d,xWrap=%d/%d:%d,xPps0=%d:%d)",
+                            [decParts addObject:[NSString stringWithFormat:@"%@=noDec(%d,xRaw=%d/%d:%d,xWrap=%d/%d:%d,xSlicePps[%d->9]=%d:%d)",
                                                  tag, (int)dsSt, (int)xDecRaw, (int)xCbRaw, xImgRaw,
-                                                 (int)xDecWrap, (int)xCbWrap, xImgWrap, (int)xCbPatch, xImgPatch]];
+                                                 (int)xDecWrap, (int)xCbWrap, xImgWrap, oldUePps, (int)xCbPatch, xImgPatch]];
                             VTDecompressionSessionInvalidate(xds);
                             CFRelease(xds);
                         } else {
@@ -2049,11 +2217,13 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
         { "la=20(sps=5,pps=9,a=3)",        5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99,  20, -99, -99 },
         { "la=21(sps=5,pps=9,a=3)",        5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99,  21, -99, -99 },
         { "la=64(sps=5,pps=9,a=3)",        5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99,  64, -99, -99 },
-        { "pGap=15(sps=5,pps=9,a=3)",      5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99,  15, -99 },
-        { "pGap=16(sps=5,pps=9,a=3)",      5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99,  16, -99 },
-        { "pGap=64(sps=5,pps=9,a=3)",      5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99,  64, -99 },
-        { "mctf=2(sps=5,pps=9,a=3)",       5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99, -99,   2 },
-        { "mctf=3(sps=5,pps=9,a=3)",       5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99, -99,   3 },
+        { "la=128(sps=5,pps=9,a=3)",       5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, 128, -99, -99 },
+        { "pGap=8(sps=5,pps=9,a=3)",       5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99,   8, -99 },
+        { "pGap=9(sps=5,pps=9,a=3)",       5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99,   9, -99 },
+        { "mctf=1,rt=0(sps=5,pps=9)",      5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99, -99,  -1 },
+        { "mctf=2,rt=0(sps=5,pps=9)",      5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99, -99,  -2 },
+        { "mctf=2,rt=1(sps=5,pps=9)",      5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99, -99,   2 },
+        { "mctf=3,rt=0(sps=5,pps=9)",      5,   9,   3,  -99, -99, -99, -99, -99, -99, -99, -99, -99, -99,  -3 },
     };
     for (size_t rci = 0; rci < sizeof(reqCases) / sizeof(reqCases[0]); rci++) {
         ReqHEVCCase rc = reqCases[rci];
@@ -2113,8 +2283,12 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                     stExtra = VTSessionSetProperty(reqS, CFSTR("MultiReferencePSpacing"), (__bridge CFNumberRef)@(rc.pSpacing));
                 }
                 if (rc.mctfMode != -99) {
+                    int mVal = (rc.mctfMode < 0) ? -rc.mctfMode : rc.mctfMode;
+                    if (rc.mctfMode < 0) {
+                        VTSessionSetProperty(reqS, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
+                    }
                     VTSessionSetProperty(reqS, CFSTR("EnableMCTF"), kCFBooleanTrue);
-                    stExtra = VTSessionSetProperty(reqS, CFSTR("MCTFLatencyMode"), (__bridge CFNumberRef)@(rc.mctfMode));
+                    stExtra = VTSessionSetProperty(reqS, CFSTR("MCTFLatencyMode"), (__bridge CFNumberRef)@(mVal));
                 }
                 phase = "prep";
                 prepSt = VTCompressionSessionPrepareToEncodeFrames(reqS);
@@ -2286,46 +2460,66 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
         VTSessionSetProperty(s, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
         KPH9PrimeRealTime(s);
 
-        // Схема ветки InterRefPicSetPredictionFlag = false в AVE_HEVC_ST_RPS_Retrieve:
-        // проверяем точное совпадение длины массивов DeltaPocS1Minus1 / UsedByCurrPicS1 с NumPositivePics
-        // (2+2, 2+0 с пустыми массивами, CFBoolean vs NSNumber vs битовая маска) и размер внешнего массива (1, 2, 4).
+        // Exact DSC .68 schema for AVE_HEVC_ST_RPS_Retrieve (0x9cdba0) & AVE_HEVC_ST_RPS_RetrieveArray (0x9ce010):
+        //   1) Branch InterRefPicSetPredictionFlag == kCFBooleanFalse (0x9cdde0):
+        //      - NumNegativePics    :CFNumber (AVE_CFDict_GetSInt32 -> [pInfo + 0x30])
+        //      - NumPositivePics    :CFNumber (AVE_CFDict_GetSInt32 -> [pInfo + 0x34])
+        //      - DeltaPOCS0Minus1   :CFArray<CFNumber> (capital POC! AVE_CFArray_GetSInt16 loop 0..CFArrayGetCount-1 -> int16_t [pInfo + 0x38 + 2*i])
+        //      - UsedByCurrPicS0Flag:CFNumber SInt16 bitmask (ends with Flag! AVE_CFDict_GetSInt16 0x9bea24 -> SIMD 16B [pInfo + 0x58..0x67])
+        //      - DeltaPOCS1Minus1   :CFArray<CFNumber> (capital POC! AVE_CFArray_GetSInt16 loop 0..CFArrayGetCount-1 -> int32_t [pInfo + 0x68 + 4*i])
+        //      - UsedByCurrPicS1Flag:CFNumber SInt16 bitmask (ends with Flag! AVE_CFDict_GetSInt16 0x9bea24 -> SIMD 16B [pInfo + 0xa8..0xb7])
+        //   2) Branch InterRefPicSetPredictionFlag == kCFBooleanTrue (0x9cdc24):
+        //      - DeltaIdxMinus1     :CFNumber (AVE_CFDict_GetSInt32 -> [pInfo + 0x04])
+        //      - DeltaRPSSign       :CFBoolean (AVE_CFDict_GetBool  -> [pInfo + 0x08])
+        //      - AbsDeltaRPSMinus1  :CFNumber (AVE_CFDict_GetSInt32 -> [pInfo + 0x0c])
+        //      - UsedByCurrPicFlag  :CFNumber SInt16 bitmask (AVE_CFDict_GetSInt16 -> SIMD 16B [pInfo + 0x10..0x1f])
+        //      - UsedDeltaFlag      :CFNumber SInt16 bitmask (AVE_CFDict_GetSInt16 -> SIMD 16B [pInfo + 0x20..0x2f])
+        //   3) AVE_Prop_HEVC_GetUserRPSForFaceTime (0x92f13c) copy-paste bug:
+        //      Reads [pINS + 0x2e2c] (DPB count) and [pINS + 0x2e30..0x2e74] (UserDPBFramesForFaceTime) instead of pINS + 0x13adc!
         NSMutableArray *s0s = [NSMutableArray array], *s1s = [NSMutableArray array];
-        NSMutableArray *u0Num = [NSMutableArray array], *u1Num = [NSMutableArray array];
-        NSMutableArray *u0Bool = [NSMutableArray array], *u1Bool = [NSMutableArray array];
         for (int i = 0; i < 2; i++) {
             [s0s addObject:@(i)];
             [s1s addObject:@(i)];
-            [u0Num addObject:@1];
-            [u1Num addObject:@1];
-            [u0Bool addObject:(id)kCFBooleanTrue];
-            [u1Bool addObject:(id)kCFBooleanTrue];
         }
-        NSDictionary *rps2x2Bool = @{
+        NSMutableArray *s0Oob24 = [NSMutableArray arrayWithCapacity:24];
+        NSMutableArray *s1Oob24 = [NSMutableArray arrayWithCapacity:24];
+        for (int i = 0; i < 24; i++) {
+            [s0Oob24 addObject:@(i & 3)];
+            [s1Oob24 addObject:@(i & 3)];
+        }
+        NSDictionary *rpsExact2x2 = @{
             @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
             @"NumNegativePics": @2,
             @"NumPositivePics": @2,
-            @"DeltaPocS0Minus1": s0s,
-            @"UsedByCurrPicS0": u0Bool,
-            @"DeltaPocS1Minus1": s1s,
-            @"UsedByCurrPicS1": u1Bool,
+            @"DeltaPOCS0Minus1": s0s,
+            @"UsedByCurrPicS0Flag": @3,
+            @"DeltaPOCS1Minus1": s1s,
+            @"UsedByCurrPicS1Flag": @3,
         };
-        NSDictionary *rps2x2Num = @{
-            @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
-            @"NumNegativePics": @2,
-            @"NumPositivePics": @2,
-            @"DeltaPocS0Minus1": s0s,
-            @"UsedByCurrPicS0": u0Num,
-            @"DeltaPocS1Minus1": s1s,
-            @"UsedByCurrPicS1": u1Num,
-        };
-        NSDictionary *rps2x0Empty = @{
+        NSDictionary *rpsExact2x0 = @{
             @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
             @"NumNegativePics": @2,
             @"NumPositivePics": @0,
-            @"DeltaPocS0Minus1": s0s,
-            @"UsedByCurrPicS0": u0Bool,
-            @"DeltaPocS1Minus1": @[],
-            @"UsedByCurrPicS1": @[],
+            @"DeltaPOCS0Minus1": s0s,
+            @"UsedByCurrPicS0Flag": @3,
+        };
+        NSDictionary *rpsPred1 = @{
+            @"InterRefPicSetPredictionFlag": (id)kCFBooleanTrue,
+            @"DeltaIdxMinus1": @0,
+            @"DeltaRPSSign": (id)kCFBooleanFalse,
+            @"AbsDeltaRPSMinus1": @0,
+            @"UsedByCurrPicFlag": @3,
+            @"UsedDeltaFlag": @3,
+        };
+        // Inner array OOB (count=24 > 16 slots at +0x38 and +0x68, safely contained inside the 0x164-byte RPS struct)
+        NSDictionary *rpsInnerOob24 = @{
+            @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+            @"NumNegativePics": @2,
+            @"NumPositivePics": @2,
+            @"DeltaPOCS0Minus1": s0Oob24,
+            @"UsedByCurrPicS0Flag": @3,
+            @"DeltaPOCS1Minus1": s1Oob24,
+            @"UsedByCurrPicS1Flag": @3,
         };
 
         OSStatus stPsIds2 = VTSessionSetProperty(s, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @0, @1 ]);
@@ -2336,14 +2530,19 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             if (CFGetTypeID(psIdsRb) == CFArrayGetTypeID()) psIdsRbCnt = CFArrayGetCount((CFArrayRef)psIdsRb);
             CFRelease(psIdsRb);
         }
-        OSStatus stPre2x2Bool  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x2Bool]);
-        OSStatus stPre2x2Num   = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x2Num]);
-        OSStatus stPre2x0Empty = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x0Empty]);
+        OSStatus stPre2x2      = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsExact2x2]);
+        OSStatus stPre2x0      = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsExact2x0]);
+        OSStatus stPrePred1    = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsPred1]);
+        OSStatus stPreInner24  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsInnerOob24]);
         OSStatus stPreArr4     = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"),
-                                                      (__bridge CFTypeRef)@[rps2x2Bool, rps2x2Bool, rps2x2Bool, rps2x2Bool]);
-        KPH9OutAppend(out, @"  set UserRPS @pre (psIds2=%d psIds4=%d rbPs=%ld): 2x2Bool=%d 2x2Num=%d 2x0Empty=%d arr4=%d\n",
+                                                      (__bridge CFTypeRef)@[rpsExact2x2, rpsExact2x2, rpsExact2x2, rpsExact2x2]);
+        OSStatus stPreArr5     = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"),
+                                                      (__bridge CFTypeRef)@[rpsExact2x2, rpsExact2x2, rpsExact2x2, rpsExact2x2, rpsExact2x2]);
+        // Restore in-bounds 1-entry RPS before Prepare/EncodeFrame
+        VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsExact2x0]);
+        KPH9OutAppend(out, @"  set UserRPS @pre (psIds2=%d psIds4=%d rbPs=%ld): 2x2=%d 2x0=%d pred1=%d inOob24=%d arr4=%d arr5=%d\n",
                       (int)stPsIds2, (int)stPsIds4, (long)psIdsRbCnt,
-                      (int)stPre2x2Bool, (int)stPre2x2Num, (int)stPre2x0Empty, (int)stPreArr4);
+                      (int)stPre2x2, (int)stPre2x0, (int)stPrePred1, (int)stPreInner24, (int)stPreArr4, (int)stPreArr5);
 
         // 7A proved ChromaQPIndexOffsetMultiPPS is CFArray<CFNumber> (tid=19, PropertyType=Number), NOT NSString!
         // Accepts even counts 2, 4, 6, 8, 10, 12, 14, 16 (up to 8 (cb_qp_offset, cr_qp_offset) pairs in -12..+12).
@@ -2370,16 +2569,17 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
         OSStatus prep = VTCompressionSessionPrepareToEncodeFrames(s);
         KPH9OutAppend(out, @"  prepare -> %d\n", (int)prep);
 
-        OSStatus stSane   = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x2Bool]);
-        OSStatus stArr0   = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x2Num]);
-        OSStatus stEmpty0 = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x0Empty]);
+        OSStatus stSane   = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsExact2x2]);
+        OSStatus stPred1  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsPred1]);
+        OSStatus stIn24   = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsInnerOob24]);
+        OSStatus stEmpty0 = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsExact2x0]);
         CFTypeRef rpsRb = NULL;
         OSStatus rpsCopySt = VTSessionCopyProperty(s, CFSTR("UserRPSForFaceTime"), kCFAllocatorDefault, &rpsRb);
         CFIndex rpsRbCount = (rpsCopySt == noErr && rpsRb && CFGetTypeID(rpsRb) == CFArrayGetTypeID())
                              ? CFArrayGetCount((CFArrayRef)rpsRb) : -1;
         if (rpsRb) CFRelease(rpsRb);
-        KPH9OutAppend(out, @"  session set UserRPS @post-prep: 2x2Bool=%d 2x2Num=%d 2x0Empty=%d rbCount=%ld\n",
-                      (int)stSane, (int)stArr0, (int)stEmpty0, (long)rpsRbCount);
+        KPH9OutAppend(out, @"  session set UserRPS @post-prep: 2x2=%d pred1=%d inOob24=%d 2x0=%d rbCount=%ld\n",
+                      (int)stSane, (int)stPred1, (int)stIn24, (int)stEmpty0, (long)rpsRbCount);
 
         CVPixelBufferRef pb = KPH9CreatePixelBuffer(1280, 720);
         if (pb) {
@@ -2388,14 +2588,17 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
             if (e0 == noErr) KPH9Drain(cbSink, 1, 60);
             NSString *cb0 = nil;
             @synchronized (cbSink) { cb0 = cbSink.firstObject ?: @"(no cb)"; [cbSink removeAllObjects]; }
-            OSStatus stSanePost  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x2Bool]);
-            OSStatus stEmptyPost = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rps2x0Empty]);
-            KPH9OutAppend(out, @"  encode[0] clean IDR -> %d (%@) | set UserRPS @post-idr 2x2Bool=%d 2x0Empty=%d\n",
+            OSStatus stSanePost  = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsExact2x2]);
+            OSStatus stEmptyPost = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[rpsExact2x0]);
+            KPH9OutAppend(out, @"  encode[0] clean IDR -> %d (%@) | set UserRPS @post-idr 2x2=%d 2x0=%d\n",
                           (int)e0, cb0, (int)stSanePost, (int)stEmptyPost);
 
             NSDictionary *fp = @{
-                @"UserRPSForFaceTime": @[rps2x2Bool],
+                @"UserRPSForFaceTime": @[rpsExact2x0],
                 @"ForceSliceRPS": (id)kCFBooleanTrue,
+                @"ShortTermRefPicSetSPSFlag": (id)kCFBooleanFalse,
+                @"ShortTermRefPicSetIdx": @0,
+                @"RPSData": rpsExact2x0,
             };
             OSStatus e1 = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(1, 30), kCMTimeInvalid,
                                                           (__bridge CFDictionaryRef)fp, NULL, NULL);
