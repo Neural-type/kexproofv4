@@ -39,9 +39,9 @@ static inline uint64_t KPStripPACKernel(uint64_t raw) {
     uint8_t byte6 = (uint8_t)((raw >> 48) & 0xff);
     uint8_t byte5 = (uint8_t)((raw >> 40) & 0xff);
     // Require canonical untagged (0xffff) or plausible TBI/PAC tag (top8 != 0, byte6 == 0xff)
-    // and valid kernel VA byte5 (0xf0, 0xfe, 0xff, 0xe0..0xef)
+    // and valid kernel VA byte5 (0xf0, 0xfe, 0xff, 0xde..0xef)
     if (top8 == 0x00 || byte6 != 0xff) return 0;
-    if (byte5 != 0xf0 && byte5 != 0xfe && byte5 != 0xff && (byte5 < 0xe0 || byte5 > 0xef)) {
+    if (byte5 != 0xf0 && byte5 != 0xfe && byte5 != 0xff && (byte5 < 0xde || byte5 > 0xef)) {
         return 0;
     }
     return (raw & 0x0000ffffffffffffULL) | 0xffff000000000000ULL;
@@ -74,14 +74,13 @@ static inline BOOL KPIsPlausibleKernelHeap(uint64_t raw, uint64_t *untagged) {
     if (top8 == 0x00 || byte6 != 0xff) return NO;
     // T8122/T8130 kalloc / zone / kernel_map:
     //   - 0xfffffe10..0xfffffe3f (zone map)
-    //   - 0xffffffec..0xffffffef (confirmed on iPhone16,1 27.0.1 panic:
-    //     AppleAVE2 outer object = 0xffffffedfd620000, SP = 0xffffffefff31b3f0)
+    //   - 0xffffffde..0xffffffef (.GEN0..3, .DATA, KMA, kernel_map 0xffffffec..0xffffffef)
     if (byte5 == 0xfe && byte4 >= 0x10 && byte4 < 0x40) {
         uint64_t norm = 0xfffffe0000000000ULL | (raw & 0x000000ffffffffffULL);
         if (untagged) *untagged = norm;
         return YES;
     }
-    if (byte5 == 0xff && byte4 >= 0xec && byte4 <= 0xef) {
+    if (byte5 == 0xff && byte4 >= 0xde && byte4 <= 0xef) {
         uint64_t norm = 0xffffff0000000000ULL | (raw & 0x000000ffffffffffULL);
         if (untagged) *untagged = norm;
         return YES;
@@ -108,7 +107,7 @@ static inline kptr_class_t KPClassifyKPtr(uint64_t raw) {
     if (hi32 >= 0xFFFFFFF0U && hi32 <= 0xFFFFFFFBU) return KPTR_CANDIDATE_KERNEL_TEXT_DATA;
     if (hi32 >= 0xFFFFFE00U && hi32 <= 0xFFFFFE0FU) return KPTR_CANDIDATE_KERNEL_TEXT_DATA;
     if ((hi32 >= 0xFFFFFE10U && hi32 <= 0xFFFFFE3FU) ||
-        (hi32 >= 0xFFFFFFECU && hi32 <= 0xFFFFFFEFU)) {
+        (hi32 >= 0xFFFFFFDEU && hi32 <= 0xFFFFFFEFU)) {
         return ((raw & 0x7ULL) == 0) ? KPTR_CANDIDATE_ZONE_HEAP : KPTR_REJECT_UNALIGNED;
     }
     return KPTR_REJECT_UNALIGNED;
@@ -120,12 +119,8 @@ static BOOL KPIsKernelPointerCandidate(uint64_t value) {
     // Bit 55 MUST be 1 for arm64e kernel pointers (also excludes all user-space VAs)
     if ((value & (1ULL << 55)) == 0) return NO;
 
-    // Reject SIMD/float/NaN noise
-    if ((value & 0xffffULL) == 0) {
-        uint8_t byte5 = (value >> 40) & 0xff;
-        if (byte5 >= 0xf0) return NO;
-    }
-    if ((value & 0xFFFFFULL) == 0) return NO;
+    // Reject SIMD/float/NaN base noise while preserving 16KB/64KB-aligned kernel_map objects (e.g. 0xffffffedfd620000)
+    if ((value & 0x00ffffffULL) == 0) return NO;
 
     kptr_class_t cls = KPClassifyKPtr(value);
     if (cls != KPTR_CANDIDATE_ZONE_HEAP && cls != KPTR_CANDIDATE_KERNEL_TEXT_DATA) return NO;

