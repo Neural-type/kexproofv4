@@ -130,60 +130,92 @@ static BOOL isKernelPointer(uint64_t v) {
      unexpected, freshCandidateCount];
     [report appendString:@"No candidate is modified: userspace alias propagation is not a kernel read/write oracle.\n"];
 
-    // --- Phase 4: filtered, read-only RW region candidate scan ---
-    [report appendString:@"\n--- Phase 4: filtered read-only candidate scan ---\n"];
+    // --- Phase 4: filtered, read-only RW region candidate scan & alias verification ---
+    [report appendString:@"\n--- Phase 4: filtered read-only candidate scan & memory-entry alias check ---\n"];
 
     vm_address_t scanAddr = 0;
     vm_size_t scanSize = 0;
     uint32_t scanDepth = 0;
     vm_region_submap_info_data_64_t scanInfo;
     mach_msg_type_number_t scanCount;
-    vm_address_t excludedAddresses[] = {inputAddr, outputAddr};
-    vm_size_t excludedSizes[] = {regionSize, regionSize};
+    uint64_t pageBuf[512];
+    vm_address_t excludedAddresses[] = { inputAddr, outputAddr, (vm_address_t)pageBuf };
+    vm_size_t excludedSizes[] = { regionSize, regionSize, sizeof(pageBuf) };
     int regionWithCandidates = 0;
     int scannedRegions = 0;
     int skippedRegions = 0;
     int filteredConstants = 0;
     int totalCandidates = 0;
 
-    while (regionWithCandidates < 8) {
-        scanAddr = (scanAddr == 0) ? 0 : scanAddr + scanSize;
+    for (int iter = 0; iter < 4096 && regionWithCandidates < 8; iter++) {
         scanCount = VM_REGION_SUBMAP_INFO_COUNT_64;
         if (vm_region_recurse_64(mach_task_self(), &scanAddr, &scanSize, &scanDepth,
                                   (vm_region_recurse_info_t)&scanInfo, &scanCount) != KERN_SUCCESS || scanSize == 0) break;
         if (scanInfo.is_submap) { scanDepth++; continue; }
-        if ((scanInfo.protection & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) continue;
-        if (scanSize > 16 * 1024 * 1024) continue;
-        if (KPVMShouldSkipRegion(&scanInfo, scanAddr, scanSize, &scanDepth,
-                                 excludedAddresses, excludedSizes, 2)) {
-            skippedRegions++;
-            continue;
-        }
-        scannedRegions++;
+        if ((scanInfo.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE) &&
+            scanSize <= 16 * 1024 * 1024 &&
+            !KPVMShouldSkipRegion(&scanInfo, scanAddr, scanSize, &scanDepth,
+                                 excludedAddresses, excludedSizes, 3)) {
+            scannedRegions++;
+            int candidates = 0;
+            uint64_t firstCandidate = 0;
+            size_t firstOffset = 0;
+            uint64_t firstCtx[8] = {0};
 
-        volatile uint64_t *p = (volatile uint64_t *)scanAddr;
-        size_t words = scanSize / 8;
-        int candidates = 0;
-        uint64_t firstCandidate = 0;
-        size_t firstOffset = 0;
-
-        for (size_t i = 0; i < words; i++) {
-            uint64_t v = p[i];
-            if (!isKernelPointer(v)) continue;
-            if (KPIsKnownDiagnosticConstant(v)) {
-                filteredConstants++;
-                continue;
+            for (vm_size_t off = 0; off + sizeof(pageBuf) <= scanSize; off += sizeof(pageBuf)) {
+                vm_size_t outSz = 0;
+                if (vm_read_overwrite(mach_task_self(), scanAddr + off, sizeof(pageBuf),
+                                      (vm_address_t)pageBuf, &outSz) != KERN_SUCCESS ||
+                    outSz < sizeof(uint64_t)) {
+                    break;
+                }
+                size_t words = outSz / sizeof(uint64_t);
+                for (size_t i = 0; i < words; i++) {
+                    uint64_t v = pageBuf[i];
+                    if (!isKernelPointer(v)) continue;
+                    if (KPIsKnownDiagnosticConstant(v)) {
+                        filteredConstants++;
+                        continue;
+                    }
+                    candidates++;
+                    if (candidates == 1) {
+                        firstCandidate = v;
+                        firstOffset = off + i * 8;
+                        for (int cw = 0; cw < 8; cw++) {
+                            ptrdiff_t idx = (ptrdiff_t)i - 2 + cw;
+                            firstCtx[cw] = (idx >= 0 && (size_t)idx < words) ? pageBuf[idx] : 0;
+                        }
+                    }
+                }
             }
-            candidates++;
-            if (candidates == 1) { firstCandidate = v; firstOffset = i * 8; }
-        }
 
-        if (candidates > 0) {
-            regionWithCandidates++;
-            totalCandidates += candidates;
-            [report appendFormat:@"region 0x%lx (size=0x%zx): %d candidates, first=0x%llx @ +0x%zx\n",
-             (unsigned long)scanAddr, scanSize, candidates, firstCandidate, firstOffset];
+            if (candidates > 0) {
+                regionWithCandidates++;
+                totalCandidates += candidates;
+                int32_t hiSigned = (int32_t)(uint32_t)(firstCandidate >> 32);
+                int steeredNTL = 16463 + hiSigned;
+                uint64_t steeredX0 = (firstCandidate & 0xffffffff00000000ULL) | 0x59ULL;
+                vm_address_t candVA = scanAddr + firstOffset;
+                vm_address_t candPage = candVA & ~(vm_address_t)0x3fffULL;
+                memory_object_size_t meSz = 0x4000;
+                mach_port_t mePort = MACH_PORT_NULL;
+                kern_return_t meKr = mach_make_memory_entry_64(mach_task_self(), &meSz, candPage,
+                                                               VM_PROT_READ | VM_PROT_WRITE, &mePort, MACH_PORT_NULL);
+                if (meKr == KERN_SUCCESS && mePort != MACH_PORT_NULL) {
+                    mach_port_deallocate(mach_task_self(), mePort);
+                }
+                [report appendFormat:@"region 0x%lx (size=0x%zx tag=%u share=%u obj=0x%x): %d candidates, first=0x%016llx @ +0x%zx (va=0x%lx memEntry=0x%x steeredNTL=%d x0=0x%016llx)\n",
+                 (unsigned long)scanAddr, scanSize, scanInfo.user_tag, (unsigned)scanInfo.share_mode, scanInfo.object_id,
+                 candidates, firstCandidate, firstOffset, (unsigned long)candVA, meKr, steeredNTL, steeredX0];
+                [report appendFormat:@"  ctx[-2..+5]: %016llx %016llx [%016llx] %016llx %016llx %016llx %016llx %016llx\n",
+                 firstCtx[0], firstCtx[1], firstCtx[2], firstCtx[3],
+                 firstCtx[4], firstCtx[5], firstCtx[6], firstCtx[7]];
+            }
+        } else {
+            skippedRegions++;
         }
+        if (scanAddr + scanSize <= scanAddr) break;
+        scanAddr += scanSize;
     }
 
     [report appendFormat:@"scanned regions: %d; skipped local regions: %d\n", scannedRegions, skippedRegions];
