@@ -148,6 +148,7 @@
         [[KPAuditAVESpriteModule alloc] initWithSprayCount:64 marker:0x43434343],
         [[KPAuditAVESpriteModule alloc] initWithSprayCount:64 marker:0x44444444 ntl:0],
         [[KPAuditAVESpriteModule alloc] initWithSprayCount:64 marker:0x45454545 ntl:16431],
+        [[KPAuditAVESpriteModule alloc] initWithSprayCount:1 marker:0x50505050 ntl:16433],
         [[KPAuditAVEPANModule alloc] initWithTemporalLayers:16467],
         [[KPAuditAVEPANModule alloc] initWithTemporalLayers:16471],
         [[KPAuditUAF84495Module alloc] initWithArmed:NO],
