@@ -3278,6 +3278,13 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 if (VTSessionCopyProperty(s, CFSTR("NumberOfTemporalLayers"), NULL, &rb) == noErr && rb) {
                     CFNumberGetValue(rb, kCFNumberIntType, &postEnc); CFRelease(rb);
                 }
+                OSStatus encSt1 = -1;
+                if (steerPx && sntl < 16463) {
+                    NSDictionary *pProps = @{ (id)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO };
+                    encSt1 = VTCompressionSessionEncodeFrame(s, steerPx, CMTimeMake(1, 30), kCMTimeInvalid, (__bridge CFDictionaryRef)pProps, NULL, NULL);
+                    int w1 = 0;
+                    while (sRes->cbCount < 2 && w1 < 80) { usleep(2000); w1 += 2; }
+                }
                 OSStatus cbSt = sRes->lastStatus;
                 NSString *cbFirst = nil;
                 @synchronized ([KPH9EncoderModule class]) {
@@ -3289,9 +3296,9 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 if (dpbSib) KPH9SafeTeardown(dpbSib);
 
                 int seqSubLayersM1 = (postPub < 2 && effNtl >= 2) ? (effNtl - 1) : (postPub - 1);
-                KPH9OutAppend(log, @"  dynSteer[kptr=0x%016llx -> NTL=%d x0=0x%016llx P_slot0=0x%016llx(x0_al=0x%016llx)]: u1Prep=%d(u1POST=%d) frac15_30=%d pubSet=%d dpb34=%d rpsSlot0=%d PRE=%d prep=%d POST=%d([+0x2eec]=%d) POST_ENC=%d enc=%d(cb=%d) | %@\n",
+                KPH9OutAppend(log, @"  dynSteer[kptr=0x%016llx -> NTL=%d x0=0x%016llx P_slot0=0x%016llx(x0_al=0x%016llx)]: u1Prep=%d(u1POST=%d) frac15_30=%d pubSet=%d dpb34=%d rpsSlot0=%d PRE=%d prep=%d POST=%d([+0x2eec]=%d) POST_ENC=%d enc0=%d enc1=%d(cb=%d) | %@\n",
                               origKPtr, sntl, steeredX0, pTarget64, x0Aligned, (int)u1Prep, u1Post, (int)uSt, (int)pubSt, (int)dpbSt, (int)sRpsSt,
-                              prePub, (int)prepSt, postPub, seqSubLayersM1, postEnc, (int)encSt, (int)cbSt, cbFirst);
+                              prePub, (int)prepSt, postPub, seqSubLayersM1, postEnc, (int)encSt, (int)encSt1, (int)cbSt, cbFirst);
             } else {
                 if (sRes) free(sRes);
                 if (uSib) KPH9SafeTeardown(uSib);

