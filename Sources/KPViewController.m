@@ -153,6 +153,7 @@
         [[KPAuditAVEPANModule alloc] initWithTemporalLayers:16471],
         [[KPAuditUAF84495Module alloc] initWithArmed:NO],
         [[KPAuditUAF84495Module alloc] initWithArmed:YES],
+        [[KPRootExploitModule alloc] init],
     ];
     NSMutableArray<NSMutableArray<id<KPTestModule>> *> *groups = [NSMutableArray array];
     for (NSUInteger index = 0; index < self.sectionTitles.count; index++) {
