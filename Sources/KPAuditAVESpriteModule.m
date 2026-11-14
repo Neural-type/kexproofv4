@@ -181,7 +181,7 @@ static void SpriteDrain(VTCompressionSessionRef s, NSMutableArray *sink, int exp
     {
         int sharedCount = KPH9GetStage5CandidateCount();
         for (int si = 0; si < sharedCount && liveKPtrCount < 8; si++) {
-            const KPStage5Candidate *sc = KPH9GetStage5Candidate(si);
+            const Stage5KPtrRecord *sc = KPH9GetStage5Candidate(si);
             if (!sc || sc->kptr == 0) continue;
             BOOL dup = NO;
             for (int k = 0; k < liveKPtrCount; k++) {
